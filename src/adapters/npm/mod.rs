@@ -1,5 +1,8 @@
+use crate::domain::{Ecosystem, PackageCoordinate, PackageVersion};
 use crate::ports::UpstreamNpmRegistry;
 use anyhow::Result;
+use chrono::{DateTime, Utc};
+use semver::Version;
 pub struct HttpNpmRegistry {
     pub base_url: String,
     pub client: reqwest::blocking::Client,
@@ -64,6 +67,45 @@ pub fn rewrite_tarball_urls(
     metadata
 }
 
+pub fn package_version_from_metadata(
+    metadata: &serde_json::Value,
+    package: &str,
+    version: &Version,
+) -> Result<PackageVersion> {
+    let entry = metadata
+        .get("versions")
+        .and_then(|v| v.get(version.to_string()))
+        .ok_or_else(|| anyhow::anyhow!("{package}@{version} not found in registry metadata"))?;
+    let dist = entry
+        .get("dist")
+        .ok_or_else(|| anyhow::anyhow!("{package}@{version} has no dist object"))?;
+    let integrity = dist
+        .get("integrity")
+        .and_then(|i| i.as_str())
+        .map(str::to_string);
+    let tarball_url = dist
+        .get("tarball")
+        .and_then(|t| t.as_str())
+        .map(str::to_string);
+    let published_at = metadata
+        .get("time")
+        .and_then(|t| t.get(version.to_string()))
+        .and_then(|t| t.as_str())
+        .map(DateTime::parse_from_rfc3339)
+        .transpose()?
+        .map(|t| t.with_timezone(&Utc));
+    Ok(PackageVersion {
+        package: PackageCoordinate {
+            ecosystem: Ecosystem::Npm,
+            name: package.to_string(),
+        },
+        version: version.clone(),
+        published_at,
+        integrity,
+        tarball_url,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,5 +117,31 @@ mod tests {
             r["versions"]["1.0.0"]["dist"]["tarball"],
             "http://localhost:4873/left-pad/-/left-pad-1.0.0.tgz"
         );
+    }
+    #[test]
+    fn maps_registry_metadata_to_domain() -> Result<()> {
+        let meta = serde_json::json!({
+            "name": "left-pad",
+            "versions": {"1.3.0": {"dist": {
+                "integrity": "sha512-abc",
+                "tarball": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz"
+            }}},
+            "time": {"1.3.0": "2018-02-05T02:27:32.476Z"}
+        });
+        let pv = package_version_from_metadata(&meta, "left-pad", &Version::parse("1.3.0")?)?;
+        assert_eq!(pv.integrity.as_deref(), Some("sha512-abc"));
+        assert!(pv
+            .tarball_url
+            .as_deref()
+            .is_some_and(|u| u.ends_with("1.3.0.tgz")));
+        assert!(pv.published_at.is_some());
+        Ok(())
+    }
+    #[test]
+    fn unknown_version_errors() -> Result<()> {
+        let meta = serde_json::json!({"versions": {}});
+        let v = Version::parse("9.9.9")?;
+        assert!(package_version_from_metadata(&meta, "x", &v).is_err());
+        Ok(())
     }
 }
