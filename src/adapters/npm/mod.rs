@@ -7,12 +7,14 @@ pub struct HttpNpmRegistry {
     pub base_url: String,
     pub client: reqwest::blocking::Client,
 }
-impl Default for HttpNpmRegistry {
-    fn default() -> Self {
-        Self {
+impl HttpNpmRegistry {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
             base_url: "https://registry.npmjs.org".into(),
-            client: reqwest::blocking::Client::new(),
-        }
+            client: reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()?,
+        })
     }
 }
 impl UpstreamNpmRegistry for HttpNpmRegistry {

@@ -25,24 +25,37 @@ runtime dependencies, no lifecycle scripts.
 
 Steps (each is an assertion in `tests/e2e_npm.rs`):
 
-1. **Fetch metadata** — `HttpNpmRegistry.metadata("left-pad")` returns
-   registry JSON containing `versions["1.3.0"]` and `time["1.3.0"]`.
-2. **Map to domain** — `package_version_from_metadata` produces a
-   `PackageVersion` with integrity (`sha512-…`), tarball URL, and
-   `published_at` parsed from the `time` map.
-3. **Evaluate → Allow** — default policy, system clock, noop vuln source:
-   2018 publish date clears quarantine → `Decision::Allow`.
-4. **Fetch tarball** — `HttpNpmRegistry.tarball(url)` returns bytes.
-5. **Verify integrity** — `ShaHasher.verify_npm_integrity(bytes, integrity)`
-   must be `true`: proves the real registry round-trip preserves the
-   sha512 SRI contract.
-6. **Freeze** — sha256 the bytes, `FsArtifactStore.put` writes under
-   `artifacts/`, `MemoryMetadataStore.put_frozen` records it.
-7. **Quarantine → Fallback** — fixed clock set to publish-date + 2 days:
-   re-evaluate the same version → `Decision::Fallback` serving frozen
-   1.3.0 (the frozen copy rescues the quarantined request).
-8. **Denylist → Block** — policy with `left-pad` denied, frozen copy
-   still available → `Decision::Block` (denylist must never serve).
+1. **Fetch + map** — `HttpNpmRegistry.metadata("left-pad")` →
+   `package_version_from_metadata` produces a `PackageVersion` with
+   integrity, tarball URL, and `published_at`.
+2. **Evaluate → Allow** — 2018 publish date clears the 7-day quarantine.
+3. **Verified freeze** — `IngestService.freeze_verified` fetches the real
+   tarball, verifies sha512 bytes-vs-metadata (production path, not just
+   test code), and freezes via `FsArtifactStore` + `MemoryMetadataStore`.
+4. **Quarantine → Fallback** — fixed clock at publish-date + 2 days →
+   `Decision::Fallback` serving frozen 1.3.0.
+5. **Denylist → Block** — denied package with frozen copy available →
+   `Decision::Block` (denylist must never serve).
+
+## 0-day simulation (`zero_day_update_quarantined_tamper_blocked`)
+
+Models the CVE-less attack window from the feasibility research: a
+malicious version lands, no advisory exists yet, so the vulnerability
+source (noop = empty findings, as with a real 0-day) cannot catch it.
+Only the quarantine window stands between the build and the payload.
+
+1. **Baseline freeze** of known-good 1.3.0 via verified ingest.
+2. **0-day construct** — version `9.9.9`, `published_at` = now − 2 days,
+   noop vuln source (nothing to match, exactly like a 0-day).
+3. **Upstream tamper** — `TamperRegistry` corrupts real tarball bytes;
+   `freeze_verified` must fail with "integrity mismatch" and produce no
+   frozen artifact. Freezing never trusts unverified bytes.
+4. **Quarantine holds** — 0-day evaluates to `Fallback` on frozen 1.3.0
+   with a quarantine warning; the build survives without exposure.
+5. **No frozen → Block** — same 0-day against an empty store hard-blocks.
+6. **Window expiry** — clock +30 days: same version allows. The cooldown
+   is the only CVE-less control; this asserts its actual duration
+   semantics rather than assuming them.
 
 ## Pass criteria
 
