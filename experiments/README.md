@@ -22,11 +22,20 @@ to latest.
 python3 report.py           # baseline vs latest diff
 ```
 
-Optional daily cron:
+## Daily auto-capture (GitHub-backed)
 
+The cron wrapper pulls latest from the repo before each run, so editing
+`candidates.txt`, `run.sh`, `report.py`, or source code on `main` (or
+the checked-out branch) propagates within a day without touching the
+cron entry.
+
+```bash
+./install-cron.sh           # 08:15 daily
+crontab -l | grep supply-core
+./uninstall-cron.sh         # remove
 ```
-15 8 * * * /Users/jakubsikora/Repos/personal/supply-core/experiments/run.sh >> /tmp/supply-field.log 2>&1
-```
+
+Log: `experiments/data/cron.log`.
 
 ## Day-0 baseline observations (2026-08-15)
 
