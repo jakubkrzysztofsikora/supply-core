@@ -66,6 +66,52 @@ impl<'a> PackageEvaluator<'a> {
     }
 }
 
+pub struct IngestService<'a> {
+    pub policy: &'a Policy,
+    pub registry: &'a dyn UpstreamNpmRegistry,
+    pub hasher: &'a dyn Hasher,
+    pub artifacts: &'a dyn ArtifactStore,
+    pub metadata: &'a dyn MetadataStore,
+    pub clock: &'a dyn Clock,
+}
+impl<'a> IngestService<'a> {
+    /// Fetch tarball bytes and freeze them only after dist.integrity verifies.
+    /// Fail closed: missing integrity, unreachable tarball, or byte mismatch
+    /// never produces a frozen artifact.
+    pub fn freeze_verified(&self, version: &PackageVersion) -> Result<FrozenArtifact> {
+        let name = &version.package.name;
+        let url = version
+            .tarball_url
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("no tarball url for {name}"))?;
+        let integrity = version.integrity.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "no dist.integrity for {name}@{}: refusing to freeze unverified bytes",
+                version.version
+            )
+        })?;
+        let bytes = self.registry.tarball(url)?;
+        if self.policy.npm.require_integrity && !self.hasher.verify_npm_integrity(&bytes, integrity)
+        {
+            anyhow::bail!(
+                "integrity mismatch for {name}@{}: registry bytes do not match dist.integrity",
+                version.version
+            );
+        }
+        let path = self.artifacts.put(name, &version.version, &bytes)?;
+        let artifact = FrozenArtifact {
+            package: version.package.clone(),
+            version: version.version.clone(),
+            sha256: self.hasher.sha256(&bytes),
+            integrity: Some(integrity.to_string()),
+            path,
+            frozen_at: self.clock.now(),
+        };
+        self.metadata.put_frozen(artifact.clone())?;
+        Ok(artifact)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowScanReport {
     pub findings: Vec<Decision>,
