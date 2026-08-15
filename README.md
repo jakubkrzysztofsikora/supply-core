@@ -17,7 +17,11 @@
 cargo test
 cargo run -- scan-actions . --json
 cargo run -- serve --addr 127.0.0.1:4873
+cargo test -- --ignored   # e2e against registry.npmjs.org (left-pad 1.3.0)
 ```
+
+See [`docs/e2e-npm-plan.md`](docs/e2e-npm-plan.md) for the real-registry
+example process and its test tiers.
 
 ## Docker
 
