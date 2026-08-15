@@ -1,0 +1,33 @@
+[package]
+name = "supply-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+axum = "0.7"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde", "clock"] }
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+http = "1"
+regex = "1"
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"], default-features = false }
+semver = { version = "1", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+tower-http = { version = "0.6", features = ["trace"] }
+urlencoding = "2"
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
