@@ -1,0 +1,20 @@
+# supply-core week-long field test candidates
+# format: name<TAB>repo-root<TAB>track(s)
+# tracks: npm = dependency policy snapshots, actions = workflow scanner
+# Selection rationale:
+#   - both tracks covered; sizes range 1-78 deps and 1-48 workflows
+#   - llama.cpp = hostile real-world upstream (48 workflows, heavy)
+#   - lustro cluster = own production infra (19 workflows, will drift during week)
+#   - sikoras-chat/voxel = biggest npm graphs (78/75 deps)
+choyce-cli	/Users/jakubsikora/Repos/personal/choyce-cli	npm
+gruntum-campaign	/Users/jakubsikora/Repos/personal/gruntum-campaign	npm
+linkedin-ads-mcp	/Users/jakubsikora/Repos/personal/linkedin-ads-mcp	npm
+nieruchomosci-mcp	/Users/jakubsikora/Repos/personal/nieruchomosci-mcp	npm actions
+sikoras-chat	/Users/jakubsikora/Repos/personal/sikoras-chat	npm
+voxel	/Users/jakubsikora/Repos/personal/voxel	npm
+Pathslopper	/Users/jakubsikora/Repos/personal/Pathslopper	npm actions
+lustro	/Users/jakubsikora/Repos/personal/lustro	actions
+lustro-prod	/Users/jakubsikora/Repos/personal/lustro-prod	actions
+screenpipe	/Users/jakubsikora/Repos/personal/screenpipe	actions
+odysseus	/Users/jakubsikora/Repos/personal/odysseus	actions
+llama.cpp	/Users/jakubsikora/Repos/personal/llama.cpp	actions
