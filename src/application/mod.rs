@@ -15,7 +15,11 @@ impl<'a> PackageEvaluator<'a> {
     pub fn evaluate(&self, version: &PackageVersion) -> Result<Decision> {
         let name = &version.package.name;
         if self.policy.npm.deny_packages.contains(name) {
-            return self.fallback_or_block(name, &version.version, "package is denylisted");
+            return Ok(Decision::block(
+                name,
+                Some(version.version.to_string()),
+                "package is denylisted",
+            ));
         }
         if self.policy.npm.require_integrity && version.integrity.is_none() {
             return self.fallback_or_block(
@@ -131,29 +135,26 @@ impl<'a> GitHubActionsScanner<'a> {
 }
 fn extract_uses(line: &str) -> Option<String> {
     let s = line.trim().trim_start_matches('-').trim();
-    let rest = s
-        .strip_prefix("uses:")?
-        .trim()
-        .trim_matches('"')
-        .trim_matches('\'');
-    Some(rest.to_string())
+    let rest = s.strip_prefix("uses:")?.trim();
+    if let Some(quote) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') {
+        let inner = rest.strip_prefix(quote)?.strip_suffix(quote)?;
+        return Some(inner.to_string());
+    }
+    let value = rest.split_once(" #").map(|(v, _)| v).unwrap_or(rest);
+    Some(value.trim().to_string())
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+    use chrono::{DateTime, Duration, Utc};
     use std::{path::Path, sync::Mutex};
-    struct C;
-    impl Clock for C {
-        fn now(&self) -> chrono::DateTime<Utc> {
-            Utc::now()
-        }
-    }
-    struct V(Vec<VulnerabilityFinding>);
-    impl VulnerabilitySource for V {
-        fn query(&self, _: Ecosystem, _: &str, _: &Version) -> Result<Vec<VulnerabilityFinding>> {
-            Ok(self.0.clone())
+
+    struct FixedClock(DateTime<Utc>);
+    impl Clock for FixedClock {
+        fn now(&self) -> DateTime<Utc> {
+            self.0
         }
     }
     struct M(Mutex<Option<FrozenArtifact>>);
@@ -172,58 +173,130 @@ mod tests {
             Ok(())
         }
     }
-    #[test]
-    fn falls_back_instead_of_error() -> Result<()> {
-        let p = Policy::default();
-        let m = M(Mutex::new(Some(FrozenArtifact {
+    fn frozen(version: &str) -> FrozenArtifact {
+        FrozenArtifact {
             package: PackageCoordinate {
                 ecosystem: Ecosystem::Npm,
                 name: "left-pad".into(),
             },
-            version: Version::parse("1.0.0")?,
+            version: Version::parse(version).unwrap(),
             sha256: "x".into(),
             integrity: None,
             path: "p".into(),
             frozen_at: Utc::now(),
-        })));
-        let e = PackageEvaluator {
-            policy: &p,
-            clock: &C,
-            vulns: &V(vec![]),
-            metadata: &m,
-        };
-        let v = PackageVersion {
+        }
+    }
+    fn package(published: Option<DateTime<Utc>>) -> PackageVersion {
+        PackageVersion {
             package: PackageCoordinate {
                 ecosystem: Ecosystem::Npm,
                 name: "left-pad".into(),
             },
-            version: Version::parse("2.0.0")?,
-            published_at: Some(Utc::now()),
+            version: Version::parse("2.0.0").unwrap(),
+            published_at: published,
             integrity: Some("sha512-x".into()),
             tarball_url: None,
-        };
-        let d = e.evaluate(&v)?;
+        }
+    }
+    fn evaluator<'a>(
+        policy: &'a Policy,
+        clock: &'a FixedClock,
+        metadata: &'a M,
+    ) -> PackageEvaluator<'a> {
+        PackageEvaluator {
+            policy,
+            clock,
+            vulns: &NoVulns,
+            metadata,
+        }
+    }
+    struct NoVulns;
+    impl VulnerabilitySource for NoVulns {
+        fn query(&self, _: Ecosystem, _: &str, _: &Version) -> Result<Vec<VulnerabilityFinding>> {
+            Ok(vec![])
+        }
+    }
+    #[test]
+    fn quarantine_falls_back_to_frozen() -> Result<()> {
+        let now = Utc::now();
+        let p = Policy::default();
+        let c = FixedClock(now);
+        let m = M(Mutex::new(Some(frozen("1.0.0"))));
+        let e = evaluator(&p, &c, &m);
+        let d = e.evaluate(&package(Some(now - Duration::days(2))))?;
         assert_eq!(d.status, DecisionStatus::Fallback);
         assert_eq!(d.served_version.as_deref(), Some("1.0.0"));
         Ok(())
     }
-    struct R;
+    #[test]
+    fn missing_published_at_is_quarantined() -> Result<()> {
+        let now = Utc::now();
+        let p = Policy::default();
+        let c = FixedClock(now);
+        let m = M(Mutex::new(None));
+        let e = evaluator(&p, &c, &m);
+        let d = e.evaluate(&package(None))?;
+        assert_eq!(d.status, DecisionStatus::Block);
+        assert!(d.reasons[0].contains("quarantine"));
+        Ok(())
+    }
+    #[test]
+    fn denylisted_blocks_even_with_frozen_available() -> Result<()> {
+        let now = Utc::now();
+        let mut p = Policy::default();
+        p.npm.deny_packages = vec!["left-pad".into()];
+        let c = FixedClock(now);
+        let m = M(Mutex::new(Some(frozen("1.0.0"))));
+        let e = evaluator(&p, &c, &m);
+        let d = e.evaluate(&package(Some(now - Duration::days(30))))?;
+        assert_eq!(d.status, DecisionStatus::Block);
+        assert!(d.reasons[0].contains("denylisted"));
+        Ok(())
+    }
+    #[test]
+    fn old_version_allows() -> Result<()> {
+        let now = Utc::now();
+        let p = Policy::default();
+        let c = FixedClock(now);
+        let m = M(Mutex::new(None));
+        let e = evaluator(&p, &c, &m);
+        let d = e.evaluate(&package(Some(now - Duration::days(30))))?;
+        assert_eq!(d.status, DecisionStatus::Allow);
+        Ok(())
+    }
+    struct R(Vec<(String, String)>);
     impl WorkflowReader for R {
         fn read(&self, _: &Path) -> Result<Vec<(String, String)>> {
-            Ok(vec![(
-                ".github/workflows/ci.yml".into(),
-                "steps:\n - uses: actions/checkout@v4".into(),
-            )])
+            Ok(self.0.clone())
         }
     }
     #[test]
     fn scans_unpinned_actions() -> Result<()> {
         let s = GitHubActionsScanner {
             policy: &Policy::default(),
-            reader: &R,
+            reader: &R(vec![(
+                ".github/workflows/ci.yml".into(),
+                "steps:\n - uses: actions/checkout@v4".into(),
+            )]),
         };
         let r = s.scan(Path::new("."))?;
         assert!(r.is_blocking());
+        Ok(())
+    }
+    #[test]
+    fn sha_pinned_action_with_comment_allows() -> Result<()> {
+        let body = format!(
+            "steps:\n  - uses: a/b@{} # v1.2.3\n  - uses: \"a/c@{}\"",
+            "0".repeat(40),
+            "1".repeat(40)
+        );
+        let s = GitHubActionsScanner {
+            policy: &Policy::default(),
+            reader: &R(vec![(".github/workflows/ci.yml".into(), body)]),
+        };
+        let r = s.scan(Path::new("."))?;
+        assert!(!r.is_blocking());
+        assert_eq!(r.references.len(), 2);
         Ok(())
     }
 }

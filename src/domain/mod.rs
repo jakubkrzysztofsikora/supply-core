@@ -151,7 +151,6 @@ pub struct NpmPolicy {
     pub require_integrity: bool,
     pub fallback_to_frozen: bool,
     pub deny_packages: Vec<String>,
-    pub allow_packages: Vec<String>,
 }
 impl Default for NpmPolicy {
     fn default() -> Self {
@@ -159,7 +158,6 @@ impl Default for NpmPolicy {
             require_integrity: true,
             fallback_to_frozen: true,
             deny_packages: vec![],
-            allow_packages: vec![],
         }
     }
 }
@@ -224,9 +222,10 @@ pub fn is_version_quarantined(
     policy: &QuarantinePolicy,
 ) -> bool {
     policy.enabled
-        && published_at
-            .map(|p| now.signed_duration_since(p).num_days() < policy.minimum_age_days)
-            .unwrap_or(false)
+        && match published_at {
+            Some(p) => now.signed_duration_since(p).num_days() < policy.minimum_age_days,
+            None => true,
+        }
 }
 
 pub fn blocks_vulnerability(
