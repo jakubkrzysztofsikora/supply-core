@@ -1,0 +1,14 @@
+quarantine:
+  enabled: true
+  minimum_age_days: 7
+vulnerabilities:
+  block_severities:
+    - High
+    - Critical
+npm:
+  require_integrity: true
+  fallback_to_frozen: true
+  deny_packages: []
+github_actions:
+  require_full_sha_pin: true
+  allow_local_actions: true
