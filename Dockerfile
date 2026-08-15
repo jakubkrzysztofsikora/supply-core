@@ -1,7 +1,7 @@
 FROM rust:1-bookworm AS build
 WORKDIR /app
 COPY . .
-RUN cargo build --release
+RUN cargo build --release --locked
 
 FROM debian:bookworm-slim
 RUN useradd -r -u 10001 supply

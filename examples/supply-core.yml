@@ -9,7 +9,6 @@ npm:
   require_integrity: true
   fallback_to_frozen: true
   deny_packages: []
-  allow_packages: []
 github_actions:
   require_full_sha_pin: true
   allow_local_actions: true

@@ -3,7 +3,3 @@ services:
     build: .
     ports:
       - "4873:4873"
-    volumes:
-      - supply-data:/var/lib/supply-core
-volumes:
-  supply-data:
