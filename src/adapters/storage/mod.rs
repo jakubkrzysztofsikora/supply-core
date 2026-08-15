@@ -3,7 +3,7 @@ use crate::{
     ports::{ArtifactStore, MetadataStore},
 };
 use anyhow::Result;
-use semver::Version;
+use semver::{Version, VersionReq};
 use std::{fs, path::PathBuf, sync::Mutex};
 
 pub struct FsArtifactStore {
@@ -46,14 +46,28 @@ impl MetadataStore for MemoryMetadataStore {
             .push(d.clone());
         Ok(())
     }
-    fn latest_frozen(&self, name: &str) -> Result<Option<FrozenArtifact>> {
+    fn latest_frozen_satisfying(
+        &self,
+        name: &str,
+        requested: Option<&VersionReq>,
+    ) -> Result<Option<FrozenArtifact>> {
         Ok(self
             .frozen
             .lock()
             .map_err(|_| anyhow::anyhow!("lock poisoned"))?
             .iter()
             .filter(|a| a.package.name == name)
+            .filter(|a| requested.is_none_or(|r| r.matches(&a.version)))
             .max_by(|a, b| a.version.cmp(&b.version))
+            .cloned())
+    }
+    fn get_frozen(&self, name: &str, version: &Version) -> Result<Option<FrozenArtifact>> {
+        Ok(self
+            .frozen
+            .lock()
+            .map_err(|_| anyhow::anyhow!("lock poisoned"))?
+            .iter()
+            .find(|a| a.package.name == name && a.version == *version)
             .cloned())
     }
     fn put_frozen(&self, a: FrozenArtifact) -> Result<()> {

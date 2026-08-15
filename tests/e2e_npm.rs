@@ -71,7 +71,7 @@ fn left_pad_end_to_end() -> Result<()> {
         vulns: &NoopVulnerabilitySource,
         metadata: &store,
     }
-    .evaluate(&pv)
+    .evaluate(&pv, None)
     .context("evaluate for allow")?;
     assert_eq!(
         allow.status,
@@ -104,7 +104,7 @@ fn left_pad_end_to_end() -> Result<()> {
         vulns: &NoopVulnerabilitySource,
         metadata: &store,
     }
-    .evaluate(&pv)
+    .evaluate(&pv, None)
     .context("evaluate quarantine fallback")?;
     assert_eq!(fallback.status, DecisionStatus::Fallback);
     assert_eq!(fallback.served_version.as_deref(), Some("1.3.0"));
@@ -117,7 +117,7 @@ fn left_pad_end_to_end() -> Result<()> {
         vulns: &NoopVulnerabilitySource,
         metadata: &store,
     }
-    .evaluate(&pv)
+    .evaluate(&pv, None)
     .context("evaluate denylist block")?;
     assert_eq!(
         denied.status,
@@ -188,13 +188,15 @@ fn zero_day_update_quarantined_tamper_blocked() -> Result<()> {
         .contains("integrity mismatch"));
 
     // Quarantine catches the 0-day; frozen 1.3.0 rescues the build.
+    // Range-aware: ^1.0.0 satisfied by frozen 1.3.0; ^9.0.0 must block.
+    let caret_one = semver::VersionReq::parse("^1.0.0")?;
     let decision = PackageEvaluator {
         policy: &policy,
         clock: &SystemClock,
         vulns: &NoopVulnerabilitySource,
         metadata: &store,
     }
-    .evaluate(&zero_day)
+    .evaluate(&zero_day, Some(&caret_one))
     .context("evaluate 0-day")?;
     assert_eq!(
         decision.status,
@@ -204,6 +206,20 @@ fn zero_day_update_quarantined_tamper_blocked() -> Result<()> {
     assert_eq!(decision.served_version.as_deref(), Some("1.3.0"));
     assert!(decision.warnings.iter().any(|w| w.contains("quarantine")));
 
+    let caret_nine = semver::VersionReq::parse("^9.0.0")?;
+    let unsatisfiable = PackageEvaluator {
+        policy: &policy,
+        clock: &SystemClock,
+        vulns: &NoopVulnerabilitySource,
+        metadata: &store,
+    }
+    .evaluate(&zero_day, Some(&caret_nine))?;
+    assert_eq!(
+        unsatisfiable.status,
+        DecisionStatus::Block,
+        "range not satisfied by any frozen version must block, not serve wrong major"
+    );
+
     // Same 0-day with nothing frozen: hard block, no silent allow.
     let empty_store = MemoryMetadataStore::default();
     let blocked = PackageEvaluator {
@@ -212,7 +228,7 @@ fn zero_day_update_quarantined_tamper_blocked() -> Result<()> {
         vulns: &NoopVulnerabilitySource,
         metadata: &empty_store,
     }
-    .evaluate(&zero_day)?;
+    .evaluate(&zero_day, None)?;
     assert_eq!(
         blocked.status,
         DecisionStatus::Block,
@@ -228,8 +244,70 @@ fn zero_day_update_quarantined_tamper_blocked() -> Result<()> {
         vulns: &NoopVulnerabilitySource,
         metadata: &empty_store,
     }
-    .evaluate(&zero_day)?;
+    .evaluate(&zero_day, None)?;
     assert_eq!(aged.status, DecisionStatus::Allow);
 
     Ok(())
+}
+
+/// Registry immutability: compromised mirror re-publishing the same
+/// version with different (self-consistently hashed) bytes must be
+/// rejected against the frozen ledger.
+#[test]
+#[ignore = "hits registry.npmjs.org"]
+fn same_version_republish_detected() -> Result<()> {
+    let registry = HttpNpmRegistry::new()?;
+    let pv = fixture(&registry)?;
+
+    let dir = tempfile::tempdir()?;
+    let artifacts = FsArtifactStore {
+        root: dir.path().to_path_buf(),
+    };
+    let policy = Policy::default();
+    let hasher = ShaHasher;
+    let store = MemoryMetadataStore::default();
+    let baseline = IngestService {
+        policy: &policy,
+        registry: &registry,
+        hasher: &hasher,
+        artifacts: &artifacts,
+        metadata: &store,
+        clock: &SystemClock,
+    }
+    .freeze_verified(&pv)
+    .context("baseline freeze of real 1.3.0")?;
+
+    // Attacker mirror serves different bytes for the same version, with
+    // an integrity string matching those bytes — so sha512 alone would
+    // pass; only the frozen-ledger conflict detects the re-publish.
+    let tamper = TamperRegistry { inner: &registry };
+    let tampered_bytes = tamper.tarball(pv.tarball_url.as_deref().unwrap())?;
+    let mut republish = pv.clone();
+    republish.integrity = Some(sri_sha512(&tampered_bytes));
+    let conflict = IngestService {
+        policy: &policy,
+        registry: &tamper,
+        hasher: &hasher,
+        artifacts: &artifacts,
+        metadata: &store,
+        clock: &SystemClock,
+    }
+    .freeze_verified(&republish);
+    let err = conflict.unwrap_err().to_string();
+    assert!(
+        err.contains("immutability violation"),
+        "expected immutability violation, got: {err}"
+    );
+    assert_eq!(
+        store.latest_frozen("left-pad")?.unwrap().sha256,
+        baseline.sha256,
+        "ledger must keep original bytes after refused re-publish"
+    );
+    Ok(())
+}
+
+fn sri_sha512(bytes: &[u8]) -> String {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use sha2::Digest;
+    format!("sha512-{}", STANDARD.encode(sha2::Sha512::digest(bytes)))
 }
