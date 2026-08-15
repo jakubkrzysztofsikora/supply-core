@@ -1,7 +1,7 @@
 use crate::domain::*;
 use crate::ports::*;
 use anyhow::Result;
-use semver::Version;
+use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -12,7 +12,13 @@ pub struct PackageEvaluator<'a> {
     pub metadata: &'a dyn MetadataStore,
 }
 impl<'a> PackageEvaluator<'a> {
-    pub fn evaluate(&self, version: &PackageVersion) -> Result<Decision> {
+    /// `requested` is the client's semver range (e.g. `^1.2.0`). Fallback
+    /// serves the latest frozen version satisfying it; `None` allows any.
+    pub fn evaluate(
+        &self,
+        version: &PackageVersion,
+        requested: Option<&VersionReq>,
+    ) -> Result<Decision> {
         let name = &version.package.name;
         if self.policy.npm.deny_packages.contains(name) {
             return Ok(Decision::block(
@@ -25,12 +31,13 @@ impl<'a> PackageEvaluator<'a> {
             return self.fallback_or_block(
                 name,
                 &version.version,
+                requested,
                 "package version is missing npm integrity",
             );
         }
         let findings = self.vulns.query(Ecosystem::Npm, name, &version.version)?;
         if let Some(reason) = blocks_vulnerability(&findings, &self.policy.vulnerabilities) {
-            return self.fallback_or_block(name, &version.version, reason);
+            return self.fallback_or_block(name, &version.version, requested, reason);
         }
         if is_version_quarantined(
             version.published_at,
@@ -40,6 +47,7 @@ impl<'a> PackageEvaluator<'a> {
             return self.fallback_or_block(
                 name,
                 &version.version,
+                requested,
                 "package version is inside quarantine window",
             );
         }
@@ -48,21 +56,26 @@ impl<'a> PackageEvaluator<'a> {
     fn fallback_or_block(
         &self,
         name: &str,
-        requested: &Version,
+        requested_version: &Version,
+        requested: Option<&VersionReq>,
         reason: impl Into<String>,
     ) -> Result<Decision> {
         let reason = reason.into();
         if self.policy.npm.fallback_to_frozen {
-            if let Some(frozen) = self.metadata.latest_frozen(name)? {
+            if let Some(frozen) = self.metadata.latest_frozen_satisfying(name, requested)? {
                 return Ok(Decision::fallback(
                     name,
-                    requested.to_string(),
+                    requested_version.to_string(),
                     frozen.version.to_string(),
                     reason,
                 ));
             }
         }
-        Ok(Decision::block(name, Some(requested.to_string()), reason))
+        Ok(Decision::block(
+            name,
+            Some(requested_version.to_string()),
+            reason,
+        ))
     }
 }
 
@@ -97,6 +110,16 @@ impl<'a> IngestService<'a> {
                 "integrity mismatch for {name}@{}: registry bytes do not match dist.integrity",
                 version.version
             );
+        }
+        let sha256 = self.hasher.sha256(&bytes);
+        if let Some(existing) = self.metadata.get_frozen(name, &version.version)? {
+            if existing.sha256 != sha256 {
+                anyhow::bail!(
+                    "registry immutability violation: {name}@{} already frozen with different bytes",
+                    version.version
+                );
+            }
+            return Ok(existing);
         }
         let path = self.artifacts.put(name, &version.version, &bytes)?;
         let artifact = FrozenArtifact {
@@ -208,12 +231,25 @@ mod tests {
         fn save_decision(&self, _: &Decision) -> Result<()> {
             Ok(())
         }
-        fn latest_frozen(&self, _: &str) -> Result<Option<FrozenArtifact>> {
-            Ok(self
+        fn latest_frozen_satisfying(
+            &self,
+            _: &str,
+            requested: Option<&VersionReq>,
+        ) -> Result<Option<FrozenArtifact>> {
+            let frozen = self
                 .0
                 .lock()
                 .map_err(|_| anyhow::anyhow!("lock poisoned"))?
-                .clone())
+                .clone();
+            Ok(frozen.filter(|a| requested.is_none_or(|r| r.matches(&a.version))))
+        }
+        fn get_frozen(&self, _: &str, version: &Version) -> Result<Option<FrozenArtifact>> {
+            let frozen = self
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("lock poisoned"))?
+                .clone();
+            Ok(frozen.filter(|a| a.version == *version))
         }
         fn put_frozen(&self, _: FrozenArtifact) -> Result<()> {
             Ok(())
@@ -247,7 +283,7 @@ mod tests {
     fn evaluator<'a>(
         policy: &'a Policy,
         clock: &'a FixedClock,
-        metadata: &'a M,
+        metadata: &'a dyn MetadataStore,
     ) -> PackageEvaluator<'a> {
         PackageEvaluator {
             policy,
@@ -269,7 +305,7 @@ mod tests {
         let c = FixedClock(now);
         let m = M(Mutex::new(Some(frozen("1.0.0"))));
         let e = evaluator(&p, &c, &m);
-        let d = e.evaluate(&package(Some(now - Duration::days(2))))?;
+        let d = e.evaluate(&package(Some(now - Duration::days(2))), None)?;
         assert_eq!(d.status, DecisionStatus::Fallback);
         assert_eq!(d.served_version.as_deref(), Some("1.0.0"));
         Ok(())
@@ -281,7 +317,7 @@ mod tests {
         let c = FixedClock(now);
         let m = M(Mutex::new(None));
         let e = evaluator(&p, &c, &m);
-        let d = e.evaluate(&package(None))?;
+        let d = e.evaluate(&package(None), None)?;
         assert_eq!(d.status, DecisionStatus::Block);
         assert!(d.reasons[0].contains("quarantine"));
         Ok(())
@@ -294,7 +330,7 @@ mod tests {
         let c = FixedClock(now);
         let m = M(Mutex::new(Some(frozen("1.0.0"))));
         let e = evaluator(&p, &c, &m);
-        let d = e.evaluate(&package(Some(now - Duration::days(30))))?;
+        let d = e.evaluate(&package(Some(now - Duration::days(30))), None)?;
         assert_eq!(d.status, DecisionStatus::Block);
         assert!(d.reasons[0].contains("denylisted"));
         Ok(())
@@ -306,8 +342,103 @@ mod tests {
         let c = FixedClock(now);
         let m = M(Mutex::new(None));
         let e = evaluator(&p, &c, &m);
-        let d = e.evaluate(&package(Some(now - Duration::days(30))))?;
+        let d = e.evaluate(&package(Some(now - Duration::days(30))), None)?;
         assert_eq!(d.status, DecisionStatus::Allow);
+        Ok(())
+    }
+    #[test]
+    fn range_aware_fallback_picks_latest_satisfying() -> Result<()> {
+        let now = Utc::now();
+        let p = Policy::default();
+        let c = FixedClock(now);
+        let store = crate::adapters::storage::MemoryMetadataStore::default();
+        store.put_frozen(frozen("1.0.0"))?;
+        store.put_frozen(frozen("1.5.0"))?;
+        let quarantined = package(Some(now - Duration::days(2)));
+        let e = evaluator(&p, &c, &store);
+        let caret_one = VersionReq::parse("^1.0.0")?;
+        let d = e.evaluate(&quarantined, Some(&caret_one))?;
+        assert_eq!(d.status, DecisionStatus::Fallback);
+        assert_eq!(d.served_version.as_deref(), Some("1.5.0"));
+        let caret_two = VersionReq::parse("^2.0.0")?;
+        let d = e.evaluate(&quarantined, Some(&caret_two))?;
+        assert_eq!(
+            d.status,
+            DecisionStatus::Block,
+            "no frozen version satisfies ^2.0.0: must block, not serve wrong major"
+        );
+        Ok(())
+    }
+    struct Reg(Vec<u8>);
+    impl UpstreamNpmRegistry for Reg {
+        fn metadata(&self, _: &str) -> Result<serde_json::Value> {
+            Ok(serde_json::json!({}))
+        }
+        fn tarball(&self, _: &str) -> Result<Vec<u8>> {
+            Ok(self.0.clone())
+        }
+    }
+    struct MemStore;
+    impl ArtifactStore for MemStore {
+        fn put(&self, _: &str, _: &Version, _: &[u8]) -> Result<String> {
+            Ok("p".into())
+        }
+        fn get(&self, _: &str) -> Result<Vec<u8>> {
+            Ok(vec![])
+        }
+    }
+    fn sri_sha512(bytes: &[u8]) -> String {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use sha2::Digest;
+        format!("sha512-{}", STANDARD.encode(sha2::Sha512::digest(bytes)))
+    }
+    fn ingest_into(
+        policy: &Policy,
+        store: &crate::adapters::storage::MemoryMetadataStore,
+        bytes: Vec<u8>,
+        integrity: String,
+    ) -> Result<FrozenArtifact> {
+        use crate::adapters::crypto::ShaHasher;
+        let pv = PackageVersion {
+            package: PackageCoordinate {
+                ecosystem: Ecosystem::Npm,
+                name: "left-pad".into(),
+            },
+            version: Version::parse("1.3.0")?,
+            published_at: None,
+            integrity: Some(integrity),
+            tarball_url: Some("http://registry/t.tgz".into()),
+        };
+        let hasher = ShaHasher;
+        IngestService {
+            policy,
+            registry: &Reg(bytes),
+            hasher: &hasher,
+            artifacts: &MemStore,
+            metadata: store,
+            clock: &FixedClock(Utc::now()),
+        }
+        .freeze_verified(&pv)
+    }
+    #[test]
+    fn republish_same_version_conflicting_bytes_rejected() -> Result<()> {
+        let p = Policy::default();
+        let store = crate::adapters::storage::MemoryMetadataStore::default();
+        let good = b"good bytes".to_vec();
+        let first = ingest_into(&p, &store, good.clone(), sri_sha512(&good))?;
+        assert_eq!(first.sha256.len(), 64);
+        let idempotent = ingest_into(&p, &store, good.clone(), sri_sha512(&good))?;
+        assert_eq!(
+            idempotent.sha256, first.sha256,
+            "same bytes re-freeze is idempotent"
+        );
+        let evil = b"evil payload".to_vec();
+        let republished = ingest_into(&p, &store, evil.clone(), sri_sha512(&evil));
+        let err = republished.unwrap_err().to_string();
+        assert!(
+            err.contains("immutability violation"),
+            "expected immutability violation, got: {err}"
+        );
         Ok(())
     }
     struct R(Vec<(String, String)>);

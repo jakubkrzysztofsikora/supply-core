@@ -1,7 +1,7 @@
 use crate::domain::*;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use semver::Version;
+use semver::{Version, VersionReq};
 use std::path::Path;
 
 pub trait Clock: Send + Sync {
@@ -17,8 +17,16 @@ pub trait VulnerabilitySource: Send + Sync {
 }
 pub trait MetadataStore: Send + Sync {
     fn save_decision(&self, decision: &Decision) -> Result<()>;
-    fn latest_frozen(&self, name: &str) -> Result<Option<FrozenArtifact>>;
     fn put_frozen(&self, artifact: FrozenArtifact) -> Result<()>;
+    fn get_frozen(&self, name: &str, version: &Version) -> Result<Option<FrozenArtifact>>;
+    fn latest_frozen_satisfying(
+        &self,
+        name: &str,
+        requested: Option<&VersionReq>,
+    ) -> Result<Option<FrozenArtifact>>;
+    fn latest_frozen(&self, name: &str) -> Result<Option<FrozenArtifact>> {
+        self.latest_frozen_satisfying(name, None)
+    }
 }
 pub trait ArtifactStore: Send + Sync {
     fn put(&self, name: &str, version: &Version, bytes: &[u8]) -> Result<String>;
