@@ -45,7 +45,20 @@ cargo run -- scan-actions . --annotations
 ```
 *Emits escaped GitHub workflow errors and exits `2` on policy findings.*
 
-### 3. Machine-Wide Daily Radar (macOS)
+### 3. Azure DevOps Pipeline Scan
+Check your repository for unpinned Azure DevOps tasks, external checkouts, or floating repository resources:
+
+```bash
+cargo run -- scan-pipelines .
+```
+
+*Want Azure DevOps pipeline annotations?*
+```bash
+cargo run -- scan-pipelines . --annotations
+```
+*Emits escaped Azure DevOps error logging commands (`##vso[task.logissue...]`) and exits `2` on policy findings.*
+
+### 4. Machine-Wide Daily Radar (macOS)
 Scan **all** git repositories across your machine every morning at 08:30 AM:
 
 ```bash

@@ -110,6 +110,7 @@ fn ecosystem_label(e: &Ecosystem) -> &'static str {
     match *e {
         Ecosystem::Npm => "npm",
         Ecosystem::GitHubActions => "github",
+        Ecosystem::AzurePipelines => "azure",
     }
 }
 
@@ -126,8 +127,8 @@ impl VulnerabilitySource for OsvVulnerabilitySource {
         name: &str,
         version: &Version,
     ) -> Result<Vec<VulnerabilityFinding>> {
-        if matches!(ecosystem, Ecosystem::GitHubActions) {
-            // OSV does not index Actions; the firewall does not act on
+        if matches!(ecosystem, Ecosystem::GitHubActions | Ecosystem::AzurePipelines) {
+            // OSV does not index Actions or Pipelines; the firewall does not act on
             // them. Return empty rather than spending a request.
             return Ok(vec![]);
         }

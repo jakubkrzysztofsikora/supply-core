@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use std::{net::SocketAddr, path::PathBuf};
 use supply_core::{
     adapters::{
+        azure_devops::{pipeline_annotations, FsAzurePipelineReader},
         config::load_policy,
         github::{workflow_annotations, FsWorkflowReader},
         http::app,
@@ -10,7 +11,7 @@ use supply_core::{
         osv::{NoopVulnerabilitySource, OsvVulnerabilitySource, ReqwestOsvTransport},
         storage::MemoryMetadataStore,
     },
-    application::{GitHubActionsScanner, PackageEvaluator},
+    application::{AzurePipelinesScanner, GitHubActionsScanner, PackageEvaluator},
 };
 
 #[derive(Parser)]
@@ -36,6 +37,18 @@ enum Command {
         #[arg(long)]
         json: bool,
         /// Emit GitHub Actions workflow error annotations for blocking findings.
+        #[arg(long, conflicts_with = "json")]
+        annotations: bool,
+    },
+    #[command(alias = "scan-azure-pipelines")]
+    ScanPipelines {
+        #[arg(default_value = ".")]
+        root: PathBuf,
+        #[arg(long)]
+        policy: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+        /// Emit Azure DevOps pipeline error logging commands (##vso[task.logissue...]) for blocking findings.
         #[arg(long, conflicts_with = "json")]
         annotations: bool,
     },
@@ -94,6 +107,34 @@ async fn main() -> Result<()> {
                     println!("BLOCK: {}", f.reasons.join("; "));
                 }
                 println!("scanned {} action references", report.references.len());
+            }
+            if report.is_blocking() {
+                std::process::exit(2);
+            }
+        }
+        Command::ScanPipelines {
+            root,
+            policy,
+            json,
+            annotations,
+        } => {
+            let p = load_policy(policy.as_deref())?;
+            let scanner = AzurePipelinesScanner {
+                policy: &p,
+                reader: &FsAzurePipelineReader,
+            };
+            let report = scanner.scan(&root)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else if annotations {
+                for annotation in pipeline_annotations(&report) {
+                    println!("{annotation}");
+                }
+            } else {
+                for f in &report.findings {
+                    println!("BLOCK: {}", f.reasons.join("; "));
+                }
+                println!("scanned {} pipeline references", report.references.len());
             }
             if report.is_blocking() {
                 std::process::exit(2);
@@ -254,6 +295,37 @@ mod cli_tests {
     #[test]
     fn annotations_and_json_are_mutually_exclusive() {
         let error = Cli::try_parse_from(["supply", "scan-actions", "--annotations", "--json"])
+            .err()
+            .map(|error| error.kind());
+        assert_eq!(error, Some(clap::error::ErrorKind::ArgumentConflict));
+    }
+
+    #[test]
+    fn scan_pipelines_flags_accepted() -> Result<()> {
+        let cli = Cli::try_parse_from(["supply", "scan-pipelines", "--annotations"])?;
+        assert!(matches!(
+            cli.command,
+            Command::ScanPipelines {
+                annotations: true,
+                json: false,
+                ..
+            }
+        ));
+        let cli_alias = Cli::try_parse_from(["supply", "scan-azure-pipelines", "--json"])?;
+        assert!(matches!(
+            cli_alias.command,
+            Command::ScanPipelines {
+                annotations: false,
+                json: true,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn scan_pipelines_annotations_and_json_conflict() {
+        let error = Cli::try_parse_from(["supply", "scan-pipelines", "--annotations", "--json"])
             .err()
             .map(|error| error.kind());
         assert_eq!(error, Some(clap::error::ErrorKind::ArgumentConflict));

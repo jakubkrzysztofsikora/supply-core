@@ -12,3 +12,10 @@ npm:
 github_actions:
   require_full_sha_pin: true
   allow_local_actions: true
+azure_pipelines:
+  require_task_version: true
+  require_full_sha_pin: true
+  allow_local_templates: true
+  allowed_unpinned_checkouts: []
+  allowed_unpinned_tasks: []
+  allowed_unpinned_repositories: []
