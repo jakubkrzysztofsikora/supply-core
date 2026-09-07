@@ -6,7 +6,7 @@ use supply_core::{
         azure_devops::{pipeline_annotations, FsAzurePipelineReader},
         config::load_policy,
         github::{workflow_annotations, FsWorkflowReader},
-        http::app,
+        http::app_with_config,
         npm::HttpNpmRegistry,
         osv::{NoopVulnerabilitySource, OsvVulnerabilitySource, ReqwestOsvTransport},
         storage::MemoryMetadataStore,
@@ -26,8 +26,18 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Serve {
-        #[arg(long, default_value = "127.0.0.1:4873")]
+        #[arg(long, default_value = "0.0.0.0:4873")]
         addr: SocketAddr,
+        #[arg(
+            long,
+            env = "SUPPLY_SERVICE_NAME",
+            default_value = "supply-core-official"
+        )]
+        service_name: String,
+        #[arg(long, env = "SUPPLY_ARTIFACTS_DIR")]
+        artifacts_dir: Option<PathBuf>,
+        #[arg(long, env = "SUPPLY_AUTH_TOKEN")]
+        auth_token: Option<String>,
     },
     ScanActions {
         #[arg(default_value = ".")]
@@ -80,9 +90,23 @@ impl supply_core::ports::Clock for SystemClock {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve { addr } => {
+        Command::Serve {
+            addr,
+            service_name,
+            artifacts_dir,
+            auth_token,
+        } => {
+            let config = supply_core::adapters::http::ServerConfig {
+                service_name,
+                artifacts_dir,
+                auth_token,
+            };
+            eprintln!(
+                "Starting supply-core server '{}' listening on {}",
+                config.service_name, addr
+            );
             let listener = tokio::net::TcpListener::bind(addr).await?;
-            axum::serve(listener, app()).await?;
+            axum::serve(listener, app_with_config(config)).await?;
         }
         Command::ScanActions {
             root,

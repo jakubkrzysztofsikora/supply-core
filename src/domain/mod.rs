@@ -438,7 +438,10 @@ mod tests {
             ActionPinKind::Local
         );
         assert_eq!(
-            classify_pipeline_ref("git://Circit/release-notes-generator", &PipelineRefKind::Checkout),
+            classify_pipeline_ref(
+                "git://Circit/release-notes-generator",
+                &PipelineRefKind::Checkout
+            ),
             ActionPinKind::TagOrBranch
         );
         assert_eq!(

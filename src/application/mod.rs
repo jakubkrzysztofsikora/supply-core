@@ -385,8 +385,7 @@ impl<'a> AzurePipelinesScanner<'a> {
                     }
                     PipelineRefKind::Action => match pin_kind {
                         ActionPinKind::FullSha => {}
-                        ActionPinKind::Local
-                            if self.policy.github_actions.allow_local_actions => {}
+                        ActionPinKind::Local if self.policy.github_actions.allow_local_actions => {}
                         ActionPinKind::Local => {
                             block = Some("Local GitHub Actions are disallowed by policy");
                         }
@@ -1057,7 +1056,9 @@ steps:
         }
         .scan(Path::new("."))?;
         assert!(report.is_blocking());
-        assert!(report.findings[0].reasons[0].contains("External repository checkout is not pinned"));
+        assert!(
+            report.findings[0].reasons[0].contains("External repository checkout is not pinned")
+        );
         assert_eq!(report.references[0].line, 2);
         Ok(())
     }
@@ -1066,7 +1067,10 @@ steps:
     fn azure_scanner_allows_pinned_external_checkouts() -> Result<()> {
         let policy = Policy::default();
         let sha = "0".repeat(40);
-        let body = format!("steps:\n  - checkout: git://Circit/release-notes-generator@{}\n", sha);
+        let body = format!(
+            "steps:\n  - checkout: git://Circit/release-notes-generator@{}\n",
+            sha
+        );
         let reader = R(vec![("pipelines/core-main.yml".into(), body)]);
         let report = AzurePipelinesScanner {
             policy: &policy,
