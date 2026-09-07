@@ -3,3 +3,5 @@
 .DS_Store
 PLAN.md
 experiments/data/
+__pycache__/
+*.pyc

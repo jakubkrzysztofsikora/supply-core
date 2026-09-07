@@ -3,8 +3,12 @@ use clap::{Parser, Subcommand};
 use std::{net::SocketAddr, path::PathBuf};
 use supply_core::{
     adapters::{
-        config::load_policy, github::FsWorkflowReader, http::app, npm::HttpNpmRegistry,
-        osv::NoopVulnerabilitySource, storage::MemoryMetadataStore,
+        config::load_policy,
+        github::{workflow_annotations, FsWorkflowReader},
+        http::app,
+        npm::HttpNpmRegistry,
+        osv::{NoopVulnerabilitySource, OsvVulnerabilitySource, ReqwestOsvTransport},
+        storage::MemoryMetadataStore,
     },
     application::{GitHubActionsScanner, PackageEvaluator},
 };
@@ -31,6 +35,9 @@ enum Command {
         policy: Option<PathBuf>,
         #[arg(long)]
         json: bool,
+        /// Emit GitHub Actions workflow error annotations for blocking findings.
+        #[arg(long, conflicts_with = "json")]
+        annotations: bool,
     },
     /// Snapshot every dependency of a package.json against the live
     /// registry: latest satisfying version, publish age, policy decision.
@@ -39,6 +46,15 @@ enum Command {
         root: PathBuf,
         #[arg(long)]
         policy: Option<PathBuf>,
+        /// Query the real OSV.dev API for known vulnerabilities.
+        /// Off by default to keep tests deterministic; the daily cron
+        /// sets this to populate the field report.
+        #[arg(long)]
+        osv: bool,
+        /// Directory to cache OSV responses in. Defaults to
+        /// `$HOME/.local/share/supply-core/osv-cache`.
+        #[arg(long)]
+        osv_cache: Option<PathBuf>,
     },
 }
 struct SystemClock;
@@ -55,7 +71,12 @@ async fn main() -> Result<()> {
             let listener = tokio::net::TcpListener::bind(addr).await?;
             axum::serve(listener, app()).await?;
         }
-        Command::ScanActions { root, policy, json } => {
+        Command::ScanActions {
+            root,
+            policy,
+            json,
+            annotations,
+        } => {
             let p = load_policy(policy.as_deref())?;
             let scanner = GitHubActionsScanner {
                 policy: &p,
@@ -64,6 +85,10 @@ async fn main() -> Result<()> {
             let report = scanner.scan(&root)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
+            } else if annotations {
+                for annotation in workflow_annotations(&report) {
+                    println!("{annotation}");
+                }
             } else {
                 for f in &report.findings {
                     println!("BLOCK: {}", f.reasons.join("; "));
@@ -74,9 +99,14 @@ async fn main() -> Result<()> {
                 std::process::exit(2);
             }
         }
-        Command::SnapshotNpm { root, policy } => {
+        Command::SnapshotNpm {
+            root,
+            policy,
+            osv,
+            osv_cache,
+        } => {
             let p = load_policy(policy.as_deref())?;
-            tokio::task::spawn_blocking(move || snapshot_npm(&root, &p))
+            tokio::task::spawn_blocking(move || snapshot_npm(&root, &p, osv, osv_cache.as_deref()))
                 .await
                 .map_err(|e| anyhow::anyhow!("snapshot task failed: {e}"))??;
         }
@@ -84,7 +114,12 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn snapshot_npm(root: &std::path::Path, policy: &supply_core::domain::Policy) -> Result<()> {
+fn snapshot_npm(
+    root: &std::path::Path,
+    policy: &supply_core::domain::Policy,
+    use_osv: bool,
+    osv_cache: Option<&std::path::Path>,
+) -> Result<()> {
     use supply_core::adapters::npm::package_version_from_metadata;
     use supply_core::domain::PackageVersion;
     use supply_core::ports::UpstreamNpmRegistry;
@@ -147,10 +182,26 @@ fn snapshot_npm(root: &std::path::Path, policy: &supply_core::domain::Policy) ->
             .published_at
             .map(|t| now.signed_duration_since(t).num_days())
             .unwrap_or(-1);
+        let noop: Box<dyn supply_core::ports::VulnerabilitySource> =
+            Box::new(NoopVulnerabilitySource);
+        let cached: Box<dyn supply_core::ports::VulnerabilitySource> = if use_osv {
+            let cache = osv_cache.map(|p| p.to_path_buf()).unwrap_or_else(|| {
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(std::env::temp_dir)
+                    .join(".local/share/supply-core/osv-cache")
+            });
+            Box::new(
+                OsvVulnerabilitySource::new(Box::new(ReqwestOsvTransport::new()?))
+                    .with_cache(cache),
+            )
+        } else {
+            noop
+        };
         let decision = PackageEvaluator {
             policy,
             clock: &SystemClock,
-            vulns: &NoopVulnerabilitySource,
+            vulns: cached.as_ref(),
             metadata: &store,
         }
         .evaluate(&pv, Some(&req));
@@ -180,4 +231,31 @@ fn snapshot_npm(root: &std::path::Path, policy: &supply_core::domain::Policy) ->
     });
     println!("{}", serde_json::to_string_pretty(&out)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn annotations_flag_is_accepted() -> Result<()> {
+        let cli = Cli::try_parse_from(["supply", "scan-actions", "--annotations"])?;
+        assert!(matches!(
+            cli.command,
+            Command::ScanActions {
+                annotations: true,
+                json: false,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn annotations_and_json_are_mutually_exclusive() {
+        let error = Cli::try_parse_from(["supply", "scan-actions", "--annotations", "--json"])
+            .err()
+            .map(|error| error.kind());
+        assert_eq!(error, Some(clap::error::ErrorKind::ArgumentConflict));
+    }
 }
