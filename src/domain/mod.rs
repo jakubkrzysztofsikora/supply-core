@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 pub enum Ecosystem {
     Npm,
     GitHubActions,
+    AzurePipelines,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -121,6 +122,7 @@ impl Decision {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct QuarantinePolicy {
     pub enabled: bool,
     pub minimum_age_days: i64,
@@ -135,6 +137,7 @@ impl Default for QuarantinePolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct VulnerabilityPolicy {
     pub block_severities: Vec<Severity>,
 }
@@ -147,6 +150,7 @@ impl Default for VulnerabilityPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct NpmPolicy {
     pub require_integrity: bool,
     pub fallback_to_frozen: bool,
@@ -163,6 +167,7 @@ impl Default for NpmPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GitHubActionsPolicy {
     pub require_full_sha_pin: bool,
     pub allow_local_actions: bool,
@@ -176,12 +181,41 @@ impl Default for GitHubActionsPolicy {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AzurePipelinesPolicy {
+    pub require_task_version: bool,
+    pub require_full_sha_pin: bool,
+    pub allow_local_templates: bool,
+    pub allowed_unpinned_checkouts: Vec<String>,
+    pub allowed_unpinned_tasks: Vec<String>,
+    pub allowed_unpinned_repositories: Vec<String>,
+}
+impl Default for AzurePipelinesPolicy {
+    fn default() -> Self {
+        Self {
+            require_task_version: true,
+            require_full_sha_pin: true,
+            allow_local_templates: true,
+            allowed_unpinned_checkouts: vec![],
+            allowed_unpinned_tasks: vec![],
+            allowed_unpinned_repositories: vec![],
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Policy {
+    #[serde(default)]
     pub quarantine: QuarantinePolicy,
+    #[serde(default)]
     pub vulnerabilities: VulnerabilityPolicy,
+    #[serde(default)]
     pub npm: NpmPolicy,
+    #[serde(default)]
     pub github_actions: GitHubActionsPolicy,
+    #[serde(default)]
+    pub azure_pipelines: AzurePipelinesPolicy,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ActionPinKind {
@@ -189,6 +223,7 @@ pub enum ActionPinKind {
     TagOrBranch,
     Local,
     Docker,
+    TaskVersion,
     Unknown,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,6 +231,24 @@ pub struct GitHubActionReference {
     pub raw: String,
     pub file: String,
     pub line: usize,
+    pub pin_kind: ActionPinKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PipelineRefKind {
+    Action,
+    Task,
+    Checkout,
+    Template,
+    Repository,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipelineReference {
+    pub raw: String,
+    pub file: String,
+    pub line: usize,
+    pub kind: PipelineRefKind,
     pub pin_kind: ActionPinKind,
 }
 
@@ -213,6 +266,64 @@ pub fn classify_action_ref(raw: &str) -> ActionPinKind {
         ActionPinKind::FullSha
     } else {
         ActionPinKind::TagOrBranch
+    }
+}
+
+pub fn classify_pipeline_ref(raw: &str, kind: &PipelineRefKind) -> ActionPinKind {
+    match kind {
+        PipelineRefKind::Task => {
+            if let Some((_, version)) = raw.rsplit_once('@') {
+                if !version.is_empty() {
+                    if version.len() == 40 && version.chars().all(|c| c.is_ascii_hexdigit()) {
+                        ActionPinKind::FullSha
+                    } else {
+                        ActionPinKind::TaskVersion
+                    }
+                } else {
+                    ActionPinKind::Unknown
+                }
+            } else {
+                ActionPinKind::Unknown
+            }
+        }
+        PipelineRefKind::Checkout => {
+            if raw == "self" || raw == "none" {
+                ActionPinKind::Local
+            } else if let Some((_, reference)) = raw.rsplit_once('@') {
+                if reference.len() == 40 && reference.chars().all(|c| c.is_ascii_hexdigit()) {
+                    ActionPinKind::FullSha
+                } else {
+                    ActionPinKind::TagOrBranch
+                }
+            } else {
+                ActionPinKind::TagOrBranch
+            }
+        }
+        PipelineRefKind::Template => {
+            if let Some((_, suffix)) = raw.rsplit_once('@') {
+                if suffix.len() == 40 && suffix.chars().all(|c| c.is_ascii_hexdigit()) {
+                    ActionPinKind::FullSha
+                } else {
+                    ActionPinKind::TagOrBranch
+                }
+            } else {
+                ActionPinKind::Local
+            }
+        }
+        PipelineRefKind::Repository => {
+            let trimmed = raw
+                .strip_prefix("refs/heads/")
+                .or_else(|| raw.strip_prefix("refs/tags/"))
+                .unwrap_or(raw);
+            if trimmed.len() == 40 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+                ActionPinKind::FullSha
+            } else if !trimmed.is_empty() {
+                ActionPinKind::TagOrBranch
+            } else {
+                ActionPinKind::Unknown
+            }
+        }
+        PipelineRefKind::Action => classify_action_ref(raw),
     }
 }
 
@@ -303,5 +414,65 @@ mod tests {
             summary: "x".into(),
         }];
         assert!(blocks_vulnerability(&f, &VulnerabilityPolicy::default()).is_some());
+    }
+    #[test]
+    fn classifies_pipeline_refs() {
+        assert_eq!(
+            classify_pipeline_ref("AzureCLI@2", &PipelineRefKind::Task),
+            ActionPinKind::TaskVersion
+        );
+        assert_eq!(
+            classify_pipeline_ref("UseNode@1.2.3", &PipelineRefKind::Task),
+            ActionPinKind::TaskVersion
+        );
+        assert_eq!(
+            classify_pipeline_ref("AzureCLI", &PipelineRefKind::Task),
+            ActionPinKind::Unknown
+        );
+        assert_eq!(
+            classify_pipeline_ref("self", &PipelineRefKind::Checkout),
+            ActionPinKind::Local
+        );
+        assert_eq!(
+            classify_pipeline_ref("none", &PipelineRefKind::Checkout),
+            ActionPinKind::Local
+        );
+        assert_eq!(
+            classify_pipeline_ref("git://Circit/release-notes-generator", &PipelineRefKind::Checkout),
+            ActionPinKind::TagOrBranch
+        );
+        assert_eq!(
+            classify_pipeline_ref(
+                "git://Circit/repo@0123456789abcdef0123456789abcdef01234567",
+                &PipelineRefKind::Checkout
+            ),
+            ActionPinKind::FullSha
+        );
+        assert_eq!(
+            classify_pipeline_ref("../templates/bicep.yml", &PipelineRefKind::Template),
+            ActionPinKind::Local
+        );
+        assert_eq!(
+            classify_pipeline_ref("template.yml@common-templates", &PipelineRefKind::Template),
+            ActionPinKind::TagOrBranch
+        );
+        assert_eq!(
+            classify_pipeline_ref(
+                "template.yml@common@0123456789abcdef0123456789abcdef01234567",
+                &PipelineRefKind::Template
+            ),
+            ActionPinKind::FullSha
+        );
+        assert_eq!(
+            classify_pipeline_ref(
+                "0123456789abcdef0123456789abcdef01234567",
+                &PipelineRefKind::Repository
+            ),
+            ActionPinKind::FullSha
+        );
+        assert_eq!(
+            classify_pipeline_ref("refs/heads/main", &PipelineRefKind::Repository),
+            ActionPinKind::TagOrBranch
+        );
     }
 }

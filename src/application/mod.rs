@@ -265,6 +265,292 @@ fn walk_value(v: &serde_norway::Value, out: &mut Vec<String>) {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineScanReport {
+    pub findings: Vec<Decision>,
+    pub references: Vec<PipelineReference>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub finding_locations: Vec<PipelineReference>,
+}
+impl PipelineScanReport {
+    pub fn is_blocking(&self) -> bool {
+        self.findings
+            .iter()
+            .any(|d| matches!(d.status, DecisionStatus::Block))
+    }
+}
+
+pub struct AzurePipelinesScanner<'a> {
+    pub policy: &'a Policy,
+    pub reader: &'a dyn WorkflowReader,
+}
+impl<'a> AzurePipelinesScanner<'a> {
+    pub fn scan(&self, root: &Path) -> Result<PipelineScanReport> {
+        let mut refs = vec![];
+        let mut findings = vec![];
+        let mut finding_locations = vec![];
+        for (file, body) in self.reader.read(root)? {
+            for (raw, kind, line) in extract_pipeline_references(&body)
+                .map_err(|error| anyhow::anyhow!("invalid pipeline {file}: {error}"))?
+            {
+                let pin_kind = classify_pipeline_ref(&raw, &kind);
+                let reference = PipelineReference {
+                    raw: raw.clone(),
+                    file: file.clone(),
+                    line,
+                    kind: kind.clone(),
+                    pin_kind: pin_kind.clone(),
+                };
+                let mut block = None;
+                match kind {
+                    PipelineRefKind::Task => {
+                        let is_allowed = self
+                            .policy
+                            .azure_pipelines
+                            .allowed_unpinned_tasks
+                            .iter()
+                            .any(|p| p == &raw);
+                        if !is_allowed {
+                            match pin_kind {
+                                ActionPinKind::TaskVersion | ActionPinKind::FullSha => {}
+                                ActionPinKind::Unknown
+                                    if self.policy.azure_pipelines.require_task_version =>
+                                {
+                                    block = Some(
+                                        "Azure DevOps task is missing a version specifier (e.g. @1, @2)",
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    PipelineRefKind::Checkout => {
+                        let is_allowed = self
+                            .policy
+                            .azure_pipelines
+                            .allowed_unpinned_checkouts
+                            .iter()
+                            .any(|p| p == &raw);
+                        if !is_allowed {
+                            match pin_kind {
+                                ActionPinKind::Local => {}
+                                ActionPinKind::FullSha => {}
+                                ActionPinKind::TagOrBranch | ActionPinKind::Unknown
+                                    if self.policy.azure_pipelines.require_full_sha_pin =>
+                                {
+                                    block = Some(
+                                        "External repository checkout is not pinned to a full 40-character commit SHA",
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    PipelineRefKind::Template => match pin_kind {
+                        ActionPinKind::Local
+                            if self.policy.azure_pipelines.allow_local_templates => {}
+                        ActionPinKind::Local => {
+                            block = Some("Local pipeline templates are disallowed by policy");
+                        }
+                        ActionPinKind::FullSha => {}
+                        ActionPinKind::TagOrBranch | ActionPinKind::Unknown
+                            if self.policy.azure_pipelines.require_full_sha_pin =>
+                        {
+                            block = Some(
+                                "External pipeline template repository is not pinned to a full 40-character commit SHA",
+                            );
+                        }
+                        _ => {}
+                    },
+                    PipelineRefKind::Repository => {
+                        let is_allowed = self
+                            .policy
+                            .azure_pipelines
+                            .allowed_unpinned_repositories
+                            .iter()
+                            .any(|p| p == &raw);
+                        if !is_allowed {
+                            match pin_kind {
+                                ActionPinKind::FullSha => {}
+                                ActionPinKind::TagOrBranch | ActionPinKind::Unknown
+                                    if self.policy.azure_pipelines.require_full_sha_pin =>
+                                {
+                                    block = Some(
+                                        "Repository resource is not pinned to a full 40-character commit SHA",
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    PipelineRefKind::Action => match pin_kind {
+                        ActionPinKind::FullSha => {}
+                        ActionPinKind::Local
+                            if self.policy.github_actions.allow_local_actions => {}
+                        ActionPinKind::Local => {
+                            block = Some("Local GitHub Actions are disallowed by policy");
+                        }
+                        ActionPinKind::TagOrBranch
+                            if self.policy.github_actions.require_full_sha_pin =>
+                        {
+                            block = Some(
+                                "GitHub Action is not pinned to a full 40-character commit SHA",
+                            );
+                        }
+                        ActionPinKind::Docker => {
+                            block = Some(
+                                "Docker actions are not immutable unless image digests are enforced",
+                            );
+                        }
+                        ActionPinKind::Unknown => {
+                            block = Some("GitHub Action reference could not be classified");
+                        }
+                        _ => {}
+                    },
+                }
+                if let Some(reason) = block {
+                    finding_locations.push(reference.clone());
+                    findings.push(Decision::block(
+                        raw.clone(),
+                        None,
+                        if line == 0 {
+                            format!("{reason} at {file}")
+                        } else {
+                            format!("{reason} at {file}:{line}")
+                        },
+                    ));
+                }
+                refs.push(reference);
+            }
+        }
+        Ok(PipelineScanReport {
+            findings,
+            references: refs,
+            finding_locations,
+        })
+    }
+}
+
+pub fn extract_pipeline_references(body: &str) -> Result<Vec<(String, PipelineRefKind, usize)>> {
+    let root = serde_norway::from_str::<serde_norway::Value>(body)?;
+    let mut out = Vec::new();
+    walk_pipeline_value(&root, &mut out);
+    let mut located = Vec::new();
+    for (raw, kind) in out {
+        let line = find_pipeline_ref_line(body, &raw, &kind);
+        located.push((raw, kind, line));
+    }
+    Ok(located)
+}
+
+fn walk_pipeline_value(v: &serde_norway::Value, out: &mut Vec<(String, PipelineRefKind)>) {
+    use serde_norway::Value;
+    match v {
+        Value::Mapping(map) => {
+            for (k, val) in map.iter() {
+                if let Value::String(key_str) = k {
+                    match key_str.as_str() {
+                        "task" => {
+                            if let Value::String(s) = val {
+                                out.push((s.clone(), PipelineRefKind::Task));
+                            }
+                            continue;
+                        }
+                        "checkout" => {
+                            if let Value::String(s) = val {
+                                out.push((s.clone(), PipelineRefKind::Checkout));
+                            }
+                            continue;
+                        }
+                        "template" => {
+                            if let Value::String(s) = val {
+                                out.push((s.clone(), PipelineRefKind::Template));
+                            }
+                            continue;
+                        }
+                        "uses" => {
+                            if let Value::String(s) = val {
+                                out.push((s.clone(), PipelineRefKind::Action));
+                            }
+                            continue;
+                        }
+                        "repositories" => {
+                            if let Value::Sequence(seq) = val {
+                                for item in seq {
+                                    if let Value::Mapping(repo_map) = item {
+                                        let repo_val = repo_map.get("repository").and_then(|v| {
+                                            if let Value::String(s) = v {
+                                                Some(s.clone())
+                                            } else {
+                                                None
+                                            }
+                                        });
+                                        let ref_val = repo_map.get("ref").and_then(|v| {
+                                            if let Value::String(s) = v {
+                                                Some(s.clone())
+                                            } else {
+                                                None
+                                            }
+                                        });
+                                        if let Some(name) = repo_val {
+                                            if let Some(r) = ref_val {
+                                                out.push((
+                                                    format!("{name}@{r}"),
+                                                    PipelineRefKind::Repository,
+                                                ));
+                                            } else {
+                                                out.push((name, PipelineRefKind::Repository));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                walk_pipeline_value(val, out);
+            }
+        }
+        Value::Sequence(seq) => {
+            for item in seq.iter() {
+                walk_pipeline_value(item, out);
+            }
+        }
+        Value::Tagged(t) => walk_pipeline_value(&t.value, out),
+        _ => {}
+    }
+}
+
+fn find_pipeline_ref_line(body: &str, raw: &str, kind: &PipelineRefKind) -> usize {
+    let keyword = match kind {
+        PipelineRefKind::Task => "task:",
+        PipelineRefKind::Checkout => "checkout:",
+        PipelineRefKind::Template => "template:",
+        PipelineRefKind::Repository => "repository:",
+        PipelineRefKind::Action => "uses:",
+    };
+    let target = if let PipelineRefKind::Repository = kind {
+        if let Some((repo, _)) = raw.split_once('@') {
+            repo
+        } else {
+            raw
+        }
+    } else {
+        raw
+    };
+    for (idx, line) in body.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed.contains(keyword) && trimmed.contains(target) {
+            return idx + 1;
+        }
+    }
+    0
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -720,6 +1006,116 @@ mod tests {
         .scan(Path::new("."))?;
         assert!(report.is_blocking());
         assert!(report.findings[0].reasons[0].contains("Local GitHub Actions are disallowed"));
+        Ok(())
+    }
+
+    #[test]
+    fn azure_scanner_passes_versioned_tasks_and_local_templates() -> Result<()> {
+        let policy = Policy::default();
+        let body = r#"
+steps:
+  - checkout: self
+  - checkout: none
+  - task: UseNode@1
+  - task: AzureCLI@2
+  - template: ../templates/build.yml
+"#;
+        let reader = R(vec![("pipelines/pr.yml".into(), body.into())]);
+        let scanner = AzurePipelinesScanner {
+            policy: &policy,
+            reader: &reader,
+        };
+        let report = scanner.scan(Path::new("."))?;
+        assert!(!report.is_blocking());
+        assert_eq!(report.references.len(), 5);
+        Ok(())
+    }
+
+    #[test]
+    fn azure_scanner_blocks_unversioned_tasks() -> Result<()> {
+        let policy = Policy::default();
+        let body = "steps:\n  - task: AzureCLI\n";
+        let reader = R(vec![("pipelines/pr.yml".into(), body.into())]);
+        let report = AzurePipelinesScanner {
+            policy: &policy,
+            reader: &reader,
+        }
+        .scan(Path::new("."))?;
+        assert!(report.is_blocking());
+        assert!(report.findings[0].reasons[0].contains("missing a version specifier"));
+        Ok(())
+    }
+
+    #[test]
+    fn azure_scanner_blocks_unpinned_external_checkouts() -> Result<()> {
+        let policy = Policy::default();
+        let body = "steps:\n  - checkout: git://Circit/release-notes-generator\n";
+        let reader = R(vec![("pipelines/core-main.yml".into(), body.into())]);
+        let report = AzurePipelinesScanner {
+            policy: &policy,
+            reader: &reader,
+        }
+        .scan(Path::new("."))?;
+        assert!(report.is_blocking());
+        assert!(report.findings[0].reasons[0].contains("External repository checkout is not pinned"));
+        assert_eq!(report.references[0].line, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn azure_scanner_allows_pinned_external_checkouts() -> Result<()> {
+        let policy = Policy::default();
+        let sha = "0".repeat(40);
+        let body = format!("steps:\n  - checkout: git://Circit/release-notes-generator@{}\n", sha);
+        let reader = R(vec![("pipelines/core-main.yml".into(), body)]);
+        let report = AzurePipelinesScanner {
+            policy: &policy,
+            reader: &reader,
+        }
+        .scan(Path::new("."))?;
+        assert!(!report.is_blocking());
+        Ok(())
+    }
+
+    #[test]
+    fn azure_scanner_respects_allowed_unpinned_checkouts() -> Result<()> {
+        let mut policy = Policy::default();
+        policy
+            .azure_pipelines
+            .allowed_unpinned_checkouts
+            .push("git://Circit/release-notes-generator".into());
+        let body = "steps:\n  - checkout: git://Circit/release-notes-generator\n";
+        let reader = R(vec![("pipelines/core-main.yml".into(), body.into())]);
+        let report = AzurePipelinesScanner {
+            policy: &policy,
+            reader: &reader,
+        }
+        .scan(Path::new("."))?;
+        assert!(!report.is_blocking());
+        Ok(())
+    }
+
+    #[test]
+    fn azure_scanner_blocks_unpinned_repositories_and_templates() -> Result<()> {
+        let policy = Policy::default();
+        let body = r#"
+resources:
+  repositories:
+    - repository: common
+      type: git
+      name: Circit/common
+      ref: refs/heads/main
+steps:
+  - template: build.yml@common
+"#;
+        let reader = R(vec![("pipelines/ci.yml".into(), body.into())]);
+        let report = AzurePipelinesScanner {
+            policy: &policy,
+            reader: &reader,
+        }
+        .scan(Path::new("."))?;
+        assert!(report.is_blocking());
+        assert_eq!(report.findings.len(), 2);
         Ok(())
     }
 }
