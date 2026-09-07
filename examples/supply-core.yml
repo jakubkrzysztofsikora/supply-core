@@ -1,3 +1,6 @@
+server:
+  service_url: "https://supply-core.tail5d39b4.ts.net"  # Official service is primary by default
+  allow_fallback: false  # Overwritable only by explicit config
 quarantine:
   enabled: true
   minimum_age_days: 7

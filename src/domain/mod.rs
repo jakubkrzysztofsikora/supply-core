@@ -204,8 +204,29 @@ impl Default for AzurePipelinesPolicy {
     }
 }
 
+pub const OFFICIAL_SERVICE_URL: &str = "https://supply-core.tail5d39b4.ts.net";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServerPolicy {
+    pub service_url: String,
+    pub allow_fallback: bool,
+    pub force_official: bool,
+}
+impl Default for ServerPolicy {
+    fn default() -> Self {
+        Self {
+            service_url: OFFICIAL_SERVICE_URL.to_string(),
+            allow_fallback: false,
+            force_official: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Policy {
+    #[serde(default)]
+    pub server: ServerPolicy,
     #[serde(default)]
     pub quarantine: QuarantinePolicy,
     #[serde(default)]
