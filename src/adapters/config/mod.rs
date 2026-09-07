@@ -10,6 +10,10 @@ pub fn load_policy(path: Option<&Path>) -> Result<Policy> {
     }
 }
 
+pub fn parse_policy_str(content: &str) -> Result<Policy> {
+    Ok(serde_norway::from_str(content)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

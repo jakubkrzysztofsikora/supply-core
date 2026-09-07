@@ -51,7 +51,11 @@ impl WorkflowReader for FsAzurePipelineReader {
         if root.is_file() {
             let ext = root.extension().and_then(|x| x.to_str()).unwrap_or("");
             if matches!(ext, "yml" | "yaml") {
-                let rel = root.file_name().unwrap_or_default().to_string_lossy().to_string();
+                let rel = root
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
                 return Ok(vec![(rel, fs::read_to_string(root)?)]);
             }
             return Ok(vec![]);

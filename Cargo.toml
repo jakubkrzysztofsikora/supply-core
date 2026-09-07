@@ -8,7 +8,7 @@ anyhow = "1"
 axum = "0.7"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde", "clock"] }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 hex = "0.4"
 http = "1"
 regex = "1"

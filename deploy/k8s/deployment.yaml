@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: supply-core-official
+  namespace: supply-core
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: supply-core-official
+  template:
+    metadata:
+      labels:
+        app: supply-core-official
+    spec:
+      containers:
+      - name: app
+        image: ghcr.io/jakubkrzysztofsikora/supply-core:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 4873
+          name: http
+        env:
+        - name: SUPPLY_SERVICE_NAME
+          value: "supply-core-official"
+        - name: SUPPLY_ARTIFACTS_DIR
+          value: "/app/artifacts"
+        - name: PORT
+          value: "4873"
+        - name: HOST
+          value: "127.0.0.1"
+        volumeMounts:
+        - name: artifacts
+          mountPath: /app/artifacts
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 4873
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 4873
+          initialDelaySeconds: 10
+          periodSeconds: 20
+      - name: ts-funnel
+        image: tailscale/tailscale:stable
+        env:
+        - name: TS_AUTHKEY
+          valueFrom:
+            secretKeyRef:
+              name: ts-sidecar-auth
+              key: TS_AUTHKEY
+        - name: TS_HOSTNAME
+          value: supply-core
+        - name: TS_USERSPACE
+          value: "true"
+        - name: TS_SERVE_CONFIG
+          value: /config/serve.json
+        - name: TS_STATE_DIR
+          value: /var/lib/tailscale
+        - name: TS_KUBE_SECRET
+          value: ""
+        volumeMounts:
+        - name: config
+          mountPath: /config
+          readOnly: true
+        - name: state
+          mountPath: /var/lib/tailscale
+      volumes:
+      - name: artifacts
+        persistentVolumeClaim:
+          claimName: supply-core-artifacts
+      - name: config
+        configMap:
+          name: ts-funnel-config
+      - name: state
+        persistentVolumeClaim:
+          claimName: ts-funnel-state

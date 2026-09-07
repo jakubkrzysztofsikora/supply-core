@@ -1,5 +1,22 @@
 services:
   supply-core:
-    build: .
+    image: ghcr.io/jakubkrzysztofsikora/supply-core:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: supply-core
+    restart: unless-stopped
     ports:
       - "4873:4873"
+    environment:
+      - SUPPLY_SERVICE_NAME=supply-core-selfhosted
+      - PORT=4873
+    volumes:
+      - ./artifacts:/app/artifacts
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:4873/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
