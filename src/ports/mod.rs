@@ -30,7 +30,15 @@ pub trait MetadataStore: Send + Sync {
 }
 pub trait ArtifactStore: Send + Sync {
     fn put(&self, name: &str, version: &Version, bytes: &[u8]) -> Result<String>;
-    fn get(&self, path: &str) -> Result<Vec<u8>>;
+    /// Resolve a frozen artifact for `(name, version)`. Returns the
+    /// canonical on-disk path inside the store root, or `None` if no
+    /// such artifact exists. The store validates `name` and confines
+    /// the resulting path to its artifact directory.
+    fn resolve(&self, name: &str, version: &Version) -> Result<Option<String>>;
+    /// Read an artifact into memory, rejecting paths outside the store's
+    /// artifact directory. Callers normally obtain paths from `resolve`
+    /// or `put`; this API does not track path provenance.
+    fn read(&self, path: &str) -> Result<Vec<u8>>;
 }
 pub trait Hasher: Send + Sync {
     fn sha256(&self, bytes: &[u8]) -> String;

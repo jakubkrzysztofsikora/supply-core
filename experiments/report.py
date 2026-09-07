@@ -3,6 +3,7 @@
 what works, what doesn't, efficiency. Run after `run.sh` on any later day."""
 import json
 import sys
+import re
 from pathlib import Path
 
 HERE = Path(__file__).parent
@@ -10,7 +11,8 @@ DATA = HERE / "data"
 
 
 def load_days():
-    days = sorted(d for d in DATA.iterdir() if d.is_dir())
+    days = sorted(d for d in DATA.iterdir()
+                  if d.is_dir() and re.fullmatch(r"\d{4}-\d{2}-\d{2}", d.name))
     if len(days) < 2:
         print("need >= 2 capture days; run ./run.sh again later")
         sys.exit(1)

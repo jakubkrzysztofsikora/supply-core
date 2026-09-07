@@ -63,6 +63,20 @@ impl<'a> PackageEvaluator<'a> {
         let reason = reason.into();
         if self.policy.npm.fallback_to_frozen {
             if let Some(frozen) = self.metadata.latest_frozen_satisfying(name, requested)? {
+                // Frozen bytes are immutable, but vulnerability knowledge changes.
+                let findings = self.vulns.query(Ecosystem::Npm, name, &frozen.version)?;
+                if let Some(fallback_reason) =
+                    blocks_vulnerability(&findings, &self.policy.vulnerabilities)
+                {
+                    return Ok(Decision::block(
+                        name,
+                        Some(requested_version.to_string()),
+                        format!(
+                            "{reason}; frozen fallback {} blocked: {fallback_reason}",
+                            frozen.version
+                        ),
+                    ));
+                }
                 return Ok(Decision::fallback(
                     name,
                     requested_version.to_string(),
@@ -139,6 +153,9 @@ impl<'a> IngestService<'a> {
 pub struct WorkflowScanReport {
     pub findings: Vec<Decision>,
     pub references: Vec<GitHubActionReference>,
+    /// Locations in the same order as findings; absent in older serialized reports.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub finding_locations: Vec<GitHubActionReference>,
 }
 impl WorkflowScanReport {
     pub fn is_blocking(&self) -> bool {
@@ -156,61 +173,96 @@ impl<'a> GitHubActionsScanner<'a> {
     pub fn scan(&self, root: &Path) -> Result<WorkflowScanReport> {
         let mut refs = vec![];
         let mut findings = vec![];
+        let mut finding_locations = vec![];
         for (file, body) in self.reader.read(root)? {
-            for (idx, line) in body.lines().enumerate() {
-                if let Some(raw) = extract_uses(line) {
-                    let pin_kind = classify_action_ref(&raw);
-                    let reference = GitHubActionReference {
-                        raw: raw.clone(),
-                        file: file.clone(),
-                        line: idx + 1,
-                        pin_kind: pin_kind.clone(),
-                    };
-                    let mut block = None;
-                    match pin_kind {
-                        ActionPinKind::FullSha => {}
-                        ActionPinKind::Local if self.policy.github_actions.allow_local_actions => {}
-                        ActionPinKind::TagOrBranch
-                            if self.policy.github_actions.require_full_sha_pin =>
-                        {
-                            block = Some(
-                                "GitHub Action is not pinned to a full 40-character commit SHA",
-                            )
-                        }
-                        ActionPinKind::Docker => block = Some(
+            for (raw, line) in extract_uses(&body)
+                .map_err(|error| anyhow::anyhow!("invalid workflow {file}: {error}"))?
+            {
+                let pin_kind = classify_action_ref(&raw);
+                let reference = GitHubActionReference {
+                    raw: raw.clone(),
+                    file: file.clone(),
+                    line,
+                    pin_kind: pin_kind.clone(),
+                };
+                let mut block = None;
+                match pin_kind {
+                    ActionPinKind::FullSha => {}
+                    ActionPinKind::Local if self.policy.github_actions.allow_local_actions => {}
+                    ActionPinKind::Local => {
+                        block = Some("Local GitHub Actions are disallowed by policy")
+                    }
+                    ActionPinKind::TagOrBranch
+                        if self.policy.github_actions.require_full_sha_pin =>
+                    {
+                        block =
+                            Some("GitHub Action is not pinned to a full 40-character commit SHA")
+                    }
+                    ActionPinKind::Docker => {
+                        block = Some(
                             "Docker actions are not immutable unless image digests are enforced",
-                        ),
-                        ActionPinKind::Unknown => {
-                            block = Some("GitHub Action reference could not be classified")
-                        }
-                        _ => {}
+                        )
                     }
-                    if let Some(reason) = block {
-                        findings.push(Decision::block(
-                            raw.clone(),
-                            None,
-                            format!("{reason} at {file}:{}", idx + 1),
-                        ));
+                    ActionPinKind::Unknown => {
+                        block = Some("GitHub Action reference could not be classified")
                     }
-                    refs.push(reference);
+                    _ => {}
                 }
+                if let Some(reason) = block {
+                    finding_locations.push(reference.clone());
+                    findings.push(Decision::block(
+                        raw.clone(),
+                        None,
+                        if line == 0 {
+                            format!("{reason} at {file}")
+                        } else {
+                            format!("{reason} at {file}:{line}")
+                        },
+                    ));
+                }
+                refs.push(reference);
             }
         }
         Ok(WorkflowScanReport {
             findings,
             references: refs,
+            finding_locations,
         })
     }
 }
-fn extract_uses(line: &str) -> Option<String> {
-    let s = line.trim().trim_start_matches('-').trim();
-    let rest = s.strip_prefix("uses:")?.trim();
-    if let Some(quote) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') {
-        let inner = rest.strip_prefix(quote)?.strip_suffix(quote)?;
-        return Some(inner.to_string());
+/// Extract all parsed YAML `uses` occurrences, including repeated values.
+/// Line 0 means unknown: serde_norway's value tree does not retain source spans.
+/// Raw text matching cannot safely locate folded scalars, aliases, or repeated
+/// values inside comments and run blocks, so it never gates security findings.
+pub fn extract_uses(body: &str) -> Result<Vec<(String, usize)>> {
+    let root = serde_norway::from_str::<serde_norway::Value>(body)?;
+    let mut out = Vec::new();
+    walk_value(&root, &mut out);
+    Ok(out.into_iter().map(|value| (value, 0)).collect())
+}
+fn walk_value(v: &serde_norway::Value, out: &mut Vec<String>) {
+    use serde_norway::Value;
+    match v {
+        Value::Mapping(map) => {
+            for (k, val) in map.iter() {
+                let key_is_uses = matches!(k, Value::String(s) if s == "uses");
+                if key_is_uses {
+                    if let Value::String(s) = val {
+                        out.push(s.clone());
+                    }
+                    continue;
+                }
+                walk_value(val, out);
+            }
+        }
+        Value::Sequence(seq) => {
+            for item in seq.iter() {
+                walk_value(item, out);
+            }
+        }
+        Value::Tagged(t) => walk_value(&t.value, out),
+        _ => {}
     }
-    let value = rest.split_once(" #").map(|(v, _)| v).unwrap_or(rest);
-    Some(value.trim().to_string())
 }
 
 #[cfg(test)]
@@ -311,6 +363,64 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn frozen_fallback_is_rechecked_for_vulnerabilities() -> Result<()> {
+        struct Source {
+            fail: bool,
+            queried: Mutex<Vec<Version>>,
+        }
+        impl VulnerabilitySource for Source {
+            fn query(
+                &self,
+                _: Ecosystem,
+                _: &str,
+                version: &Version,
+            ) -> Result<Vec<VulnerabilityFinding>> {
+                self.queried.lock().unwrap().push(version.clone());
+                if version.major != 1 {
+                    return Ok(vec![]);
+                }
+                if self.fail {
+                    anyhow::bail!("OSV unavailable for fallback");
+                }
+                Ok(vec![VulnerabilityFinding {
+                    source: "OSV".into(),
+                    id: "TEST-FROZEN".into(),
+                    severity: Severity::High,
+                    summary: "new advisory".into(),
+                }])
+            }
+        }
+        let now = Utc::now();
+        let policy = Policy::default();
+        let clock = FixedClock(now);
+        let metadata = M(Mutex::new(Some(frozen("1.0.0"))));
+        for fail in [false, true] {
+            let source = Source {
+                fail,
+                queried: Mutex::new(vec![]),
+            };
+            let evaluator = PackageEvaluator {
+                policy: &policy,
+                clock: &clock,
+                vulns: &source,
+                metadata: &metadata,
+            };
+            let result = evaluator.evaluate(&package(Some(now)), None);
+            if fail {
+                assert!(result.is_err(), "fallback query errors must fail closed");
+            } else {
+                let decision = result?;
+                assert_eq!(decision.status, DecisionStatus::Block);
+                assert!(decision.reasons[0].contains("TEST-FROZEN"));
+            }
+            assert_eq!(
+                *source.queried.lock().unwrap(),
+                vec![Version::new(2, 0, 0), Version::new(1, 0, 0)]
+            );
+        }
+        Ok(())
+    }
+    #[test]
     fn missing_published_at_is_quarantined() -> Result<()> {
         let now = Utc::now();
         let p = Policy::default();
@@ -383,7 +493,10 @@ mod tests {
         fn put(&self, _: &str, _: &Version, _: &[u8]) -> Result<String> {
             Ok("p".into())
         }
-        fn get(&self, _: &str) -> Result<Vec<u8>> {
+        fn resolve(&self, _: &str, _: &Version) -> Result<Option<String>> {
+            Ok(Some("p".into()))
+        }
+        fn read(&self, _: &str) -> Result<Vec<u8>> {
             Ok(vec![])
         }
     }
@@ -474,6 +587,139 @@ mod tests {
         let r = s.scan(Path::new("."))?;
         assert!(!r.is_blocking());
         assert_eq!(r.references.len(), 2);
+        Ok(())
+    }
+
+    // ----- adversarial parser tests (see docs/adversarial-review.md) -----
+
+    fn scan_str(body: &str) -> WorkflowScanReport {
+        GitHubActionsScanner {
+            policy: &Policy::default(),
+            reader: &R(vec![(".github/workflows/ci.yml".into(), body.into())]),
+        }
+        .scan(Path::new("."))
+        .unwrap()
+    }
+
+    #[test]
+    fn flow_mapping_uses_is_detected() {
+        let body = "steps:\n  - { uses: actions/checkout@v4 }\n";
+        let r = scan_str(body);
+        assert!(r.is_blocking());
+        assert_eq!(r.references.len(), 1);
+        assert_eq!(r.references[0].raw, "actions/checkout@v4");
+    }
+
+    #[test]
+    fn quoted_uses_with_trailing_comment_is_detected() {
+        let body = "steps:\n  - uses: \"actions/checkout@main\" # pinned\n";
+        let r = scan_str(body);
+        assert!(r.is_blocking());
+        assert_eq!(r.references.len(), 1);
+        assert_eq!(r.references[0].raw, "actions/checkout@main");
+    }
+
+    #[test]
+    fn space_before_colon_uses_is_detected() {
+        let body = "steps:\n  - uses : actions/checkout@v4\n";
+        let r = scan_str(body);
+        assert!(r.is_blocking());
+        assert_eq!(r.references.len(), 1);
+    }
+
+    #[test]
+    fn run_block_with_literal_uses_text_is_ignored() {
+        let body = "steps:\n  - run: |\n      echo \"uses: actions/checkout@v4\"\n";
+        let r = scan_str(body);
+        assert!(!r.is_blocking());
+        assert_eq!(r.references.len(), 0);
+    }
+
+    #[test]
+    fn mixed_block_and_flow_and_quoted_in_one_file() {
+        let sha = "0".repeat(40);
+        let body = format!(
+            "steps:\n  - uses: actions/checkout@v4\n  - {{ uses: actions/setup-node@v4 }}\n  - uses: \"actions/setup-python@{}\" # pinned\n",
+            sha
+        );
+        let r = scan_str(&body);
+        assert_eq!(r.references.len(), 3);
+        assert!(r.is_blocking());
+    }
+
+    #[test]
+    fn malformed_yaml_returns_error() {
+        let body = "steps:\n  - uses: actions/checkout@v4\n  oops: [unclosed\n";
+        let error = GitHubActionsScanner {
+            policy: &Policy::default(),
+            reader: &R(vec![(".github/workflows/ci.yml".into(), body.into())]),
+        }
+        .scan(Path::new("."))
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("invalid workflow .github/workflows/ci.yml"));
+    }
+
+    #[test]
+    fn quoted_key_and_flow_extra_key_are_detected() {
+        for body in [
+            "steps:\n  - 'uses': actions/checkout@v4\n",
+            "steps:\n  - { uses: actions/checkout@v4, name: checkout }\n",
+        ] {
+            let report = scan_str(body);
+            assert!(report.is_blocking());
+            assert_eq!(report.references.len(), 1);
+            assert_eq!(report.references[0].raw, "actions/checkout@v4");
+        }
+    }
+
+    #[test]
+    fn folded_and_escaped_scalars_are_detected() {
+        for body in [
+            "steps:\n  - uses: >-\n      actions/checkout@v4\n",
+            "steps:\n  - uses: \"actions/checkout@\\u00764\"\n",
+        ] {
+            let report = scan_str(body);
+            assert!(report.is_blocking());
+            assert_eq!(report.references[0].raw, "actions/checkout@v4");
+            assert_eq!(report.references[0].line, 0);
+        }
+    }
+
+    #[test]
+    fn repeated_references_are_preserved_without_matching_run_text() {
+        let report = scan_str("steps:\n  - run: |\n      uses: actions/checkout@v4\n  - uses: actions/checkout@v4\n  - uses: actions/checkout@v4\n");
+        assert_eq!(report.references.len(), 2);
+        assert_eq!(report.findings.len(), 2);
+        assert!(report
+            .finding_locations
+            .iter()
+            .all(|reference| reference.line == 0));
+    }
+
+    #[test]
+    fn local_actions_policy_is_enforced() -> Result<()> {
+        let mut policy = Policy::default();
+        let reader = R(vec![(
+            "ci.yml".into(),
+            "steps:\n  - uses: ./local-action\n".into(),
+        )]);
+        policy.github_actions.allow_local_actions = true;
+        assert!(!GitHubActionsScanner {
+            policy: &policy,
+            reader: &reader
+        }
+        .scan(Path::new("."))?
+        .is_blocking());
+        policy.github_actions.allow_local_actions = false;
+        let report = GitHubActionsScanner {
+            policy: &policy,
+            reader: &reader,
+        }
+        .scan(Path::new("."))?;
+        assert!(report.is_blocking());
+        assert!(report.findings[0].reasons[0].contains("Local GitHub Actions are disallowed"));
         Ok(())
     }
 }
