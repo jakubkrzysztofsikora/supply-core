@@ -6,12 +6,12 @@ RUN apk add --no-cache musl-dev pkgconfig
 
 WORKDIR /app
 
-# Cache dependency builds
+# Fetch dependencies before copying source to keep dependency downloads cacheable.
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && \
     echo "fn main() {}" > src/main.rs && \
     echo "" > src/lib.rs && \
-    cargo build --release || true && \
+    cargo fetch --locked && \
     rm -rf src
 
 # Build application
