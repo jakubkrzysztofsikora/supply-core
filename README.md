@@ -84,9 +84,10 @@ docker compose up -d
 **Official Cluster Service (Homelab / Tailscale Funnel):**
 - Tailscale MagicDNS: `supply-core.tail5d39b4.ts.net`
 - Public HTTPS Funnel: `https://supply-core.tail5d39b4.ts.net`
+- Public dashboard: `https://supply-core.tail5d39b4.ts.net/`
 - Health check: `curl https://supply-core.tail5d39b4.ts.net/health`
 - Pre-built binary download: `curl -sSL https://supply-core.tail5d39b4.ts.net/api/v1/download/supply-core-linux-x86_64 -o supply-core`
-- Remote pipeline scan: set `SUPPLY_AUTH_TOKEN` on the server and send `Authorization: Bearer <token>` with scan requests.
+- Remote pipeline scan: set `SUPPLY_AUTH_TOKEN` on the server and include a matching bearer token in scan requests.
 
 **Deploy to Kubernetes (K3s):**
 ```bash
