@@ -6,6 +6,7 @@ use anyhow::Result;
 use semver::{Version, VersionReq};
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -78,15 +79,18 @@ impl ArtifactStore for FsArtifactStore {
         let dir = artifacts_root.join(safe);
         ensure_directory(&dir)?;
         let p = dir.join(format!("{version}.tgz"));
-        match fs::symlink_metadata(&p) {
-            Ok(meta) if !meta.file_type().is_file() => {
-                anyhow::bail!("artifact destination is not a regular file")
+        let mut file = match fs::OpenOptions::new().write(true).create_new(true).open(&p) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                anyhow::bail!("artifact already exists: {}", p.display())
             }
-            Ok(_) => (),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
             Err(e) => return Err(e.into()),
+        };
+        if let Err(error) = file.write_all(bytes) {
+            drop(file);
+            let _ = fs::remove_file(&p);
+            return Err(error.into());
         }
-        fs::write(&p, bytes)?;
         Ok(p.display().to_string())
     }
     fn resolve(&self, name: &str, version: &Version) -> Result<Option<String>> {

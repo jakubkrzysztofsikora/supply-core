@@ -109,24 +109,28 @@ pub fn app_with_config(config: ServerConfig) -> Router {
 }
 
 fn check_auth(state: &ServerConfig, headers: &HeaderMap) -> Result<(), (StatusCode, Json<Value>)> {
-    if let Some(expected_token) = &state.auth_token {
-        let auth_header = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|h| h.to_str().ok());
-        let token_match = match auth_header {
-            Some(val) if val.starts_with("Bearer ") => {
-                let token = val.trim_start_matches("Bearer ").trim();
-                token == expected_token
-            }
-            _ => false,
-        };
-
-        if !token_match {
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                Json(json!({"error": "unauthorized: valid Bearer token required"})),
-            ));
+    let Some(expected_token) = &state.auth_token else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "scan authentication is not configured"})),
+        ));
+    };
+    let auth_header = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok());
+    let token_match = match auth_header {
+        Some(val) if val.starts_with("Bearer ") => {
+            let token = val.trim_start_matches("Bearer ").trim();
+            token == expected_token
         }
+        _ => false,
+    };
+
+    if !token_match {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "unauthorized: valid Bearer token required"})),
+        ));
     }
     Ok(())
 }
@@ -336,7 +340,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_remote_pipeline_scan_passes() {
-        let app = app();
+        let app = app_with_config(ServerConfig {
+            auth_token: Some("test-token".into()),
+            ..ServerConfig::default()
+        });
 
         let payload = json!({
             "files": [
@@ -353,6 +360,7 @@ mod tests {
                     .method("POST")
                     .uri("/api/v1/scan/pipelines")
                     .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
                     .body(axum::body::Body::from(payload.to_string()))
                     .unwrap_or_else(|_| panic!("valid request")),
             )
@@ -364,7 +372,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_remote_pipeline_scan_blocks_unpinned() {
-        let app = app();
+        let app = app_with_config(ServerConfig {
+            auth_token: Some("test-token".into()),
+            ..ServerConfig::default()
+        });
 
         let payload = json!({
             "files": [
@@ -381,6 +392,7 @@ mod tests {
                     .method("POST")
                     .uri("/api/v1/scan/pipelines")
                     .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
                     .body(axum::body::Body::from(payload.to_string()))
                     .unwrap_or_else(|_| panic!("valid request")),
             )
@@ -388,5 +400,24 @@ mod tests {
             .unwrap_or_else(|_| panic!("request succeeds"));
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_remote_scan_requires_configured_authentication() {
+        let app = app();
+        let payload = json!({"files": []});
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/scan/pipelines")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(payload.to_string()))
+                    .unwrap_or_else(|_| panic!("valid request")),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("request succeeds"));
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

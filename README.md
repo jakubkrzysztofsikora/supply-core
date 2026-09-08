@@ -86,11 +86,12 @@ docker compose up -d
 - Public HTTPS Funnel: `https://supply-core.tail5d39b4.ts.net`
 - Health check: `curl https://supply-core.tail5d39b4.ts.net/health`
 - Pre-built binary download: `curl -sSL https://supply-core.tail5d39b4.ts.net/api/v1/download/supply-core-linux-x86_64 -o supply-core`
-- Remote pipeline scan: `curl -X POST https://supply-core.tail5d39b4.ts.net/api/v1/scan/pipelines -H "Content-Type: application/json" -d '{"files": [...]}'`
+- Remote pipeline scan: set `SUPPLY_AUTH_TOKEN` on the server and send `Authorization: Bearer <token>` with scan requests.
 
 **Deploy to Kubernetes (K3s):**
 ```bash
-# Deploy manifests with Tailscale Funnel sidecar
+# Create deploy/k8s/secret.yaml locally from your secret manager; it is intentionally gitignored.
+# Then deploy manifests with the Tailscale Funnel sidecar.
 kubectl apply -k deploy/k8s
 ```
 

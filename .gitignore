@@ -5,3 +5,4 @@ PLAN.md
 experiments/data/
 __pycache__/
 *.pyc
+deploy/k8s/secret.yaml

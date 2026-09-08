@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
       - name: app
-        image: ghcr.io/jakubkrzysztofsikora/supply-core:latest
+        image: ghcr.io/jakubkrzysztofsikora/supply-core:v0.1.0
         imagePullPolicy: Always
         ports:
         - containerPort: 4873
@@ -47,7 +47,7 @@ spec:
           initialDelaySeconds: 10
           periodSeconds: 20
       - name: ts-funnel
-        image: tailscale/tailscale:stable
+        image: tailscale/tailscale@sha256:8c42c4574ab066384fcb72f69e086a2ff1dd3652eb6f56856cee34bcf0d2f680
         env:
         - name: TS_AUTHKEY
           valueFrom:
