@@ -1,0 +1,217 @@
+<!doctype html>
+<!-- Visual baseline adapted from the open-source AdminKit dashboard pattern. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Supply Core | Server status</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #18212f;
+      --muted: #6b778c;
+      --line: #e5eaf1;
+      --surface: #ffffff;
+      --canvas: #f5f7fb;
+      --accent: #3761e9;
+      --accent-soft: #eaf0ff;
+      --good: #16835b;
+      --good-soft: #e4f6ee;
+      --warn: #a56800;
+      --warn-soft: #fff3d8;
+      --shadow: 0 14px 40px rgba(32, 52, 84, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--canvas);
+      color: var(--ink);
+      font: 15px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    a { color: var(--accent); }
+    .shell { min-height: 100vh; }
+    .topbar {
+      align-items: center;
+      background: var(--surface);
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      justify-content: space-between;
+      padding: 20px clamp(20px, 5vw, 72px);
+    }
+    .brand { align-items: center; display: flex; gap: 12px; }
+    .brand-mark {
+      align-items: center;
+      background: var(--accent);
+      border-radius: 10px;
+      color: white;
+      display: inline-flex;
+      font-weight: 800;
+      height: 38px;
+      justify-content: center;
+      letter-spacing: -0.08em;
+      width: 38px;
+    }
+    .brand-name { font-size: 17px; font-weight: 750; letter-spacing: -0.02em; }
+    .brand-subtitle { color: var(--muted); font-size: 12px; }
+    .status-pill {
+      align-items: center;
+      background: var(--good-soft);
+      border-radius: 999px;
+      color: var(--good);
+      display: inline-flex;
+      font-size: 13px;
+      font-weight: 700;
+      gap: 8px;
+      padding: 7px 12px;
+    }
+    .status-dot { background: currentColor; border-radius: 50%; height: 7px; width: 7px; }
+    main { margin: 0 auto; max-width: 1180px; padding: 54px clamp(20px, 5vw, 72px) 72px; }
+    .intro { margin-bottom: 30px; }
+    h1 { font-size: clamp(30px, 4vw, 46px); letter-spacing: -0.05em; line-height: 1.05; margin: 0 0 12px; }
+    .intro p { color: var(--muted); margin: 0; max-width: 650px; }
+    .grid { display: grid; gap: 18px; grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      box-shadow: var(--shadow);
+      padding: 22px;
+    }
+    .metric-label { color: var(--muted); font-size: 12px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+    .metric-value { font-size: 30px; font-weight: 780; letter-spacing: -0.05em; margin-top: 10px; }
+    .metric-note { color: var(--muted); font-size: 13px; margin-top: 5px; }
+    .section { margin-top: 28px; }
+    .section-head { align-items: end; display: flex; justify-content: space-between; margin-bottom: 12px; }
+    h2 { font-size: 20px; letter-spacing: -0.03em; margin: 0; }
+    .section-head p { color: var(--muted); font-size: 13px; margin: 0; }
+    .table-wrap { overflow-x: auto; }
+    table { border-collapse: collapse; min-width: 560px; width: 100%; }
+    th, td { border-bottom: 1px solid var(--line); padding: 15px 12px; text-align: left; }
+    th { color: var(--muted); font-size: 11px; letter-spacing: .07em; text-transform: uppercase; }
+    td:first-child, th:first-child { padding-left: 0; }
+    td:last-child, th:last-child { padding-right: 0; text-align: right; }
+    .empty { color: var(--muted); padding: 28px 0 12px; }
+    .badge { background: var(--warn-soft); border-radius: 999px; color: var(--warn); font-size: 12px; font-weight: 700; padding: 5px 9px; }
+    footer { color: var(--muted); font-size: 12px; margin-top: 42px; }
+    @media (max-width: 800px) {
+      .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .topbar { align-items: flex-start; gap: 16px; }
+      .status-pill { white-space: nowrap; }
+    }
+    @media (max-width: 480px) {
+      .grid { grid-template-columns: 1fr 1fr; }
+      .metric-value { font-size: 25px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">SC</span>
+        <div>
+          <div class="brand-name">Supply Core</div>
+          <div class="brand-subtitle">Dependency firewall diagnostics</div>
+        </div>
+      </div>
+      <div class="status-pill"><span class="status-dot"></span><span id="service-status">Checking status</span></div>
+    </header>
+    <main>
+      <section class="intro">
+        <h1>Server status</h1>
+        <p>Public diagnostics for the Supply Core service. Repository contents and project-specific details are intentionally not shown.</p>
+      </section>
+      <section class="grid" aria-label="Service diagnostics">
+        <article class="card">
+          <div class="metric-label">Service</div>
+          <div class="metric-value" id="service-name">—</div>
+          <div class="metric-note" id="service-version">Version —</div>
+        </article>
+        <article class="card">
+          <div class="metric-label">Health</div>
+          <div class="metric-value" id="health-value">—</div>
+          <div class="metric-note">Public health probe</div>
+        </article>
+        <article class="card">
+          <div class="metric-label">Quarantine window</div>
+          <div class="metric-value"><span id="quarantine-days">—</span>d</div>
+          <div class="metric-note">Minimum package age</div>
+        </article>
+        <article class="card">
+          <div class="metric-label">Packages held</div>
+          <div class="metric-value" id="quarantine-count">—</div>
+          <div class="metric-note">Currently in quarantine</div>
+        </article>
+      </section>
+      <section class="section card">
+        <div class="section-head">
+          <div>
+            <h2>Packages in quarantine</h2>
+            <p>Only package name, version, age, and status are shown.</p>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Package</th><th>Version</th><th>Age</th><th>Status</th></tr>
+            </thead>
+            <tbody id="quarantine-list">
+              <tr><td colspan="4" class="empty">Loading quarantine data…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+      <footer>Supply Core <span id="footer-version"></span> · Public diagnostics only · Updated <span id="updated-at">—</span></footer>
+    </main>
+  </div>
+  <script>
+    const text = (id, value) => { document.getElementById(id).textContent = value; };
+    const render = (data) => {
+      text("service-status", data.health.status === "ok" ? "Operational" : "Degraded");
+      text("service-name", data.service);
+      text("service-version", `Version ${data.version}`);
+      text("health-value", data.health.status === "ok" ? "OK" : "Degraded");
+      text("quarantine-days", data.quarantine.minimum_age_days);
+      text("quarantine-count", data.quarantine.packages.length);
+      text("footer-version", `v${data.version}`);
+      text("updated-at", new Date(data.generated_at).toLocaleTimeString());
+      const list = document.getElementById("quarantine-list");
+      list.replaceChildren();
+      if (!data.quarantine.packages.length) {
+        const row = document.createElement("tr");
+        const cell = document.createElement("td");
+        cell.colSpan = 4;
+        cell.className = "empty";
+        cell.textContent = "No packages are currently held in quarantine.";
+        row.appendChild(cell);
+        list.appendChild(row);
+        return;
+      }
+      data.quarantine.packages.forEach((pkg) => {
+        const row = document.createElement("tr");
+        [pkg.name, pkg.version, `${pkg.age_days} days`].forEach((value) => {
+          const cell = document.createElement("td");
+          cell.textContent = value;
+          row.appendChild(cell);
+        });
+        const status = document.createElement("td");
+        const badge = document.createElement("span");
+        badge.className = "badge";
+        badge.textContent = "Held";
+        status.appendChild(badge);
+        row.appendChild(status);
+        list.appendChild(row);
+      });
+    };
+    fetch("/api/v1/status", { headers: { Accept: "application/json" } })
+      .then((response) => response.ok ? response.json() : Promise.reject(new Error("status unavailable")))
+      .then(render)
+      .catch(() => {
+        text("service-status", "Unavailable");
+        text("health-value", "Error");
+        document.getElementById("quarantine-list").innerHTML = '<tr><td colspan="4" class="empty">Diagnostics are temporarily unavailable.</td></tr>';
+      });
+  </script>
+</body>
+</html>

@@ -1,4 +1,4 @@
-# supply-core 🛡️
+# supply-core
 
 **Local-first supply-chain security firewall & silent daily vulnerability radar.**
 
@@ -12,17 +12,17 @@ No SaaS accounts. No cloud dashboards. No agent daemons. Zero telemetry.
 
 ---
 
-## ⚡ The 10-Second Pitch (Why You Need This)
+## The 10-Second Pitch (Why You Need This)
 
 Every modern project imports hundreds of third-party dependencies and uses unpinned GitHub Actions:
 
-- 🪤 **0-Day NPM Poisoning**: Malicious packages sit on the public registry for an average of 48 hours before takedown. `supply-core` automatically quarantines packages published <24h/72h and transparently falls back to known-good frozen versions.
-- 🚨 **Floating GitHub Actions**: If you use `actions/checkout@v4`, anyone compromising that tag gets write tokens in your CI pipeline. `supply-core` catches and flags floating tags in milliseconds.
-- ☕ **Morning Coffee Snapshot**: A passive daily LaunchAgent checks all 100+ repositories across your Mac, inventories lockfiles (`package-lock.json`, `yarn.lock`), checks OSV.dev, and leaves a crisp `report.md` on your desk.
+- **0-Day NPM Poisoning**: Malicious packages sit on the public registry for an average of 48 hours before takedown. `supply-core` automatically quarantines packages published <24h/72h and transparently falls back to known-good frozen versions.
+- **Floating GitHub Actions**: If you use `actions/checkout@v4`, anyone compromising that tag gets write tokens in your CI pipeline. `supply-core` catches and flags floating tags in milliseconds.
+- **Morning Snapshot**: A passive daily LaunchAgent checks all 100+ repositories across your Mac, inventories lockfiles (`package-lock.json`, `yarn.lock`), checks OSV.dev, and leaves a crisp `report.md` on your desk.
 
 ---
 
-## 🚀 Quickstart
+## Quickstart
 
 ### 1. The One-Line Docker Setup
 Run the local caching firewall & health endpoint in one command:
@@ -97,7 +97,7 @@ kubectl apply -k deploy/k8s
 
 ---
 
-## 🛠️ Superpowers at a Glance
+## Features at a Glance
 
 | Feature | What It Does | Why It Matters |
 |---|---|---|
@@ -110,7 +110,7 @@ kubectl apply -k deploy/k8s
 
 ---
 
-## 📋 Architecture & Data Flow
+## Architecture & Data Flow
 
 ```text
 [ Developer Machine / CI ]
@@ -129,7 +129,7 @@ kubectl apply -k deploy/k8s
 
 ---
 
-## ☕ Morning Report Example
+## Morning Report Example
 
 Every morning, open `~/.local/share/supply-core/latest.json` or `runs/<timestamp>/report.md`:
 
@@ -137,18 +137,18 @@ Every morning, open `~/.local/share/supply-core/latest.json` or `runs/<timestamp
 # Machine-wide supply-chain evaluation
 **Timestamp:** 2026-09-07T18:42:30Z | **Repositories:** 105 | **Exact versions:** 10,201
 
-### 🔴 Top Findings
+### Top Findings
 - `Repos/dashboard` (yarn.lock): 411 advisory hits (Prototype Pollution, ReDoS)
 - `Repos/api` (.github/workflows/deploy.yml): 8 unpinned actions (`actions/checkout@v4`)
 
-### 🟢 Status
+### Status
 - Cached OSV lookups: 9,840 / 10,201 (96.4% cache hit rate)
 - Evaluation runtime: 4.2 seconds
 ```
 
 ---
 
-## ⚙️ Configuration & Policy
+## Configuration & Policy
 
 Policies are defined in a clean YAML structure (see [`examples/supply-core.yml`](examples/supply-core.yml)):
 
@@ -169,7 +169,7 @@ rules:
 
 ---
 
-## 🧪 Development & Testing
+## Development & Testing
 
 ```bash
 # Run all unit and integration tests (45 tests)
@@ -186,7 +186,7 @@ CI checks formatting, tests, Clippy, and maintains an 85% library line-coverage 
 
 ---
 
-## 📚 Deep Dive & Specifications
+## Deep Dive & Specifications
 
 - [Machine-wide Evaluation Spec](docs/machine-evaluation.md) — Multi-repo discovery, LaunchAgent setup, evidence structure.
 - [Threat Model & Security Assumptions](docs/threat-model.md) — Trust boundaries, attack vectors, residual risks.
@@ -196,6 +196,6 @@ CI checks formatting, tests, Clippy, and maintains an 85% library line-coverage 
 
 ---
 
-## 📄 License
+## License
 
 MIT License. Designed for developers who value security, speed, and clean code.
