@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # Multi-stage static build for supply-core
-FROM rust:1.80-alpine AS builder
+FROM rust:1-alpine AS builder
 
 RUN apk add --no-cache musl-dev pkgconfig
 
@@ -26,7 +26,7 @@ RUN apk add --no-cache ca-certificates curl tzdata && \
 
 WORKDIR /app
 
-COPY --from=builder /app/target/release/supply /usr/local/bin/supply-core
+COPY --from=builder /app/target/release/supply-core /usr/local/bin/supply-core
 RUN ln -s /usr/local/bin/supply-core /usr/local/bin/supply && \
     mkdir -p /app/artifacts /app/data && \
     chown -R supply:supply /app
