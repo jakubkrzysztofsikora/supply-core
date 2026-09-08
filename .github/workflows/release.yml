@@ -54,7 +54,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/supply" "dist/${{ matrix.name }}"
+          cp "target/${{ matrix.target }}/release/supply-core" "dist/${{ matrix.name }}"
           chmod +x "dist/${{ matrix.name }}"
           cd dist
           if command -v sha256sum >/dev/null 2>&1; then
