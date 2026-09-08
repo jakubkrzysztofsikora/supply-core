@@ -98,7 +98,6 @@ jobs:
 
   publish-docker:
     name: Build & Push Container Image
-    needs: [publish-release]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
