@@ -10,6 +10,7 @@ services:
       - "4873:4873"
     environment:
       - SUPPLY_SERVICE_NAME=supply-core-selfhosted
+      - SUPPLY_STATUS_FILE=/app/data/quarantine-status.json
       - PORT=4873
     volumes:
       - ./artifacts:/app/artifacts

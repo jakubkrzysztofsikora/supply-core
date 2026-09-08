@@ -11,7 +11,7 @@ use axum::{
     extract::{Path as AxumPath, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Redirect, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,7 @@ const PUBLIC_STATUS_PAGE: &str = include_str!("../../../web/index.html");
 pub struct ServerConfig {
     pub service_name: String,
     pub artifacts_dir: Option<PathBuf>,
+    pub status_file: Option<PathBuf>,
     pub auth_token: Option<String>,
 }
 
@@ -38,6 +39,7 @@ impl Default for ServerConfig {
             artifacts_dir: std::env::var("SUPPLY_ARTIFACTS_DIR")
                 .ok()
                 .map(PathBuf::from),
+            status_file: std::env::var("SUPPLY_STATUS_FILE").ok().map(PathBuf::from),
             auth_token: std::env::var("SUPPLY_AUTH_TOKEN").ok(),
         }
     }
@@ -91,6 +93,20 @@ pub struct ActionScanResponse {
     pub annotations: Vec<String>,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+struct QuarantinedPackage {
+    name: String,
+    version: String,
+    age_days: i64,
+    status: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+struct QuarantineSnapshot {
+    captured_at: String,
+    packages: Vec<QuarantinedPackage>,
+}
+
 pub fn app() -> Router {
     app_with_config(ServerConfig::default())
 }
@@ -103,6 +119,7 @@ pub fn app_with_config(config: ServerConfig) -> Router {
         .route("/", get(status_page))
         .route("/api/v1/health", get(detailed_health))
         .route("/api/v1/status", get(public_status))
+        .route("/api/v1/status/quarantine", put(publish_quarantine_status))
         .route("/api/v1/version", get(version_info))
         .route("/api/v1/download/:artifact", get(download_artifact))
         .route("/api/v1/scan/pipelines", post(scan_azure_pipelines))
@@ -147,6 +164,9 @@ fn check_auth(state: &ServerConfig, headers: &HeaderMap) -> Result<(), (StatusCo
 }
 
 async fn public_status(State(state): State<Arc<ServerConfig>>) -> Json<Value> {
+    let snapshot = read_quarantine_snapshot(state.status_file.as_deref())
+        .ok()
+        .flatten();
     Json(json!({
         "generated_at": chrono::Utc::now().to_rfc3339(),
         "service": state.service_name,
@@ -155,9 +175,75 @@ async fn public_status(State(state): State<Arc<ServerConfig>>) -> Json<Value> {
         "quarantine": {
             "enabled": true,
             "minimum_age_days": 7,
-            "packages": []
+            "captured_at": snapshot.as_ref().map(|snapshot| &snapshot.captured_at),
+            "packages": snapshot.map(|snapshot| snapshot.packages).unwrap_or_default()
         }
     }))
+}
+
+async fn publish_quarantine_status(
+    headers: HeaderMap,
+    State(state): State<Arc<ServerConfig>>,
+    Json(snapshot): Json<QuarantineSnapshot>,
+) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    check_auth(&state, &headers)?;
+    validate_quarantine_snapshot(&snapshot)?;
+    let Some(status_file) = state.status_file.as_deref() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "quarantine status storage is not configured"})),
+        ));
+    };
+    write_quarantine_snapshot(status_file, &snapshot).map_err(|err| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("failed to persist quarantine status: {err}")})),
+        )
+    })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn validate_quarantine_snapshot(
+    snapshot: &QuarantineSnapshot,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let valid_time = chrono::DateTime::parse_from_rfc3339(&snapshot.captured_at).is_ok();
+    let valid_packages = snapshot.packages.len() <= 5_000
+        && snapshot.packages.iter().all(|package| {
+            !package.name.trim().is_empty()
+                && !package.version.trim().is_empty()
+                && package.age_days >= 0
+                && matches!(package.status.as_str(), "Block" | "Fallback")
+        });
+    if valid_time && valid_packages {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "invalid quarantine snapshot"})),
+        ))
+    }
+}
+
+fn read_quarantine_snapshot(path: Option<&Path>) -> Result<Option<QuarantineSnapshot>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn write_quarantine_snapshot(path: &Path, snapshot: &QuarantineSnapshot) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("quarantine status path has no parent directory"))?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = path.with_extension("tmp");
+    std::fs::write(&temporary, serde_json::to_vec(snapshot)?)?;
+    std::fs::rename(temporary, path)?;
+    Ok(())
 }
 
 async fn health_check(State(state): State<Arc<ServerConfig>>) -> Json<Value> {
@@ -396,6 +482,58 @@ mod tests {
             .await
             .unwrap_or_else(|_| panic!("request succeeds"));
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn published_quarantine_snapshot_is_returned_by_public_status() {
+        let directory = tempfile::tempdir().unwrap_or_else(|_| panic!("temporary directory"));
+        let app = app_with_config(ServerConfig {
+            auth_token: Some("test-token".into()),
+            status_file: Some(directory.path().join("quarantine-status.json")),
+            ..ServerConfig::default()
+        });
+        let snapshot = json!({
+            "captured_at": "2026-09-08T08:15:00Z",
+            "packages": [{
+                "name": "next",
+                "version": "16.3.4",
+                "age_days": 6,
+                "status": "Block"
+            }]
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/status/quarantine")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .body(axum::body::Body::from(snapshot.to_string()))
+                    .unwrap_or_else(|_| panic!("valid request")),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("request succeeds"));
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/status")
+                    .body(axum::body::Body::empty())
+                    .unwrap_or_else(|_| panic!("valid request")),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("request succeeds"));
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap_or_else(|_| panic!("response body is readable"));
+        let status: Value =
+            serde_json::from_slice(&body).unwrap_or_else(|_| panic!("response is JSON"));
+        assert_eq!(status["quarantine"]["captured_at"], "2026-09-08T08:15:00Z");
+        assert_eq!(status["quarantine"]["packages"], snapshot["packages"]);
     }
 
     #[tokio::test]

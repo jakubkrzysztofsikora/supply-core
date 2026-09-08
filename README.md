@@ -88,10 +88,21 @@ docker compose up -d
 - Health check: `curl https://supply-core.tail5d39b4.ts.net/health`
 - Pre-built binary download: `curl -sSL https://supply-core.tail5d39b4.ts.net/api/v1/download/supply-core-linux-x86_64 -o supply-core`
 - Remote pipeline scan: set `SUPPLY_AUTH_TOKEN` on the server and include a matching bearer token in scan requests.
+- Quarantine dashboard: the daily capture publishes only package name, version, age, and decision using the same token. Store its local configuration outside the repository at `~/.config/supply-core/status-publisher.env`:
+
+  ```bash
+  SUPPLY_STATUS_URL=https://supply-core.tail5d39b4.ts.net
+  SUPPLY_STATUS_AUTH_TOKEN=the-matching-SUPPLY_AUTH_TOKEN
+  ```
+
+  The next successful capture updates the public dashboard; its snapshot contains no repository paths, ranges, or advisory details.
 
 **Deploy to Kubernetes (K3s):**
 ```bash
-# Create deploy/k8s/secret.yaml locally from your secret manager; it is intentionally gitignored.
+# Apply the SOPS-managed cluster secret from the homelab-cluster repository first:
+SOPS_AGE_KEY_FILE=~/cluster-migration/.secrets/age-key.txt \
+  ~/cluster-migration/homelab-cluster/scripts/secrets-apply.sh \
+  ~/cluster-migration/homelab-cluster/secrets/ts-sidecar-auth.enc.yaml
 # Then deploy manifests with the Tailscale Funnel sidecar.
 kubectl apply -k deploy/k8s
 ```
