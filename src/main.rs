@@ -36,6 +36,8 @@ enum Command {
         service_name: String,
         #[arg(long, env = "SUPPLY_ARTIFACTS_DIR")]
         artifacts_dir: Option<PathBuf>,
+        #[arg(long, env = "SUPPLY_STATUS_FILE")]
+        status_file: Option<PathBuf>,
         #[arg(long, env = "SUPPLY_AUTH_TOKEN")]
         auth_token: Option<String>,
     },
@@ -94,11 +96,13 @@ async fn main() -> Result<()> {
             addr,
             service_name,
             artifacts_dir,
+            status_file,
             auth_token,
         } => {
             let config = supply_core::adapters::http::ServerConfig {
                 service_name,
                 artifacts_dir,
+                status_file,
                 auth_token,
             };
             eprintln!(

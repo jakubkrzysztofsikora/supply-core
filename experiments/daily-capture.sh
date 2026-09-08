@@ -20,6 +20,13 @@ export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/us
 export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 
+# This private file supplies SUPPLY_STATUS_URL and SUPPLY_STATUS_AUTH_TOKEN.
+# It stays outside the repository because cron does not inherit shell secrets.
+PUBLISH_ENV="${SUPPLY_STATUS_PUBLISH_ENV:-$HOME/.config/supply-core/status-publisher.env}"
+if [ -r "$PUBLISH_ENV" ]; then
+  . "$PUBLISH_ENV"
+fi
+
 cd "$ROOT" || exit 1
 {
   echo "=== $(date -u +%FT%TZ) ==="
@@ -51,6 +58,21 @@ cd "$ROOT" || exit 1
   SUPPLY_BIN="$BIN" "$HERE/run.sh" "$DAY" || capture_rc=$?
   if [ "$capture_rc" -ne 0 ]; then
     echo "ERROR: run.sh failed (exit $capture_rc)"
+  elif [ -n "${SUPPLY_STATUS_URL:-}" ] && [ -n "${SUPPLY_STATUS_AUTH_TOKEN:-}" ]; then
+    snapshot="$HERE/data/$DAY/quarantine-status.json"
+    if python3 "$HERE/publish-status.py" "$HERE/data/$DAY" > "$snapshot" \
+      && curl --fail --silent --show-error --request PUT \
+        --header "Authorization: Bearer $SUPPLY_STATUS_AUTH_TOKEN" \
+        --header "Content-Type: application/json" \
+        --data-binary "@$snapshot" \
+        "${SUPPLY_STATUS_URL%/}/api/v1/status/quarantine"; then
+      echo "published quarantine status"
+    else
+      echo "ERROR: failed to publish quarantine status"
+      capture_rc=1
+    fi
+  else
+    echo "WARN: quarantine status publisher is not configured"
   fi
 
   # Field-test gate: exit non-zero on regressions vs the committed baseline.

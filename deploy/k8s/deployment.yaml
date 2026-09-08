@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
       - name: app
-        image: ghcr.io/jakubkrzysztofsikora/supply-core:v0.1.1
+        image: ghcr.io/jakubkrzysztofsikora/supply-core:v0.1.2
         imagePullPolicy: Always
         ports:
         - containerPort: 4873
@@ -27,6 +27,13 @@ spec:
           value: "supply-core-official"
         - name: SUPPLY_ARTIFACTS_DIR
           value: "/app/artifacts"
+        - name: SUPPLY_STATUS_FILE
+          value: "/app/artifacts/quarantine-status.json"
+        - name: SUPPLY_AUTH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: supply-core-auth
+              key: SUPPLY_AUTH_TOKEN
         - name: PORT
           value: "4873"
         - name: HOST
