@@ -21,6 +21,8 @@ use std::{
     sync::Arc,
 };
 
+const PUBLIC_STATUS_PAGE: &str = include_str!("../../../web/index.html");
+
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub service_name: String,
@@ -98,7 +100,9 @@ pub fn app_with_config(config: ServerConfig) -> Router {
 
     Router::new()
         .route("/health", get(health_check))
+        .route("/", get(status_page))
         .route("/api/v1/health", get(detailed_health))
+        .route("/api/v1/status", get(public_status))
         .route("/api/v1/version", get(version_info))
         .route("/api/v1/download/:artifact", get(download_artifact))
         .route("/api/v1/scan/pipelines", post(scan_azure_pipelines))
@@ -106,6 +110,13 @@ pub fn app_with_config(config: ServerConfig) -> Router {
         .route("/api/v1/scan/actions", post(scan_github_actions))
         .route("/api/v1/scan/github-actions", post(scan_github_actions))
         .with_state(state)
+}
+
+async fn status_page() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        PUBLIC_STATUS_PAGE,
+    )
 }
 
 fn check_auth(state: &ServerConfig, headers: &HeaderMap) -> Result<(), (StatusCode, Json<Value>)> {
@@ -133,6 +144,20 @@ fn check_auth(state: &ServerConfig, headers: &HeaderMap) -> Result<(), (StatusCo
         ));
     }
     Ok(())
+}
+
+async fn public_status(State(state): State<Arc<ServerConfig>>) -> Json<Value> {
+    Json(json!({
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "service": state.service_name,
+        "version": env!("CARGO_PKG_VERSION"),
+        "health": {"status": "ok"},
+        "quarantine": {
+            "enabled": true,
+            "minimum_age_days": 7,
+            "packages": []
+        }
+    }))
 }
 
 async fn health_check(State(state): State<Arc<ServerConfig>>) -> Json<Value> {
@@ -335,6 +360,41 @@ mod tests {
             .await
             .unwrap_or_else(|_| panic!("request succeeds"));
 
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_public_status_page_and_diagnostics() {
+        let app = app();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap_or_else(|_| panic!("valid request")),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("request succeeds"));
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/html; charset=utf-8")
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/status")
+                    .body(axum::body::Body::empty())
+                    .unwrap_or_else(|_| panic!("valid request")),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("request succeeds"));
         assert_eq!(response.status(), StatusCode::OK);
     }
 
