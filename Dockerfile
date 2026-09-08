@@ -16,6 +16,7 @@ RUN mkdir src && \
 
 # Build application
 COPY src ./src
+COPY web ./web
 RUN cargo build --release --locked
 
 # Minimal hardened runner
