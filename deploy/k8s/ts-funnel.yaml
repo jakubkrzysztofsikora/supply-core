@@ -18,7 +18,7 @@ metadata:
   namespace: supply-core
 spec:
   accessModes: [ReadWriteOnce]
-  storageClassName: local-path
+  storageClassName: nfs-studio
   resources:
     requests:
       storage: 128Mi
