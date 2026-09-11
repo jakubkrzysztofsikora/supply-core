@@ -58,3 +58,6 @@ RUN chmod +x /radar/run.sh /radar/docker-entrypoint.sh && \
 USER supply
 ENV SUPPLY_BIN=/usr/local/bin/supply-core
 ENTRYPOINT ["/radar/docker-entrypoint.sh"]
+
+# Keep the server image as the default (last) stage for plain `docker build`.
+FROM runner AS server
