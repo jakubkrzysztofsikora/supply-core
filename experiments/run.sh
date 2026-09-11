@@ -14,7 +14,7 @@ failed=0
 
 while IFS=$'\t' read -r name root tracks; do
   case "$name" in ''|'#'*) continue;; esac
-  [ -d "$root" ] || { echo "FAIL $name (missing: $root)"; failed=1; continue; }
+  [ -d "$root" ] || { echo "SKIP $name (missing: $root)"; continue; }
   case "$tracks" in
     *npm*)
       out="$DIR/$name.npm.json"

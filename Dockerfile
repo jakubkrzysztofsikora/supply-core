@@ -45,3 +45,16 @@ HEALTHCHECK --interval=15s --timeout=3s --start-period=5s --retries=3 \
 
 ENTRYPOINT ["supply-core"]
 CMD ["serve", "--addr", "0.0.0.0:4873"]
+
+# Daily capture + quarantine publisher for self-hosted docker compose.
+FROM runner AS radar
+
+USER root
+RUN apk add --no-cache bash git python3
+WORKDIR /radar
+COPY experiments/run.sh experiments/publish-status.py experiments/docker-entrypoint.sh /radar/
+RUN chmod +x /radar/run.sh /radar/docker-entrypoint.sh && \
+    mkdir -p /radar/data && chown -R supply:supply /radar
+USER supply
+ENV SUPPLY_BIN=/usr/local/bin/supply-core
+ENTRYPOINT ["/radar/docker-entrypoint.sh"]

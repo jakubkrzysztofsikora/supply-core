@@ -81,12 +81,31 @@ cargo run -- serve --addr 0.0.0.0:4873
 docker compose up -d
 ```
 
+**Whole system with the daily radar (self-hosted):**
+
+```bash
+# 1. List your checkouts for the radar (paths are container paths)
+cp radar/candidates.example.txt radar/candidates.txt
+
+# 2. Shared token: the server rejects quarantine-status writes without one
+echo "SUPPLY_AUTH_TOKEN=$(openssl rand -hex 32)" > .env
+echo "SUPPLY_WORKSPACE=$HOME/Repos" >> .env
+
+# 3. Start server + radar
+docker compose --profile radar up -d --build
+```
+
+The radar container runs the quarantine capture immediately and every 24 h
+(`SUPPLY_INTERVAL_SECONDS`), then publishes the dashboard snapshot to the
+server over the compose network. Captures land in `radar/data/`. Without the
+`radar` profile the server alone needs no token.
+
 **Official Cluster Service (Homelab / Tailscale Funnel):**
 - Tailscale MagicDNS: `supply-core.tail5d39b4.ts.net`
 - Public HTTPS Funnel: `https://supply-core.tail5d39b4.ts.net`
 - Public dashboard: `https://supply-core.tail5d39b4.ts.net/`
 - Health check: `curl https://supply-core.tail5d39b4.ts.net/health`
-- Pre-built binary download: `curl -sSL https://supply-core.tail5d39b4.ts.net/api/v1/download/supply-core-linux-x86_64 -o supply-core`
+- Pre-built binary download: `curl -sSL https://supply-core.tail5d39b4.ts.net/api/v1/download/supply-core-linux-x86_64 -o supply-core` (falls back to a redirect to GitHub Releases when the artifact cache is empty)
 - Remote pipeline scan: set `SUPPLY_AUTH_TOKEN` on the server and include a matching bearer token in scan requests.
 - Quarantine dashboard: the daily capture publishes only package name, version, age, and decision using the same token. Store its local configuration outside the repository at `~/.config/supply-core/status-publisher.env`:
 
@@ -99,10 +118,12 @@ docker compose up -d
 
 **Deploy to Kubernetes (K3s):**
 ```bash
-# Apply the SOPS-managed cluster secret from the homelab-cluster repository first:
+# Apply the SOPS-managed cluster secrets from the homelab-cluster repository first
+# (tailnet Funnel auth key + the server/publisher SUPPLY_AUTH_TOKEN):
 SOPS_AGE_KEY_FILE=~/cluster-migration/.secrets/age-key.txt \
   ~/cluster-migration/homelab-cluster/scripts/secrets-apply.sh \
-  ~/cluster-migration/homelab-cluster/secrets/ts-sidecar-auth.enc.yaml
+  ~/cluster-migration/homelab-cluster/secrets/ts-sidecar-auth.enc.yaml \
+  ~/cluster-migration/homelab-cluster/secrets/supply-core-auth.enc.yaml
 # Then deploy manifests with the Tailscale Funnel sidecar.
 kubectl apply -k deploy/k8s
 ```
@@ -165,18 +186,20 @@ Every morning, open `~/.local/share/supply-core/latest.json` or `runs/<timestamp
 Policies are defined in a clean YAML structure (see [`examples/supply-core.yml`](examples/supply-core.yml)):
 
 ```yaml
-version: 1
+quarantine:
+  enabled: true
+  minimum_age_days: 7
+  cve_keeps_quarantined: true   # overrides block_severities: any CVE, any severity, blocks forever
 
-rules:
-  quarantine:
-    min_package_age_hours: 72    # Hold packages younger than 3 days
-    allow_frozen_fallback: true   # Auto-serve frozen known-good artifact
+vulnerabilities:
+  block_severities: [High, Critical]
 
-  vulnerabilities:
-    block_threshold: High         # Block High and Critical CVSS/OSV severities
+npm:
+  require_integrity: true
+  fallback_to_frozen: true
 
-  actions:
-    require_sha_pinning: true     # Require 40-char SHA pins in GitHub Actions
+github_actions:
+  require_full_sha_pin: true
 ```
 
 ---
@@ -184,7 +207,7 @@ rules:
 ## Development & Testing
 
 ```bash
-# Run all unit and integration tests (45 tests)
+# Run all unit and integration tests (70 tests)
 cargo test
 
 # Run Python machine-eval test suite

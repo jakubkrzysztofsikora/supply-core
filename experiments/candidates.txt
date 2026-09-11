@@ -10,16 +10,13 @@
 # actions — static hostile baseline (stability/false-positive check, no drift):
 #   llama.cpp 48 wf, 195/249 unpinned refs, frozen local clone
 # npm — live upstream churn (deps publish regardless of repo activity):
-#   voxel 66 deps (next@1d already caught); sikoras-chat 51; Pathslopper 49;
-#   nieruchomosci-mcp 24; gruntum-campaign 7; linkedin-ads-mcp 7; choyce-cli 1
-# dropped: screenpipe (dormant clone, no drift), lustro-prod (lustro worktree duplicate)
-voxel	/Users/jakubsikora/Repos/personal/voxel	npm
+#   sikoras-chat 51 deps; nieruchomosci-mcp 24; gruntum-campaign 7; linkedin-ads-mcp 7
+# dropped: screenpipe (dormant clone, no drift), lustro-prod (lustro worktree duplicate),
+#   voxel / Pathslopper / choyce-cli (checkouts no longer exist on this machine)
 sikoras-chat	/Users/jakubsikora/Repos/personal/sikoras-chat	npm
-Pathslopper	/Users/jakubsikora/Repos/personal/Pathslopper	npm actions
 nieruchomosci-mcp	/Users/jakubsikora/Repos/personal/nieruchomosci-mcp	npm actions
 gruntum-campaign	/Users/jakubsikora/Repos/personal/gruntum-campaign	npm
 linkedin-ads-mcp	/Users/jakubsikora/Repos/personal/linkedin-ads-mcp	npm
-choyce-cli	/Users/jakubsikora/Repos/personal/choyce-cli	npm
 lustro	/Users/jakubsikora/Repos/personal/lustro	actions
 choyce-engine	/Users/jakubsikora/Repos/choyce-engine	actions
 godot-ai	/Users/jakubsikora/Repos/personal/godot-ai	actions

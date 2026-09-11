@@ -126,12 +126,14 @@ impl Decision {
 pub struct QuarantinePolicy {
     pub enabled: bool,
     pub minimum_age_days: i64,
+    pub cve_keeps_quarantined: bool,
 }
 impl Default for QuarantinePolicy {
     fn default() -> Self {
         Self {
             enabled: true,
             minimum_age_days: 7,
+            cve_keeps_quarantined: true,
         }
     }
 }
@@ -360,6 +362,29 @@ pub fn is_version_quarantined(
         }
 }
 
+fn severity_word(severity: &Severity) -> &'static str {
+    match severity {
+        Severity::Critical => "critical",
+        Severity::High => "high",
+        Severity::Medium => "medium",
+        Severity::Low => "low",
+    }
+}
+
+pub fn strongest_vulnerability(findings: &[VulnerabilityFinding]) -> Option<String> {
+    findings
+        .iter()
+        .max_by_key(|f| (f.severity.rank(), f.id.as_str()))
+        .map(|f| {
+            format!(
+                "{} vulnerability {} from {}",
+                severity_word(&f.severity),
+                f.id,
+                f.source
+            )
+        })
+}
+
 pub fn blocks_vulnerability(
     findings: &[VulnerabilityFinding],
     policy: &VulnerabilityPolicy,
@@ -367,16 +392,12 @@ pub fn blocks_vulnerability(
     let min_rank = policy.block_severities.iter().map(Severity::rank).min()?;
     findings
         .iter()
-        .find(|f| f.severity.rank() >= min_rank)
+        .filter(|f| f.severity.rank() >= min_rank)
+        .max_by_key(|f| (f.severity.rank(), f.id.as_str()))
         .map(|f| {
             format!(
                 "{} vulnerability {} from {}",
-                match f.severity {
-                    Severity::Critical => "critical",
-                    Severity::High => "high",
-                    Severity::Medium => "medium",
-                    Severity::Low => "low",
-                },
+                severity_word(&f.severity),
                 f.id,
                 f.source
             )
@@ -414,7 +435,8 @@ mod tests {
             now,
             &QuarantinePolicy {
                 enabled: true,
-                minimum_age_days: 7
+                minimum_age_days: 7,
+                cve_keeps_quarantined: true
             }
         ));
         assert!(!is_version_quarantined(
@@ -422,9 +444,25 @@ mod tests {
             now,
             &QuarantinePolicy {
                 enabled: true,
-                minimum_age_days: 7
+                minimum_age_days: 7,
+                cve_keeps_quarantined: true
             }
         ));
+    }
+    #[test]
+    fn strongest_vulnerability_is_order_independent() {
+        let finding = |id: &str| VulnerabilityFinding {
+            source: "OSV".into(),
+            id: id.into(),
+            severity: Severity::Medium,
+            summary: "x".into(),
+        };
+        let forward = vec![finding("GHSA-a"), finding("GHSA-b")];
+        let reverse = vec![finding("GHSA-b"), finding("GHSA-a")];
+        assert_eq!(
+            strongest_vulnerability(&forward),
+            strongest_vulnerability(&reverse)
+        );
     }
     #[test]
     fn vuln_threshold() {

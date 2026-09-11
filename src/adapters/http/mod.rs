@@ -31,6 +31,11 @@ pub struct ServerConfig {
     pub auth_token: Option<String>,
 }
 
+fn configured_token(raw: Option<String>) -> Option<String> {
+    raw.map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -40,7 +45,7 @@ impl Default for ServerConfig {
                 .ok()
                 .map(PathBuf::from),
             status_file: std::env::var("SUPPLY_STATUS_FILE").ok().map(PathBuf::from),
-            auth_token: std::env::var("SUPPLY_AUTH_TOKEN").ok(),
+            auth_token: configured_token(std::env::var("SUPPLY_AUTH_TOKEN").ok()),
         }
     }
 }
@@ -418,6 +423,17 @@ mod tests {
     use super::*;
     use axum::http::Request;
     use tower::ServiceExt;
+
+    #[test]
+    fn empty_auth_token_is_not_configured() {
+        assert_eq!(configured_token(Some(String::new())), None);
+        assert_eq!(configured_token(Some("   ".into())), None);
+        assert_eq!(configured_token(None), None);
+        assert_eq!(
+            configured_token(Some(" token ".into())),
+            Some("token".into())
+        );
+    }
 
     #[tokio::test]
     async fn test_health_endpoints() {

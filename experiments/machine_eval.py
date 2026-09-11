@@ -27,7 +27,7 @@ PRUNE = {'.git', 'node_modules', 'target', '.venv', 'venv', '__pycache__',
          '.cargo', '.rustup', '.codex', '.claude', '.local', '.ssh', '.orbstack',
          '.bun', '.nuget', '.m2', '.gradle', '.terraform', '.yarn', '.pnpm-store',
          '.vscode', '.cursor', 'vendor', '.worktrees', 'worktrees', 'lustro-worktrees',
-         'Applications', 'Pictures', 'Movies', 'Music'}
+         'Applications', 'Pictures', 'Movies', 'Music', 'OrbStack'}
 
 
 def command(args, timeout=30):
@@ -45,14 +45,14 @@ def write_json(path, value):
 
 
 def discover(roots, known_repositories=()):
-    found, errors = [], []
+    found, errors, warnings = [], [], []
     for root in roots:
         print(f'Discovering Git repositories under {root}', flush=True)
         if not Path(root).is_dir():
             errors.append(f'missing scan root: {root}')
             continue
         for current, dirs, files in os.walk(root, followlinks=False,
-                                            onerror=lambda e: errors.append(str(e))):
+                                            onerror=lambda e: warnings.append(str(e))):
             if '.git' in dirs or '.git' in files:
                 found.append(Path(current).resolve())
                 dirs[:] = []
@@ -73,7 +73,7 @@ def discover(roots, known_repositories=()):
                     if (submodule / '.git').exists():
                         found.append(submodule.resolve())
         except (OSError, subprocess.SubprocessError) as e:
-            errors.append(f'submodule discovery for {root}: {e}')
+            warnings.append(f'submodule discovery for {root}: {e}')
     selected, duplicates, common = [], [], {}
     # Prefer the primary checkout to its linked worktrees.
     for root in sorted(set(found), key=lambda p: (not (p / '.git').is_dir(), str(p))):
@@ -87,7 +87,7 @@ def discover(roots, known_repositories=()):
                 common[key] = str(root)
                 selected.append(root)
         except (OSError, subprocess.SubprocessError) as e:
-            errors.append(f'{root}: {e}')
+            warnings.append(f'{root}: {e}')
     excluded_paths = {d['path'] for d in duplicates}
     for root in selected:
         try:
@@ -100,8 +100,8 @@ def discover(roots, known_repositories=()):
                                            'reason': 'linked worktree excluded; its content may differ'})
                         excluded_paths.add(path)
         except (OSError, subprocess.SubprocessError) as e:
-            errors.append(f'worktree inventory for {root}: {e}')
-    return selected, duplicates, errors
+            warnings.append(f'worktree inventory for {root}: {e}')
+    return selected, duplicates, errors, warnings
 
 
 def npm_packages(doc):
@@ -198,7 +198,7 @@ def inspect_repo(root, binary):
         try:
             result['commit'] = command(['git', '-C', str(root), 'rev-parse', 'HEAD'])
         except subprocess.SubprocessError as e:
-            result['errors'].append(f'HEAD unavailable: {e}')
+            result['gaps'].append(f'HEAD unavailable: {e}')
         result['dirty'] = bool(command(['git', '-C', str(root), 'status', '--porcelain',
                                         '--untracked-files=no']))
         paths = command(['git', '-C', str(root), 'ls-files', '-z']).split('\0')
@@ -223,7 +223,7 @@ def inspect_repo(root, binary):
                     continue
                 raw = path.read_bytes()
             except OSError as e:
-                result['errors'].append(f'{relative}: {e}')
+                result['gaps'].append(f'{relative}: {e}')
                 continue
             result['input_hashes'][relative] = hashlib.sha256(raw).hexdigest()
             if path.name == 'package.json':
@@ -278,7 +278,7 @@ def inspect_repo(root, binary):
         if result['commit'] is not None and result['commit'] != command(['git', '-C', str(root), 'rev-parse', 'HEAD']):
             result['errors'].append('HEAD changed during evaluation')
     except (OSError, ValueError, subprocess.SubprocessError) as e:
-        result['errors'].append(str(e))
+        result['gaps'].append(f'repository could not be read: {e}')
     result['duration_seconds'] = round(time.monotonic() - started, 2)
     return result
 
@@ -338,9 +338,10 @@ def run(config, inventory_only=False):
         started = datetime.now(timezone.utc).isoformat()
         run_dir = state / 'runs' / datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')
         run_dir.mkdir(parents=True)
-        roots, excluded, errors = discover(config['roots'], config.get('known_repositories', []))
+        roots, excluded, errors, warnings = discover(config['roots'], config.get('known_repositories', []))
         inventory = {'roots': config['roots'], 'repositories': [str(r) for r in roots],
                      'excluded_worktrees': excluded, 'errors': errors,
+                     'discovery_warnings': warnings,
                      'excluded_directories': sorted(PRUNE), 'npm_tracked_inputs_only': True,
                      'workflow_inputs': 'working-tree .github/workflows files'}
         inventory['nested_repository_scope'] = 'registered submodules and configured known_repositories; source trees are pruned'
@@ -405,7 +406,8 @@ def run(config, inventory_only=False):
                                'workflow_findings': len(r.get('actions', {}).get('findings', [])),
                                'duration_seconds': r['duration_seconds'],
                                'errors': len(r['errors']), 'gaps': len(r['gaps'])} for r in reports],
-            'osv_evaluated_versions': len(osv), 'findings': findings, 'errors': errors,
+            'osv_evaluated_versions': len(osv), 'findings': findings,
+            'errors': errors, 'discovery_warnings': warnings,
             'gaps': [{'repo': r['path'], 'details': r['gaps']} for r in reports if r['gaps']],
             'new_findings': [json.loads(f) for f in sorted(identities - baseline_ids)] if comparable else [],
             'baseline_comparable': comparable,
@@ -425,6 +427,7 @@ def run(config, inventory_only=False):
             '', '## Findings', '']
         lines.extend('- ' + json.dumps(f, ensure_ascii=True) for f in findings)
         lines.extend(['', '## Errors', ''] + ['- ' + e for e in errors])
+        lines.extend(['', '## Discovery warnings', ''] + ['- ' + w for w in warnings])
         lines.extend(['', '## Coverage gaps', ''] + ['- ' + json.dumps(g) for g in summary['gaps']])
         (run_dir / 'report.md').write_text('\n'.join(lines) + '\n')
         # Preserve failed bootstrap baselines from older versions as evidence.

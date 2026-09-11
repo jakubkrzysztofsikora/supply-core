@@ -5,8 +5,9 @@ server:
 quarantine:
   enabled: true
   minimum_age_days: 7
+  cve_keeps_quarantined: true  # Overrides block_severities: any known advisory, any severity, blocks the version forever
 vulnerabilities:
-  block_severities:
+  block_severities:           # Applies only when cve_keeps_quarantined is false
     - High
     - Critical
 npm:
