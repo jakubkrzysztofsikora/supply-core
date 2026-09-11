@@ -41,18 +41,33 @@ spec:
         volumeMounts:
         - name: artifacts
           mountPath: /app/artifacts
+        resources:
+          requests:
+            cpu: 25m
+            memory: 64Mi
+          limits:
+            memory: 256Mi
         readinessProbe:
           httpGet:
             path: /health
             port: 4873
           initialDelaySeconds: 5
           periodSeconds: 10
+          timeoutSeconds: 3
         livenessProbe:
           httpGet:
             path: /health
             port: 4873
           initialDelaySeconds: 10
           periodSeconds: 20
+          timeoutSeconds: 3
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 4873
+          periodSeconds: 2
+          failureThreshold: 30
+          timeoutSeconds: 3
       - name: ts-funnel
         image: tailscale/tailscale@sha256:8c42c4574ab066384fcb72f69e086a2ff1dd3652eb6f56856cee34bcf0d2f680
         env:
@@ -77,6 +92,12 @@ spec:
           readOnly: true
         - name: state
           mountPath: /var/lib/tailscale
+        resources:
+          requests:
+            cpu: 5m
+            memory: 32Mi
+          limits:
+            memory: 128Mi
       volumes:
       - name: artifacts
         persistentVolumeClaim:
