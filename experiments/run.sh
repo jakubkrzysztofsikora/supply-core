@@ -10,11 +10,14 @@ DAY="${1:-$(date +%Y-%m-%d)}"
 DIR="$DATA/$DAY"
 OSV_CACHE="$DATA/osv-cache"
 mkdir -p "$DIR"
+rm -f "$DIR"/*
 failed=0
+attempted=0
 
 while IFS=$'\t' read -r name root tracks; do
   case "$name" in ''|'#'*) continue;; esac
   [ -d "$root" ] || { echo "SKIP $name (missing: $root)"; continue; }
+  attempted=$((attempted + 1))
   case "$tracks" in
     *npm*)
       out="$DIR/$name.npm.json"
@@ -60,5 +63,9 @@ PY
   esac
 done < "$HERE/candidates.txt"
 
-echo "captured $DAY -> $DIR"
+echo "captured $DAY -> $DIR ($attempted candidates)"
+if [ "$attempted" -eq 0 ]; then
+  echo "ERROR: no candidates found; nothing captured"
+  exit 1
+fi
 exit "$failed"
