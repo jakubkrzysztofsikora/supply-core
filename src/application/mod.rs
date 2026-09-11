@@ -36,7 +36,7 @@ impl<'a> PackageEvaluator<'a> {
             );
         }
         let findings = self.vulns.query(Ecosystem::Npm, name, &version.version)?;
-        if let Some(reason) = blocks_vulnerability(&findings, &self.policy.vulnerabilities) {
+        if let Some(reason) = self.vulnerability_reason(&findings) {
             return self.fallback_or_block(name, &version.version, requested, reason);
         }
         if is_version_quarantined(
@@ -53,6 +53,13 @@ impl<'a> PackageEvaluator<'a> {
         }
         Ok(Decision::allow(name.clone(), version.version.to_string()))
     }
+    fn vulnerability_reason(&self, findings: &[VulnerabilityFinding]) -> Option<String> {
+        if self.policy.quarantine.cve_keeps_quarantined {
+            strongest_vulnerability(findings)
+        } else {
+            blocks_vulnerability(findings, &self.policy.vulnerabilities)
+        }
+    }
     fn fallback_or_block(
         &self,
         name: &str,
@@ -65,9 +72,7 @@ impl<'a> PackageEvaluator<'a> {
             if let Some(frozen) = self.metadata.latest_frozen_satisfying(name, requested)? {
                 // Frozen bytes are immutable, but vulnerability knowledge changes.
                 let findings = self.vulns.query(Ecosystem::Npm, name, &frozen.version)?;
-                if let Some(fallback_reason) =
-                    blocks_vulnerability(&findings, &self.policy.vulnerabilities)
-                {
+                if let Some(fallback_reason) = self.vulnerability_reason(&findings) {
                     return Ok(Decision::block(
                         name,
                         Some(requested_version.to_string()),
@@ -703,6 +708,113 @@ mod tests {
                 vec![Version::new(2, 0, 0), Version::new(1, 0, 0)]
             );
         }
+        Ok(())
+    }
+    struct VersionedVulns;
+    impl VulnerabilitySource for VersionedVulns {
+        fn query(
+            &self,
+            _: Ecosystem,
+            _: &str,
+            version: &Version,
+        ) -> Result<Vec<VulnerabilityFinding>> {
+            if version.major == 2 {
+                Ok(vec![VulnerabilityFinding {
+                    source: "OSV".into(),
+                    id: "GHSA-medium".into(),
+                    severity: Severity::Medium,
+                    summary: "medium advisory".into(),
+                }])
+            } else {
+                Ok(vec![])
+            }
+        }
+    }
+    struct MediumVulns;
+    impl VulnerabilitySource for MediumVulns {
+        fn query(&self, _: Ecosystem, _: &str, _: &Version) -> Result<Vec<VulnerabilityFinding>> {
+            Ok(vec![VulnerabilityFinding {
+                source: "OSV".into(),
+                id: "GHSA-medium".into(),
+                severity: Severity::Medium,
+                summary: "medium advisory".into(),
+            }])
+        }
+    }
+    #[test]
+    fn cve_is_never_released_after_quarantine_window() -> Result<()> {
+        let now = Utc::now();
+        let p = Policy::default();
+        let c = FixedClock(now);
+        let m = M(Mutex::new(None));
+        let e = PackageEvaluator {
+            policy: &p,
+            clock: &c,
+            vulns: &MediumVulns,
+            metadata: &m,
+        };
+        let d = e.evaluate(&package(Some(now - Duration::days(30))), None)?;
+        assert_eq!(
+            d.status,
+            DecisionStatus::Block,
+            "a version with a known CVE must never age out of quarantine"
+        );
+        assert!(d.reasons[0].contains("GHSA-medium"));
+        Ok(())
+    }
+    #[test]
+    fn cve_version_falls_back_to_clean_frozen() -> Result<()> {
+        let now = Utc::now();
+        let p = Policy::default();
+        let c = FixedClock(now);
+        let m = M(Mutex::new(Some(frozen("1.0.0"))));
+        let e = PackageEvaluator {
+            policy: &p,
+            clock: &c,
+            vulns: &VersionedVulns,
+            metadata: &m,
+        };
+        let d = e.evaluate(&package(Some(now - Duration::days(30))), None)?;
+        assert_eq!(d.status, DecisionStatus::Fallback);
+        assert_eq!(d.served_version.as_deref(), Some("1.0.0"));
+        Ok(())
+    }
+    #[test]
+    fn frozen_fallback_with_medium_cve_is_rejected() -> Result<()> {
+        let now = Utc::now();
+        let p = Policy::default();
+        let c = FixedClock(now);
+        let m = M(Mutex::new(Some(frozen("1.0.0"))));
+        let e = PackageEvaluator {
+            policy: &p,
+            clock: &c,
+            vulns: &MediumVulns,
+            metadata: &m,
+        };
+        let d = e.evaluate(&package(Some(now - Duration::days(30))), None)?;
+        assert_eq!(d.status, DecisionStatus::Block);
+        assert!(d.reasons[0].contains("GHSA-medium"));
+        Ok(())
+    }
+    #[test]
+    fn cve_permanence_can_be_disabled_by_policy() -> Result<()> {
+        let now = Utc::now();
+        let mut p = Policy::default();
+        p.quarantine.cve_keeps_quarantined = false;
+        let c = FixedClock(now);
+        let m = M(Mutex::new(None));
+        let e = PackageEvaluator {
+            policy: &p,
+            clock: &c,
+            vulns: &MediumVulns,
+            metadata: &m,
+        };
+        let d = e.evaluate(&package(Some(now - Duration::days(30))), None)?;
+        assert_eq!(
+            d.status,
+            DecisionStatus::Allow,
+            "with the strict rule disabled only block_severities applies"
+        );
         Ok(())
     }
     #[test]

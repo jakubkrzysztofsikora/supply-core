@@ -14,8 +14,11 @@ launchctl kickstart gui/$(id -u)/com.supply-core.machine-evaluation
 The installer copies the binary and runner into a versioned directory under
 `~/.local/share/supply-core/releases`. Source edits do not change a scheduled
 evaluation until the installer is run again. The LaunchAgent runs at 08:30
-local time while the user is logged in. Missed calendar events during sleep
-are coalesced by launchd; this is not a system daemon for logged-out users.
+local time while the user is logged in. A second agent at 08:45 runs
+`experiments/daily-capture.sh`, which captures field-test quarantine snapshots
+and publishes them to the server configured in
+`~/.config/supply-core/status-publisher.env`. Missed calendar events during
+sleep are coalesced by launchd; this is not a system daemon for logged-out users.
 
 Configuration: `~/.local/share/supply-core/config.json`. `roots` lists discovery
 roots, `workers` bounds repository concurrency (default 4), and `binary` pins
@@ -38,7 +41,7 @@ These limits keep daily discovery bounded; the inventory records them.
 
 Each timestamped `runs/<timestamp>/` directory contains:
 
-- `inventory.json`: selected repos, excluded worktrees, scope and discovery errors.
+- `inventory.json`: selected repos, excluded worktrees, scope, discovery errors and warnings.
 - `input-inventory.json`: tracked manifest/lockfile paths by repository, including
   inputs excluded by directory policy, mapped lockfiles, and inspection gaps/errors.
 - `repos/*.json`: commit, dirty state, input hashes, lockfile coverage and scanner output.
@@ -51,13 +54,17 @@ evaluation errors (explicit format coverage gaps remain recorded). Failed runs
 remain in their run directories. Comparisons are disabled if either run has errors or if discovery
 roots, the binary, or runner change. No failed query is treated as a clean
 result. Exit 2 means incomplete evaluation; findings alone do not fail an
-observational run. An interrupted run may leave a directory without a summary.
+observational run. Repository-level environment anomalies (unreadable or
+mutating checkouts, missing tracked files, unresolved HEAD, slow filesystems)
+are recorded as coverage gaps and do not fail the run. Discovery I/O and
+submodule-inspection problems are recorded as discovery warnings. An
+interrupted run may leave a directory without a summary.
 
 Logs append to `launchd.log` and `launchd.err`. The run lock prevents overlaps.
-The original `experiments/daily-capture.sh` experiment is separate; disable its
-cron entry when replacing it with this evaluation to avoid duplicate work.
-The installer option `--retire-legacy-cron` saves the original crontab in the
-state directory and removes only the `# supply-core-daily-capture` entry.
+The installer optionally retires the original `experiments/daily-capture.sh`
+cron entry (the agent now schedules the script directly) to avoid duplicate
+work: `--retire-legacy-cron` saves the original crontab in the state directory
+and removes only the `# supply-core-daily-capture` entry.
 
 ## What is measured
 
@@ -70,7 +77,8 @@ Only the manifest beside a Yarn lockfile is mapped; nested workspace manifests
 remain explicit gaps until workspace mapping is supported.
 Unsupported versions, custom sources, unmapped manifests, and pnpm/bun lockfiles
 remain explicit coverage gaps. Yarn Berry is not supported. Missing tracked
-files and unresolved HEAD are recorded as errors without aborting other inputs.
+files and unresolved HEAD are recorded as coverage gaps without aborting other
+inputs.
 
 The input inventory also lists common Python, Rust, Go, Ruby, PHP and NuGet
 manifests/lockfiles for adapter prioritization; inventory does not mean those

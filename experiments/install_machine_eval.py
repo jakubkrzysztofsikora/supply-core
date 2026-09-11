@@ -51,9 +51,23 @@ def main():
         'StandardOutPath': str(state / 'launchd.log'), 'StandardErrorPath': str(state / 'launchd.err')}
     with plist_path.open('wb') as handle:
         plistlib.dump(plist, handle)
+    capture_label = 'com.supply-core.daily-capture'
+    capture_plist_path = Path.home() / 'Library/LaunchAgents' / f'{capture_label}.plist'
+    capture_plist = {'Label': capture_label,
+        'ProgramArguments': ['/bin/bash', str(source / 'daily-capture.sh')],
+        'StartCalendarInterval': {'Hour': 8, 'Minute': 45},
+        'ProcessType': 'Background',
+        'EnvironmentVariables': {'HOME': str(Path.home()),
+            'PATH': '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'},
+        'StandardOutPath': str(state / 'capture-launchd.log'),
+        'StandardErrorPath': str(state / 'capture-launchd.err')}
+    with capture_plist_path.open('wb') as handle:
+        plistlib.dump(capture_plist, handle)
     domain = f'gui/{os.getuid()}'
     subprocess.run(['launchctl', 'bootout', f'{domain}/{label}'], capture_output=True)
     subprocess.run(['launchctl', 'bootstrap', domain, str(plist_path)], check=True)
+    subprocess.run(['launchctl', 'bootout', f'{domain}/{capture_label}'], capture_output=True)
+    subprocess.run(['launchctl', 'bootstrap', domain, str(capture_plist_path)], check=True)
     if args.retire_legacy_cron:
         current = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
         if current.returncode == 0:
@@ -64,7 +78,8 @@ def main():
                 (state / f'crontab-before-machine-eval-{key}.txt').write_text(current.stdout)
                 subprocess.run(['crontab', '-'], input=''.join(retained), text=True, check=True)
                 print('Retired legacy supply-core cron entry; original crontab backed up in state directory')
-    print(json.dumps({'config': str(config_path), 'release': str(release), 'launch_agent': str(plist_path)}, indent=2))
+    print(json.dumps({'config': str(config_path), 'release': str(release), 'launch_agent': str(plist_path),
+                      'capture_agent': str(capture_plist_path)}, indent=2))
 
 
 if __name__ == '__main__':

@@ -1,9 +1,10 @@
 services:
   supply-core:
-    image: ghcr.io/jakubkrzysztofsikora/supply-core:v0.1.1
+    image: ghcr.io/jakubkrzysztofsikora/supply-core:v0.1.2
     build:
       context: .
       dockerfile: Dockerfile
+      target: runner
     container_name: supply-core
     restart: unless-stopped
     ports:
@@ -11,6 +12,7 @@ services:
     environment:
       - SUPPLY_SERVICE_NAME=supply-core-selfhosted
       - SUPPLY_STATUS_FILE=/app/data/quarantine-status.json
+      - SUPPLY_AUTH_TOKEN=${SUPPLY_AUTH_TOKEN:-}
       - PORT=4873
     volumes:
       - ./artifacts:/app/artifacts
@@ -21,3 +23,24 @@ services:
       timeout: 3s
       retries: 3
       start_period: 5s
+
+  radar:
+    image: ghcr.io/jakubkrzysztofsikora/supply-core-radar:v0.1.2
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: radar
+    container_name: supply-core-radar
+    profiles: ["radar"]
+    restart: unless-stopped
+    depends_on:
+      supply-core:
+        condition: service_healthy
+    environment:
+      - SUPPLY_STATUS_URL=http://supply-core:4873
+      - SUPPLY_STATUS_AUTH_TOKEN=${SUPPLY_AUTH_TOKEN:-}
+      - SUPPLY_INTERVAL_SECONDS=${SUPPLY_INTERVAL_SECONDS:-86400}
+    volumes:
+      - ./radar:/radar-config:ro
+      - ./radar/data:/radar/data
+      - ${SUPPLY_WORKSPACE:-./workspace}:/workspace:ro

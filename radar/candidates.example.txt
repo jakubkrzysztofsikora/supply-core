@@ -1,0 +1,3 @@
+# name<TAB>container-path<TAB>track(s) — copy to radar/candidates.txt and mount your repos at /workspace
+# example: gruntum-campaign	/workspace/gruntum-campaign	npm
+example-repo	/workspace/example-repo	npm

@@ -83,8 +83,9 @@ git@*:
                 result = evaluation.inspect_repo(root, Path('/unused'))
             self.assertEqual(result['packages'], [['a', '1.2.3']])
             self.assertIsNone(result['commit'])
-            self.assertEqual(len(result['errors']), 2)
-            self.assertTrue(any('missing/package.json' in error for error in result['errors']))
+            self.assertFalse(result['errors'])
+            self.assertEqual(len(result['gaps']), 3)
+            self.assertTrue(any('missing/package.json' in gap for gap in result['gaps']))
             scan.assert_called_once()
 
     def test_unmapped_manifest_is_gap_even_with_root_lock(self):
@@ -114,7 +115,7 @@ git@*:
             config = {'state': str(root / 'state'), 'roots': [str(root)], 'binary': str(binary)}
             report = {'path': str(root), 'packages': [['a', '1.0.0']], 'errors': [],
                       'gaps': [], 'duration_seconds': 0, 'actions': {'references': [], 'findings': []}}
-            with patch.object(evaluation, 'discover', side_effect=lambda *args: ([root], [], [])), patch.object(
+            with patch.object(evaluation, 'discover', side_effect=lambda *args: ([root], [], [], [])), patch.object(
                     evaluation, 'inspect_repo', side_effect=lambda *args: json.loads(json.dumps(report))):
                 with patch.object(evaluation, 'query_osv', return_value=({}, ['offline'])):
                     self.assertEqual(evaluation.run(config), 2)
@@ -173,10 +174,42 @@ git@*:
             (root / 'repo/.git').mkdir(parents=True)
             (root / 'node_modules/vendor/.git').mkdir(parents=True)
             with patch.object(evaluation, 'command', return_value='.git'):
-                found, duplicates, errors = evaluation.discover([str(root), str(root / 'missing')])
+                found, duplicates, errors, warnings = evaluation.discover([str(root), str(root / 'missing')])
             self.assertEqual(found, [(root / 'repo').resolve()])
             self.assertFalse(duplicates)
             self.assertEqual(len(errors), 1)
+            self.assertFalse(warnings)
+
+    def test_discovery_io_noise_is_a_warning_not_an_error(self):
+        def failing_walk(root, followlinks=False, onerror=None):
+            if onerror is not None:
+                onerror(OSError(5, 'Input/output error', root))
+            return iter(())
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(evaluation.os, 'walk', side_effect=failing_walk):
+                found, duplicates, errors, warnings = evaluation.discover([directory])
+            self.assertFalse(found)
+            self.assertFalse(duplicates)
+            self.assertFalse(errors)
+            self.assertTrue(any('Input/output error' in warning for warning in warnings))
+
+    def test_discovery_submodule_failure_is_a_warning_not_an_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'repo/.git').mkdir(parents=True)
+
+            def git(args, timeout=30):
+                if 'ls-files' in args:
+                    raise evaluation.subprocess.CalledProcessError(128, args)
+                if 'rev-parse' in args:
+                    return '.git'
+                return ''
+
+            with patch.object(evaluation, 'command', side_effect=git):
+                found, duplicates, errors, warnings = evaluation.discover([str(root)])
+            self.assertEqual(found, [(root / 'repo').resolve()])
+            self.assertFalse(errors)
+            self.assertTrue(any('submodule discovery' in warning for warning in warnings))
 
 
 if __name__ == '__main__':

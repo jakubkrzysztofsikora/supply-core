@@ -9,7 +9,6 @@ on:
       tag:
         description: 'Tag to release (e.g. v0.1.0)'
         required: true
-        default: 'v0.1.0'
 
 permissions:
   contents: write
