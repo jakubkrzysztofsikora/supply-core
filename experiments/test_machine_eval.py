@@ -50,7 +50,7 @@ git@*:
                     evaluation.subprocess, 'run', return_value=SimpleNamespace(
                         returncode=0, stdout='{"references":[],"findings":[]}')):
                 result = evaluation.inspect_repo(root, Path('/unused'))
-            self.assertEqual(result['packages'], [['a', '1.0.0']])
+            self.assertEqual(result['packages'], [['npm', 'a', '1.0.0']])
             self.assertFalse(result['gaps'])
             self.assertFalse(result['errors'])
             self.assertEqual(len(result['input_inventory']), 4)
@@ -81,7 +81,7 @@ git@*:
                     evaluation.subprocess, 'run', return_value=SimpleNamespace(
                         returncode=0, stdout='{"references":[],"findings":[]}')) as scan:
                 result = evaluation.inspect_repo(root, Path('/unused'))
-            self.assertEqual(result['packages'], [['a', '1.2.3']])
+            self.assertEqual(result['packages'], [['npm', 'a', '1.2.3']])
             self.assertIsNone(result['commit'])
             self.assertFalse(result['errors'])
             self.assertEqual(len(result['gaps']), 3)
@@ -113,20 +113,106 @@ git@*:
             binary = root / 'binary'
             binary.write_bytes(b'fixture')
             config = {'state': str(root / 'state'), 'roots': [str(root)], 'binary': str(binary)}
-            report = {'path': str(root), 'packages': [['a', '1.0.0']], 'errors': [],
+            report = {'path': str(root), 'packages': [['npm', 'a', '1.0.0']], 'errors': [],
                       'gaps': [], 'duration_seconds': 0, 'actions': {'references': [], 'findings': []}}
             with patch.object(evaluation, 'discover', side_effect=lambda *args: ([root], [], [], [])), patch.object(
                     evaluation, 'inspect_repo', side_effect=lambda *args: json.loads(json.dumps(report))):
                 with patch.object(evaluation, 'query_osv', return_value=({}, ['offline'])):
                     self.assertEqual(evaluation.run(config), 2)
                     self.assertFalse((root / 'state/baseline.json').exists())
-                with patch.object(evaluation, 'query_osv', return_value=({'["a","1.0.0"]': ['GHSA-test']}, [])):
+                with patch.object(evaluation, 'query_osv', return_value=({'["npm","a","1.0.0"]': ['GHSA-test']}, [])):
                     self.assertEqual(evaluation.run(config), 0)
             latest = json.loads((root / 'state/latest.json').read_text())
             self.assertFalse(latest['baseline_comparable'])
             self.assertEqual(latest['new_findings'], [])
             self.assertEqual(len(latest['findings']), 1)
             self.assertTrue((root / 'state/baseline.json').exists())
+
+    def test_requirements_parser(self):
+        text = (
+            "# comment\n"
+            "requests==2.32.3\n"
+            "Django[argon2]==4.2.11  # pinned\n"
+            "flask>=3.0\n"
+            "numpy==1.26.4 ; python_version < '3.13'\n"
+            "-r extra.txt\n"
+            "urllib3==2.5.0 \\\n    --hash=sha256:abc\n"
+            "git+https://example.test/x.git\n"
+        )
+        pairs, gaps = evaluation.requirements_packages(text)
+        self.assertEqual(
+            pairs,
+            {('requests', '2.32.3'), ('django', '4.2.11'), ('urllib3', '2.5.0')},
+        )
+        self.assertGreaterEqual(len(gaps), 4)
+
+    def test_nuget_parser(self):
+        doc = {'version': 1, 'dependencies': {
+            'net8.0': {
+                'Newtonsoft.Json': {'type': 'Direct', 'resolved': '13.0.3'},
+                'MyProject': {'type': 'Project'},
+                'RangeOnly': {'type': 'Direct', 'requested': '[1.0.0, )'},
+            },
+            'net8.0/win-x64': {
+                'Newtonsoft.Json': {'type': 'Direct', 'resolved': '13.0.3'},
+            },
+        }}
+        pairs, gaps = evaluation.nuget_packages(doc)
+        self.assertEqual(pairs, {('Newtonsoft.Json', '13.0.3')})
+        self.assertEqual(len(gaps), 1)
+        with self.assertRaises(ValueError):
+            evaluation.nuget_packages({})
+
+    def test_ecosystem_inputs_are_evaluated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / 'requirements.txt').write_text('requests==2.32.3\n')
+            (root / 'packages.lock.json').write_text(json.dumps({
+                'version': 1,
+                'dependencies': {'net8.0': {'Serilog': {'type': 'Transitive', 'resolved': '3.1.1'}}},
+            }))
+
+            def git(args, timeout=30):
+                if 'ls-files' in args:
+                    return 'requirements.txt\0packages.lock.json\0'
+                return 'abc'
+
+            with patch.object(evaluation, 'command', side_effect=git), patch.object(
+                    evaluation.subprocess, 'run', return_value=SimpleNamespace(
+                        returncode=0, stdout='{"references":[],"findings":[]}')):
+                result = evaluation.inspect_repo(root, Path('/unused'))
+            self.assertEqual(result['packages'], [
+                ['nuget', 'Serilog', '3.1.1'],
+                ['pypi', 'requests', '2.32.3'],
+            ])
+            self.assertFalse(result['errors'])
+
+    def test_osv_batch_sends_ecosystems(self):
+        sent = []
+
+        def fake_urlopen(request, timeout=None):
+            body = json.loads(request.data)
+            sent.append(body)
+            text = json.dumps({'results': [{'vulns': []} for _ in body['queries']]})
+
+            class Response:
+                def __enter__(self):
+                    import io
+                    return io.StringIO(text)
+
+                def __exit__(self, *args):
+                    pass
+
+            return Response()
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(evaluation.urllib.request, 'urlopen', side_effect=fake_urlopen):
+                evaluation.query_osv(
+                    {('pypi', 'requests', '2.32.3'), ('nuget', 'Serilog', '3.1.1')},
+                    Path(directory),
+                )
+        ecosystems = sorted(query['package']['ecosystem'] for query in sent[0]['queries'])
+        self.assertEqual(ecosystems, ['NuGet', 'PyPI'])
 
     def test_v3_nested_dev_alias_and_workspace(self):
         pairs, gaps = evaluation.npm_packages({'lockfileVersion': 3, 'packages': {
@@ -158,13 +244,13 @@ git@*:
         with tempfile.TemporaryDirectory() as directory:
             cache = Path(directory)
             with patch.object(evaluation.urllib.request, 'urlopen', return_value=Response()) as request:
-                result, errors = evaluation.query_osv({('a', '1.0.0')}, cache)
+                result, errors = evaluation.query_osv({('npm', 'a', '1.0.0')}, cache)
                 self.assertFalse(errors)
                 self.assertEqual(list(result.values()), [['GHSA-test']])
-                evaluation.query_osv({('a', '1.0.0')}, cache)
+                evaluation.query_osv({('npm', 'a', '1.0.0')}, cache)
                 self.assertEqual(request.call_count, 1)
             with patch.object(evaluation.urllib.request, 'urlopen', side_effect=OSError('offline')):
-                result, errors = evaluation.query_osv({('b', '2.0.0')}, cache)
+                result, errors = evaluation.query_osv({('npm', 'b', '2.0.0')}, cache)
                 self.assertEqual(result, {})
                 self.assertTrue(errors)
 

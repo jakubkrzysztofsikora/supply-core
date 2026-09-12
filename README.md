@@ -138,7 +138,7 @@ kubectl apply -k deploy/k8s
 | **Frozen Fallback** | Serves latest frozen version satisfying your semver range | Prevents builds from breaking while staying safe |
 | **Actions SHA Pinning** | Enforces immutable 40-character commit SHAs in CI | Blocks malicious workflow tag mutability attacks |
 | **OSV.dev Integration** | Real-time vulnerability batch query with CVSS & severity | Immediate awareness of newly disclosed CVEs |
-| **Passive Machine Scan** | Fast traversal of 100+ repos, worktree deduplication | Total situational awareness of local attack surface |
+| **Passive Machine Scan** | Fast traversal of 100+ repos, worktree deduplication; npm, pip and NuGet advisories | Total situational awareness of local attack surface |
 | **PyPI Quarantine** | `snapshot-pip` checks exact requirements.txt pins: publish age, sha256, OSV advisories | Catches fresh malicious pip uploads before they reach your build |
 | **NuGet Quarantine** | `snapshot-nuget` checks resolved `packages.lock.json`: publish age, SHA-512 package hash, OSV | Catches fresh NuGet publishes with the same policy engine |
 | **Docker Digest Pinning** | `scan-docker` flags `FROM`/`image:` references that lack an `@sha256:` digest | Mutable tags can be silently replaced under you |

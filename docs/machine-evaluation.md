@@ -80,23 +80,27 @@ remain explicit coverage gaps. Yarn Berry is not supported. Missing tracked
 files and unresolved HEAD are recorded as coverage gaps without aborting other
 inputs.
 
-The input inventory also lists common Python, Rust, Go, Ruby, PHP and NuGet
-manifests/lockfiles for adapter prioritization; inventory does not mean those
-ecosystems have been checked against advisories. Summary counts exclude paths
-pruned by directory policy; the detailed inventory retains them as excluded.
+Python `requirements.txt` exact pins (`==`, `===`) and NuGet `packages.lock.json`
+resolved entries are evaluated too; ranges, environment markers, options and
+URL requirements in requirements files are recorded as gaps. The input
+inventory also lists other common Python, Rust, Go, Ruby and PHP
+manifests/lockfiles for adapter prioritization; inventory of those does not mean
+they have been checked against advisories. Summary counts exclude paths pruned
+by directory policy; the detailed inventory retains them as excluded.
 
 Unique package/version pairs are queried against OSV's fixed public batch API,
-100 per request, with a shared 24-hour cache in trusted local state. Only npm
-package names and versions are sent; repository paths and source contents are
-not sent. Results are advisory IDs, not severity-filtered policy decisions.
-Pagination, response errors, and missing results are incomplete evaluations.
+100 per request, with a shared 24-hour cache in trusted local state. Only npm,
+PyPI and NuGet package names and versions are sent; repository paths and source
+contents are not sent. Results are advisory IDs, not severity-filtered policy
+decisions. Pagination, response errors, and missing results are incomplete
+evaluations.
 
 The Rust scanner evaluates working-tree GitHub workflows, including untracked
 ones. Findings are file-level because the parser does not retain source spans.
 Workflow inputs have per-file and aggregate size limits and a process timeout.
 
 This run does not measure package age/quarantine, installed-byte integrity,
-actual exploitability, or non-npm dependency ecosystems. Lockfiles describe
+actual exploitability, or RubyGems/Cargo/Maven/Go ecosystems. Lockfiles describe
 declared resolution, not proof of what is running. Repositories can change
 during the scan; commit/dirty/hash evidence aids interpretation but is not an
 atomic filesystem snapshot. An incomplete bootstrap baseline left by an older

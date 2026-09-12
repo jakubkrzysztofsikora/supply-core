@@ -189,6 +189,88 @@ def yarn_packages(raw):
     return packages, gaps
 
 
+OSV_ECOSYSTEM = {'npm': 'npm', 'pypi': 'PyPI', 'nuget': 'NuGet'}
+PACKAGE_ECOSYSTEMS = ('npm', 'pypi', 'nuget')
+
+
+def normalize_pypi_name(raw):
+    return re.sub(r'[-_.]+', '-', raw).lower()
+
+
+def requirements_packages(text):
+    """Read exact ==/=== pins from requirements.txt without resolving or installing."""
+    packages, gaps = set(), []
+    logical, logical_start = '', None
+    for number, raw in enumerate(text.splitlines(), start=1):
+        line = raw.split('#', 1)[0].strip()
+        if line.endswith('\\'):
+            logical += line[:-1].strip() + ' '
+            if logical_start is None:
+                logical_start = number
+            continue
+        if logical:
+            line = (logical + line).strip()
+            start = logical_start
+            logical, logical_start = '', None
+        else:
+            start = number
+        if not line:
+            continue
+        tokens = line.split()
+        unsupported = [t for t in tokens if t.startswith('-') and not t.startswith('--hash=')]
+        if unsupported:
+            gaps.append(f'line {start}: unsupported option')
+            continue
+        parts = [t for t in tokens if not t.startswith('-')]
+        if not parts:
+            continue
+        requirement = ' '.join(parts)
+        if '://' in requirement or requirement.startswith(('.', '/')):
+            gaps.append(f'line {start}: non-registry requirement')
+            continue
+        if ';' in requirement:
+            gaps.append(f'line {start}: environment marker not evaluated')
+            continue
+        if '===' in requirement:
+            name_part, version_part = requirement.split('===', 1)
+        elif '==' in requirement:
+            name_part, version_part = requirement.split('==', 1)
+        else:
+            gaps.append(f'line {start}: not pinned with ==')
+            continue
+        name = normalize_pypi_name(name_part.split('[', 1)[0].strip())
+        version = version_part.strip()
+        if (not name or not version or any(ch.isspace() for ch in version)
+                or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._+!-]*', version)):
+            gaps.append(f'line {start}: unparseable pin')
+            continue
+        packages.add((name, version))
+    if logical:
+        gaps.append('end of file: unterminated line continuation')
+    return packages, gaps
+
+
+def nuget_packages(doc):
+    packages, gaps = set(), []
+    dependencies = doc.get('dependencies')
+    if not isinstance(dependencies, dict):
+        raise ValueError('packages.lock.json dependencies missing')
+    for target, entries in dependencies.items():
+        if not isinstance(entries, dict):
+            gaps.append(f'target {target}: dependencies are not an object')
+            continue
+        for name, details in entries.items():
+            if not isinstance(details, dict):
+                gaps.append(f'target {target}: {name} has invalid entry')
+                continue
+            resolved = details.get('resolved')
+            if isinstance(resolved, str) and resolved:
+                packages.add((name, resolved))
+            elif details.get('type') != 'Project':
+                gaps.append(f'target {target}: {name} has no resolved version')
+    return packages, gaps
+
+
 def inspect_repo(root, binary):
     started = time.monotonic()
     result = {'path': str(root), 'errors': [], 'gaps': [], 'packages': [],
@@ -211,7 +293,8 @@ def inspect_repo(root, binary):
             if not relative or any(part in PRUNE for part in Path(relative).parts):
                 continue
             relevant = (path.name in {'package.json', 'package-lock.json', 'npm-shrinkwrap.json',
-                                     'yarn.lock', 'pnpm-lock.yaml', 'bun.lock', 'bun.lockb'})
+                                     'yarn.lock', 'pnpm-lock.yaml', 'bun.lock', 'bun.lockb',
+                                     'requirements.txt', 'packages.lock.json'})
             if not relevant:
                 continue
             if path.is_symlink() or not path.resolve().is_relative_to(root):
@@ -232,7 +315,7 @@ def inspect_repo(root, binary):
                 try:
                     doc = json.loads(raw)
                     pairs, gaps = npm_packages(doc)
-                    packages.update(pairs)
+                    packages.update(('npm', name, version) for name, version in pairs)
                     result['lockfiles'].append(relative)
                     covered_manifests.add(str(Path(relative).parent / 'package.json'))
                     for workspace in doc.get('packages', {}):
@@ -244,9 +327,25 @@ def inspect_repo(root, binary):
             elif path.name == 'yarn.lock':
                 try:
                     pairs, gaps = yarn_packages(raw)
-                    packages.update(pairs)
+                    packages.update(('npm', name, version) for name, version in pairs)
                     result['lockfiles'].append(relative)
                     covered_manifests.add(str(Path(relative).parent / 'package.json'))
+                    result['gaps'].extend(f'{relative}: {g}' for g in gaps)
+                except (ValueError, TypeError) as e:
+                    result['errors'].append(f'{relative}: {e}')
+            elif path.name == 'requirements.txt':
+                try:
+                    pairs, gaps = requirements_packages(raw.decode('utf-8'))
+                    packages.update(('pypi', name, version) for name, version in pairs)
+                    result['lockfiles'].append(relative)
+                    result['gaps'].extend(f'{relative}: {g}' for g in gaps)
+                except (UnicodeDecodeError, ValueError, TypeError) as e:
+                    result['errors'].append(f'{relative}: {e}')
+            elif path.name == 'packages.lock.json':
+                try:
+                    pairs, gaps = nuget_packages(json.loads(raw))
+                    packages.update(('nuget', name, version) for name, version in pairs)
+                    result['lockfiles'].append(relative)
                     result['gaps'].extend(f'{relative}: {g}' for g in gaps)
                 except (ValueError, TypeError) as e:
                     result['errors'].append(f'{relative}: {e}')
@@ -274,7 +373,7 @@ def inspect_repo(root, binary):
         else:
             result['actions'] = json.loads(scan.stdout)
         if not result['manifests'] and not result.get('actions', {}).get('references'):
-            result['gaps'].append('no supported npm manifests or Action references found')
+            result['gaps'].append('no supported package manifests or Action references found')
         if result['commit'] is not None and result['commit'] != command(['git', '-C', str(root), 'rev-parse', 'HEAD']):
             result['errors'].append('HEAD changed during evaluation')
     except (OSError, ValueError, subprocess.SubprocessError) as e:
@@ -301,8 +400,9 @@ def query_osv(pairs, cache):
     for start in range(0, len(pending), 100):
         chunk = pending[start:start + 100]
         request = urllib.request.Request('https://api.osv.dev/v1/querybatch',
-            data=json.dumps({'queries': [{'package': {'ecosystem': 'npm', 'name': p[0]},
-                                         'version': p[1]} for p, _, _ in chunk]}).encode(),
+            data=json.dumps({'queries': [
+                {'package': {'ecosystem': OSV_ECOSYSTEM.get(p[0], p[0]), 'name': p[1]},
+                 'version': p[2]} for p, _, _ in chunk]}).encode(),
             headers={'Content-Type': 'application/json', 'User-Agent': 'supply-core-evaluation/1'})
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
@@ -342,7 +442,7 @@ def run(config, inventory_only=False):
         inventory = {'roots': config['roots'], 'repositories': [str(r) for r in roots],
                      'excluded_worktrees': excluded, 'errors': errors,
                      'discovery_warnings': warnings,
-                     'excluded_directories': sorted(PRUNE), 'npm_tracked_inputs_only': True,
+                     'excluded_directories': sorted(PRUNE), 'tracked_ecosystems': list(PACKAGE_ECOSYSTEMS),
                      'workflow_inputs': 'working-tree .github/workflows files'}
         inventory['nested_repository_scope'] = 'registered submodules and configured known_repositories; source trees are pruned'
         inventory['discovery_depth_limit'] = 6
@@ -376,10 +476,12 @@ def run(config, inventory_only=False):
             for pair in report['packages']:
                 key = json.dumps(pair, separators=(',', ':'))
                 if key not in osv:
-                    report['errors'].append(f'OSV not evaluated: {pair[0]}@{pair[1]}')
+                    report['errors'].append(
+                        f'OSV not evaluated: {pair[0]}:{pair[1]}@{pair[2]}')
                 for advisory in osv.get(key, []):
-                    findings.append({'repo': report['path'], 'kind': 'npm-advisory',
-                                     'package': pair[0], 'version': pair[1], 'id': advisory})
+                    findings.append({'repo': report['path'], 'kind': f'{pair[0]}-advisory',
+                                     'ecosystem': pair[0], 'package': pair[1],
+                                     'version': pair[2], 'id': advisory})
             counts = Counter(r['raw'] for r in report.get('actions', {}).get('references', [])
                              if r['pin_kind'] not in ('FullSha', 'Local'))
             for raw, count in counts.items():
@@ -399,9 +501,12 @@ def run(config, inventory_only=False):
         summary = {'started_at': started, 'finished_at': datetime.now(timezone.utc).isoformat(),
             'run_directory': str(run_dir), 'binary_sha256': binary_hash,
             'runner_sha256': runner_hash, 'inventory': inventory,
-            'repository_count': len(reports), 'unique_npm_versions': len(pairs),
+            'repository_count': len(reports),
+            'unique_npm_versions': len([p for p in pairs if p[0] == 'npm']),
+            'unique_pip_versions': len([p for p in pairs if p[0] == 'pypi']),
+            'unique_nuget_versions': len([p for p in pairs if p[0] == 'nuget']),
             'tracked_input_counts': dict(input_counts),
-            'per_repository': [{'path': r['path'], 'npm_versions': len(r['packages']),
+            'per_repository': [{'path': r['path'], 'package_versions': len(r['packages']),
                                'workflow_references': len(r.get('actions', {}).get('references', [])),
                                'workflow_findings': len(r.get('actions', {}).get('findings', [])),
                                'duration_seconds': r['duration_seconds'],
@@ -416,10 +521,11 @@ def run(config, inventory_only=False):
             'limitations': ['OSV advisory matches are not malware detections or severity-filtered blocks',
                 'Lockfile contents are declarations, not proof of installed bytes',
                 'No quarantine-age, upstream update, or artifact-integrity evaluation in this run',
-                'Other package ecosystems and untracked inputs are not evaluated']}
+                'Other package ecosystems (RubyGems, Cargo, Maven, Go) and untracked inputs are not evaluated']}
         write_json(run_dir / 'summary.json', summary)
         lines = ['# Machine evaluation', '', f'Repositories: {len(reports)}',
-            f'Unique npm versions: {len(pairs)}; OSV evaluated: {len(osv)}',
+            f'Unique npm: {summary["unique_npm_versions"]}; pip: {summary["unique_pip_versions"]}; '
+            f'nuget: {summary["unique_nuget_versions"]}; OSV evaluated: {len(osv)}',
             f'Finding records: {len(findings)}; errors: {len(errors)}; repositories with gaps: {len(summary["gaps"])}',
             '', '## Tracked input inventory', '',
             json.dumps(dict(input_counts), sort_keys=True),
