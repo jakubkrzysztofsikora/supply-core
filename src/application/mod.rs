@@ -217,7 +217,10 @@ pub fn extract_dockerfile_from(content: &str) -> Vec<(String, usize)> {
     let mut references = Vec::new();
     for (index, raw_line) in content.lines().enumerate() {
         let line = raw_line.trim();
-        if line.len() < 4 || !line[..4].eq_ignore_ascii_case("FROM") {
+        let Some(prefix) = line.get(..4) else {
+            continue;
+        };
+        if !prefix.eq_ignore_ascii_case("FROM") {
             continue;
         }
         if line
@@ -227,7 +230,9 @@ pub fn extract_dockerfile_from(content: &str) -> Vec<(String, usize)> {
         {
             continue;
         }
-        let image = line[4..]
+        let image = line
+            .get(4..)
+            .unwrap_or("")
             .split_whitespace()
             .find(|token| !token.starts_with('-') && !token.is_empty());
         if let Some(image) = image {
@@ -292,6 +297,9 @@ impl<'a> DockerScanner<'a> {
             "__pycache__",
             ".next",
             ".cache",
+            ".worktrees",
+            "worktrees",
+            ".claude",
         ];
         let mut references = Vec::new();
         let mut findings = Vec::new();
@@ -1011,6 +1019,26 @@ mod tests {
         assert_eq!(d.status, DecisionStatus::Block);
         assert!(d.reasons[0].contains("GHSA-medium"));
         Ok(())
+    }
+    #[test]
+    fn docker_scan_skips_worktree_copies() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::create_dir_all(dir.path().join(".worktrees/old"))?;
+        std::fs::write(
+            dir.path().join(".worktrees/old/Dockerfile"),
+            "FROM alpine:3.20\n",
+        )?;
+        std::fs::write(dir.path().join("Dockerfile"), "FROM debian:12\n")?;
+        let p = Policy::default();
+        let report = DockerScanner { policy: &p }.scan(dir.path())?;
+        assert_eq!(report.references.len(), 1);
+        assert!(!report.references[0].file.contains(".worktrees"));
+        Ok(())
+    }
+    #[test]
+    fn dockerfile_extraction_handles_unicode_lines() {
+        let refs = extract_dockerfile_from("— em dash\n# — pinned base\nFROM alpine:3.20\n");
+        assert_eq!(refs, vec![("alpine:3.20".to_string(), 3)]);
     }
     #[test]
     fn dockerfile_references_are_classified_and_blocked() -> Result<()> {
