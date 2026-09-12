@@ -20,6 +20,7 @@ use supply_core::{
 #[derive(Parser)]
 #[command(
     name = "supply",
+    version,
     about = "Local-first supply-chain dependency firewall MVP"
 )]
 struct Cli {
@@ -553,6 +554,13 @@ fn snapshot_nuget(
 mod cli_tests {
     use super::*;
 
+    #[test]
+    fn version_flag_is_supported() {
+        match Cli::try_parse_from(["supply", "--version"]) {
+            Ok(_) => panic!("--version must not parse as a subcommand"),
+            Err(error) => assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion),
+        }
+    }
     #[test]
     fn ecosystem_subcommands_parse() -> Result<()> {
         let cli = Cli::try_parse_from(["supply", "snapshot-pip"])?;
