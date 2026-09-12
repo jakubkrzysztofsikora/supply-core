@@ -165,7 +165,23 @@ pub fn package_version_from_pypi(
         .get("urls")
         .and_then(|urls| urls.as_array())
         .context("pypi payload has no urls array")?;
-    let mut candidates: Vec<&serde_json::Value> = files
+    let mut expected = Vec::new();
+    for expected_hash in expected_hashes {
+        let Some((algorithm, digest)) = expected_hash.split_once(':') else {
+            anyhow::bail!("malformed requirements hash for {name}@{version}");
+        };
+        if !algorithm.eq_ignore_ascii_case("sha256") {
+            anyhow::bail!(
+                "unsupported requirements hash algorithm '{algorithm}' for {name}@{version}"
+            );
+        }
+        let digest = digest.to_lowercase();
+        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            anyhow::bail!("malformed requirements sha256 hash for {name}@{version}");
+        }
+        expected.push(digest);
+    }
+    let non_yanked: Vec<&serde_json::Value> = files
         .iter()
         .filter(|file| {
             !file
@@ -174,8 +190,38 @@ pub fn package_version_from_pypi(
                 .unwrap_or(false)
         })
         .collect();
-    if candidates.is_empty() {
-        candidates = files.iter().collect();
+    let mut candidates = if non_yanked.is_empty() {
+        files.iter().collect()
+    } else {
+        non_yanked
+    };
+    if !expected.is_empty() {
+        candidates = files
+            .iter()
+            .filter(|file| {
+                file.get("digests")
+                    .and_then(|digests| digests.get("sha256"))
+                    .and_then(|hash| hash.as_str())
+                    .map(|hash| hash.to_lowercase())
+                    .is_some_and(|hash| expected.contains(&hash))
+            })
+            .collect();
+        if candidates.is_empty() {
+            anyhow::bail!("requirements hash mismatch for {name}@{version}");
+        }
+        let non_yanked_matches: Vec<&serde_json::Value> = candidates
+            .iter()
+            .copied()
+            .filter(|file| {
+                !file
+                    .get("yanked")
+                    .and_then(|y| y.as_bool())
+                    .unwrap_or(false)
+            })
+            .collect();
+        if !non_yanked_matches.is_empty() {
+            candidates = non_yanked_matches;
+        }
     }
     let file = candidates
         .iter()
@@ -189,31 +235,11 @@ pub fn package_version_from_pypi(
             )
         })
         .context("pypi payload has no files")?;
-    let sha256 = file
+    let integrity = file
         .get("digests")
         .and_then(|digests| digests.get("sha256"))
-        .and_then(|hash| hash.as_str());
-    if !expected_hashes.is_empty() {
-        let mut digests = Vec::new();
-        for expected in expected_hashes {
-            let Some((algorithm, digest)) = expected.split_once(':') else {
-                anyhow::bail!("malformed requirements hash for {name}@{version}");
-            };
-            if !algorithm.eq_ignore_ascii_case("sha256") {
-                anyhow::bail!(
-                    "unsupported requirements hash algorithm '{algorithm}' for {name}@{version}"
-                );
-            }
-            digests.push(digest.to_string());
-        }
-        let Some(hex) = sha256 else {
-            anyhow::bail!("no sha256 digest for {name}@{version} while requirements pin hashes");
-        };
-        if !digests.iter().any(|digest| digest == hex) {
-            anyhow::bail!("requirements hash mismatch for {name}@{version}");
-        }
-    }
-    let integrity = sha256.map(|hash| format!("sha256-{hash}"));
+        .and_then(|hash| hash.as_str())
+        .map(|hash| format!("sha256-{}", hash.to_lowercase()));
     let tarball_url = file
         .get("url")
         .and_then(|url| url.as_str())
@@ -296,13 +322,16 @@ urllib3===1.26.18
 
     #[test]
     fn selects_newest_artifact_and_validates_hashes() -> Result<()> {
+        let old = "1".repeat(64);
+        let new = "b".repeat(64);
+        let yanked = "c".repeat(64);
         let payload = json!({ "urls": [
             {"filename":"old.tar.gz","upload_time_iso_8601":"2023-01-01T00:00:00Z","yanked":false,
-             "digests":{"sha256":"1111"},"url":"https://files.example/old.tar.gz"},
+             "digests":{"sha256":old},"url":"https://files.example/old.tar.gz"},
             {"filename":"new.whl","upload_time_iso_8601":"2026-09-11T00:00:00Z","yanked":false,
-             "digests":{"sha256":"bbbb"},"url":"https://files.example/new.whl"},
+             "digests":{"sha256":new},"url":"https://files.example/new.whl"},
             {"filename":"yanked.whl","upload_time_iso_8601":"2026-09-12T00:00:00Z","yanked":true,
-             "digests":{"sha256":"cccc"},"url":"https://files.example/yanked.whl"}
+             "digests":{"sha256":yanked},"url":"https://files.example/yanked.whl"}
         ]});
         let version = Version::parse("2.32.3").unwrap();
         let pv = package_version_from_pypi(&payload, "requests", &version, &[])?;
@@ -311,22 +340,62 @@ urllib3===1.26.18
             Some("2026-09-11T00:00:00+00:00".to_string()),
             "newest non-yanked artifact must drive the age check"
         );
-        assert_eq!(pv.integrity.as_deref(), Some("sha256-bbbb"));
-
-        let matching = vec!["sha256:bbbb".to_string()];
-        package_version_from_pypi(&payload, "requests", &version, &matching)?;
-        let any_of = vec!["sha256:aaaa".to_string(), "sha256:bbbb".to_string()];
-        package_version_from_pypi(&payload, "requests", &version, &any_of)?;
-        let mismatched = vec!["sha256:dddd".to_string()];
-        assert!(package_version_from_pypi(&payload, "requests", &version, &mismatched).is_err());
-        let unsupported = vec!["sha512:eeee".to_string()];
-        let error = package_version_from_pypi(&payload, "requests", &version, &unsupported)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("unsupported"),
-            "non-sha256 hashes must be rejected explicitly, got: {error}"
+        assert_eq!(
+            pv.integrity.as_deref(),
+            Some(format!("sha256-{new}").as_str())
         );
+
+        package_version_from_pypi(&payload, "requests", &version, &[format!("sha256:{new}")])?;
+        package_version_from_pypi(
+            &payload,
+            "requests",
+            &version,
+            &[format!("sha256:{old}"), format!("sha256:{new}")],
+        )?;
+        let sdist_only =
+            package_version_from_pypi(&payload, "requests", &version, &[format!("sha256:{old}")])?;
+        assert_eq!(
+            sdist_only.integrity.as_deref(),
+            Some(format!("sha256-{old}").as_str()),
+            "when hashes are pinned, a matching artifact drives selection even if not newest"
+        );
+        assert_eq!(
+            sdist_only.published_at.map(|t| t.to_rfc3339()),
+            Some("2023-01-01T00:00:00+00:00".to_string())
+        );
+        let uppercase = package_version_from_pypi(
+            &payload,
+            "requests",
+            &version,
+            &[format!("sha256:{}", new.to_uppercase())],
+        )?;
+        assert!(uppercase
+            .integrity
+            .unwrap_or_default()
+            .starts_with("sha256-"));
+        let yanked_only = package_version_from_pypi(
+            &payload,
+            "requests",
+            &version,
+            &[format!("sha256:{yanked}")],
+        )?;
+        assert_eq!(
+            yanked_only.integrity.as_deref(),
+            Some(format!("sha256-{yanked}").as_str()),
+            "an exact pin may legitimately reference a yanked artifact"
+        );
+        let wrong = format!("sha256:{}", "d".repeat(64));
+        assert!(package_version_from_pypi(&payload, "requests", &version, &[wrong]).is_err());
+        let unsupported =
+            package_version_from_pypi(&payload, "requests", &version, &["sha512:eeee".to_string()])
+                .unwrap_err()
+                .to_string();
+        assert!(unsupported.contains("unsupported"), "got: {unsupported}");
+        let malformed =
+            package_version_from_pypi(&payload, "requests", &version, &["sha256:abcd".to_string()])
+                .unwrap_err()
+                .to_string();
+        assert!(malformed.contains("malformed"), "got: {malformed}");
         Ok(())
     }
 
