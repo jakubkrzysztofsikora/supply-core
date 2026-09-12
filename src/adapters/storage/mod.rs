@@ -244,8 +244,15 @@ impl FindingFile {
             .open(&lock_path)?;
         {
             use std::os::unix::io::AsRawFd;
-            unsafe {
-                libc::flock(lock.as_raw_fd(), libc::LOCK_EX);
+            loop {
+                let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
+                if result == 0 {
+                    break;
+                }
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error.into());
+                }
             }
         }
         let result = self.append_locked(finding);
