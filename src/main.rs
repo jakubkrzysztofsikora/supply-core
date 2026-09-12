@@ -373,13 +373,30 @@ fn scan_package(
     let store = MemoryMetadataStore::default();
     let attested = match ecosystem {
         supply_core::domain::Ecosystem::Npm => {
-            use supply_core::ports::UpstreamNpmRegistry;
-            let registry = supply_core::adapters::npm::HttpNpmRegistry::new()?;
-            match registry.metadata(name) {
-                Ok(metadata) => supply_core::adapters::npm::has_provenance(&metadata, version),
+            use supply_core::ports::{Hasher, UpstreamNpmRegistry};
+            match supply_core::adapters::npm::HttpNpmRegistry::new() {
+                Ok(registry) => match registry.metadata(name) {
+                    Ok(metadata) => {
+                        let has_provenance =
+                            supply_core::adapters::npm::has_provenance(&metadata, version);
+                        let bytes_match =
+                            supply_core::adapters::npm::integrity_for(&metadata, version)
+                                .is_some_and(|integrity| {
+                                    supply_core::adapters::crypto::ShaHasher
+                                        .verify_npm_integrity(&bytes, &integrity)
+                                });
+                        has_provenance && bytes_match
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "warning: provenance lookup failed ({error}); treating as unattested"
+                        );
+                        false
+                    }
+                },
                 Err(error) => {
                     eprintln!(
-                        "warning: provenance lookup failed ({error}); treating as unattested"
+                        "warning: registry client unavailable ({error}); treating as unattested"
                     );
                     false
                 }
