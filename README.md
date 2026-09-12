@@ -271,6 +271,7 @@ CI checks formatting, tests, Clippy, and maintains an 85% library line-coverage 
 ## Deep Dive & Specifications
 
 - [Machine-wide Evaluation Spec](docs/machine-evaluation.md) — Multi-repo discovery, LaunchAgent setup, evidence structure.
+- [Quarantine Scanning & Public Disclosure](docs/quarantine-scanning-and-disclosure.md) — In-window content scanning for hidden 0-days and how findings get reported.
 - [Threat Model & Security Assumptions](docs/threat-model.md) — Trust boundaries, attack vectors, residual risks.
 - [E2E Registry Validation Plan](docs/e2e-npm-plan.md) — Real-world registry testing tier.
 - [Vertical Slice MVP Plan](docs/vertical-slice-mvp-plan.md) — Ports & adapters design, application core.
