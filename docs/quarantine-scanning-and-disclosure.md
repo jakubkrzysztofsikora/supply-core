@@ -159,9 +159,11 @@ Guardrails before any automated submission:
    closed). `scan-package --guarddog` runs it via `$GUARDDOG_BIN`; both
    findings persist with their source intact.
 5. **Provenance** — done: `has_provenance` (npm `dist.attestations`) plus
-   score downgrade via `apply_provenance`/`PROVENANCE_RELIEF` (3 points) and
-   the `scan-package --provenance` flag; an attested archive drops from
-   Block to a review warning in the evaluator.
+   score downgrade via `apply_provenance`/`PROVENANCE_RELIEF` (3 points).
+   `scan-package` resolves the attestation from the package's npm registry
+   metadata; a lookup failure means unattested (fail closed) and callers
+   cannot assert provenance themselves. An attested malicious archive drops
+   from Block to a review warning.
 6. **Version diff** — done (`diff_package_files`, `scan_version_diff`):
    newly introduced lifecycle scripts score 9 with rule `new-install-script`.
 7. **OSV export + CLI** — done: `ContentFinding::to_osv()` and

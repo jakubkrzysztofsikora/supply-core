@@ -234,16 +234,42 @@ impl FindingFile {
                 std::fs::create_dir_all(parent)?;
             }
         }
+        let existing = std::fs::read_to_string(&self.path).unwrap_or_default();
+        if existing.trim_start().starts_with('[') {
+            let mut findings = parse_findings(&existing)?;
+            findings.push(finding.clone());
+            let mut staged = String::new();
+            for item in &findings {
+                staged.push_str(&serde_json::to_string(item)?);
+                staged.push('\n');
+            }
+            let temporary = self.path.with_extension("rewrite.tmp");
+            let mut file = std::fs::File::create(&temporary)?;
+            file.write_all(staged.as_bytes())?;
+            file.sync_data()?;
+            std::fs::rename(&temporary, &self.path)?;
+            return Ok(());
+        }
+        let mut record = serde_json::to_string(finding)?;
+        record.push('\n');
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)?;
-        writeln!(file, "{}", serde_json::to_string(finding)?)?;
+        file.write_all(record.as_bytes())?;
+        file.sync_data()?;
         Ok(())
     }
 
     pub fn load_into(&self, store: &MemoryMetadataStore) -> Result<usize> {
-        let content = std::fs::read_to_string(&self.path)?;
+        let mut content = std::fs::read_to_string(&self.path)?;
+        if !content.trim_start().starts_with('[') && !content.is_empty() && !content.ends_with('\n')
+        {
+            match content.rfind('\n') {
+                Some(index) => content.truncate(index + 1),
+                None => content.clear(),
+            }
+        }
         let findings = parse_findings(&content)?;
         for finding in &findings {
             store.save_content_finding(finding)?;
@@ -296,6 +322,58 @@ mod tests {
         assert_eq!(FindingFile::new(&array_path).load_into(&store).unwrap(), 1);
         assert!(store
             .content_finding(&Ecosystem::Npm, "c", &Version::parse("1.0.0").unwrap())
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn append_to_array_file_migrates_to_jsonl() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("findings.json");
+        let finding = |package: &str| ContentFinding {
+            ecosystem: Ecosystem::Npm,
+            package: package.to_string(),
+            version: Version::parse("1.0.0").unwrap(),
+            source: "static-heuristics".to_string(),
+            score: 9,
+            rules: vec![],
+            summary: package.to_string(),
+            detected_at: chrono::Utc::now(),
+        };
+        std::fs::write(
+            &path,
+            format!("[{}]", serde_json::to_string(&finding("a")).unwrap()),
+        )
+        .unwrap();
+        let file = FindingFile::new(&path);
+        file.append(&finding("b")).unwrap();
+        let store = MemoryMetadataStore::default();
+        assert_eq!(file.load_into(&store).unwrap(), 2);
+    }
+
+    #[test]
+    fn torn_final_jsonl_line_is_recovered() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("findings.jsonl");
+        let file = FindingFile::new(&path);
+        let finding = ContentFinding {
+            ecosystem: Ecosystem::Npm,
+            package: "a".to_string(),
+            version: Version::parse("1.0.0").unwrap(),
+            source: "static-heuristics".to_string(),
+            score: 9,
+            rules: vec![],
+            summary: "a".to_string(),
+            detected_at: chrono::Utc::now(),
+        };
+        file.append(&finding).unwrap();
+        let mut content = std::fs::read_to_string(&path).unwrap();
+        content.push_str("{\"ecosystem\":\"Npm\",\"package\":\"b\"");
+        std::fs::write(&path, content).unwrap();
+        let store = MemoryMetadataStore::default();
+        assert_eq!(file.load_into(&store).unwrap(), 1);
+        assert!(store
+            .content_finding(&Ecosystem::Npm, "a", &Version::parse("1.0.0").unwrap())
             .unwrap()
             .is_some());
     }
