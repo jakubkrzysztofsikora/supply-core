@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Ecosystem {
     Npm,
+    PyPi,
+    NuGet,
+    DockerImage,
     GitHubActions,
     AzurePipelines,
 }
@@ -152,6 +155,82 @@ impl Default for VulnerabilityPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImagePinKind {
+    Digest,
+    Tag,
+    Latest,
+    MissingTag,
+    Unresolved,
+}
+
+pub fn classify_image_ref(raw: &str) -> ImagePinKind {
+    let trimmed = raw.trim().trim_matches(['"', '\'']);
+    if trimmed.is_empty() || trimmed.contains('$') {
+        return ImagePinKind::Unresolved;
+    }
+    if let Some((_, digest)) = trimmed.split_once("@sha256:") {
+        if !digest.is_empty() {
+            return ImagePinKind::Digest;
+        }
+    }
+    let last_slash = trimmed.rfind('/');
+    let last_colon = trimmed.rfind(':');
+    match last_colon {
+        Some(colon) if last_slash.is_none_or(|slash| colon > slash) => {
+            match &trimmed[colon + 1..] {
+                "" => ImagePinKind::MissingTag,
+                "latest" => ImagePinKind::Latest,
+                _ => ImagePinKind::Tag,
+            }
+        }
+        _ => ImagePinKind::MissingTag,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PipPolicy {
+    pub require_integrity: bool,
+    pub fallback_to_frozen: bool,
+}
+impl Default for PipPolicy {
+    fn default() -> Self {
+        Self {
+            require_integrity: true,
+            fallback_to_frozen: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NuGetPolicy {
+    pub require_integrity: bool,
+    pub fallback_to_frozen: bool,
+}
+impl Default for NuGetPolicy {
+    fn default() -> Self {
+        Self {
+            require_integrity: true,
+            fallback_to_frozen: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DockerPolicy {
+    pub require_digest_pin: bool,
+}
+impl Default for DockerPolicy {
+    fn default() -> Self {
+        Self {
+            require_digest_pin: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NpmPolicy {
     pub require_integrity: bool,
@@ -235,6 +314,12 @@ pub struct Policy {
     pub vulnerabilities: VulnerabilityPolicy,
     #[serde(default)]
     pub npm: NpmPolicy,
+    #[serde(default)]
+    pub pip: PipPolicy,
+    #[serde(default)]
+    pub nuget: NuGetPolicy,
+    #[serde(default)]
+    pub docker: DockerPolicy,
     #[serde(default)]
     pub github_actions: GitHubActionsPolicy,
     #[serde(default)]
@@ -448,6 +533,38 @@ mod tests {
                 cve_keeps_quarantined: true
             }
         ));
+    }
+    #[test]
+    fn classifies_image_references() {
+        assert_eq!(
+            classify_image_ref("nginx@sha256:deadbeef"),
+            ImagePinKind::Digest
+        );
+        assert_eq!(classify_image_ref("nginx:1.27-alpine"), ImagePinKind::Tag);
+        assert_eq!(classify_image_ref("nginx:latest"), ImagePinKind::Latest);
+        assert_eq!(classify_image_ref("nginx"), ImagePinKind::MissingTag);
+        assert_eq!(
+            classify_image_ref("ghcr.io/org/app@sha256:abc123"),
+            ImagePinKind::Digest
+        );
+        assert_eq!(
+            classify_image_ref("localhost:5000/app:1.2"),
+            ImagePinKind::Tag
+        );
+        assert_eq!(classify_image_ref("$BASE_IMAGE"), ImagePinKind::Unresolved);
+        assert_eq!(
+            classify_image_ref("${BASE_IMAGE}:1"),
+            ImagePinKind::Unresolved
+        );
+    }
+    #[test]
+    fn ecosystem_policies_have_secure_defaults() {
+        let p = Policy::default();
+        assert!(p.pip.require_integrity);
+        assert!(p.pip.fallback_to_frozen);
+        assert!(p.nuget.require_integrity);
+        assert!(p.nuget.fallback_to_frozen);
+        assert!(p.docker.require_digest_pin);
     }
     #[test]
     fn strongest_vulnerability_is_order_independent() {

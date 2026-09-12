@@ -11,7 +11,36 @@ pub struct PackageEvaluator<'a> {
     pub vulns: &'a dyn VulnerabilitySource,
     pub metadata: &'a dyn MetadataStore,
 }
+struct EcosystemPolicy<'p> {
+    require_integrity: bool,
+    fallback_to_frozen: bool,
+    deny: &'p [String],
+}
 impl<'a> PackageEvaluator<'a> {
+    fn ecosystem_policy(&self, ecosystem: &Ecosystem) -> EcosystemPolicy<'_> {
+        match ecosystem {
+            Ecosystem::Npm => EcosystemPolicy {
+                require_integrity: self.policy.npm.require_integrity,
+                fallback_to_frozen: self.policy.npm.fallback_to_frozen,
+                deny: &self.policy.npm.deny_packages,
+            },
+            Ecosystem::PyPi => EcosystemPolicy {
+                require_integrity: self.policy.pip.require_integrity,
+                fallback_to_frozen: self.policy.pip.fallback_to_frozen,
+                deny: &[],
+            },
+            Ecosystem::NuGet => EcosystemPolicy {
+                require_integrity: self.policy.nuget.require_integrity,
+                fallback_to_frozen: self.policy.nuget.fallback_to_frozen,
+                deny: &[],
+            },
+            _ => EcosystemPolicy {
+                require_integrity: true,
+                fallback_to_frozen: true,
+                deny: &[],
+            },
+        }
+    }
     /// `requested` is the client's semver range (e.g. `^1.2.0`). Fallback
     /// serves the latest frozen version satisfying it; `None` allows any.
     pub fn evaluate(
@@ -20,24 +49,29 @@ impl<'a> PackageEvaluator<'a> {
         requested: Option<&VersionReq>,
     ) -> Result<Decision> {
         let name = &version.package.name;
-        if self.policy.npm.deny_packages.contains(name) {
+        let ecosystem = version.package.ecosystem.clone();
+        let ecosystem_policy = self.ecosystem_policy(&ecosystem);
+        if ecosystem_policy.deny.contains(name) {
             return Ok(Decision::block(
                 name,
                 Some(version.version.to_string()),
                 "package is denylisted",
             ));
         }
-        if self.policy.npm.require_integrity && version.integrity.is_none() {
+        if ecosystem_policy.require_integrity && version.integrity.is_none() {
             return self.fallback_or_block(
+                &ecosystem,
                 name,
                 &version.version,
                 requested,
-                "package version is missing npm integrity",
+                "package version is missing integrity",
             );
         }
-        let findings = self.vulns.query(Ecosystem::Npm, name, &version.version)?;
+        let findings = self
+            .vulns
+            .query(ecosystem.clone(), name, &version.version)?;
         if let Some(reason) = self.vulnerability_reason(&findings) {
-            return self.fallback_or_block(name, &version.version, requested, reason);
+            return self.fallback_or_block(&ecosystem, name, &version.version, requested, reason);
         }
         if is_version_quarantined(
             version.published_at,
@@ -45,6 +79,7 @@ impl<'a> PackageEvaluator<'a> {
             &self.policy.quarantine,
         ) {
             return self.fallback_or_block(
+                &ecosystem,
                 name,
                 &version.version,
                 requested,
@@ -62,16 +97,18 @@ impl<'a> PackageEvaluator<'a> {
     }
     fn fallback_or_block(
         &self,
+        ecosystem: &Ecosystem,
         name: &str,
         requested_version: &Version,
         requested: Option<&VersionReq>,
         reason: impl Into<String>,
     ) -> Result<Decision> {
         let reason = reason.into();
-        if self.policy.npm.fallback_to_frozen {
+        let ecosystem_policy = self.ecosystem_policy(ecosystem);
+        if ecosystem_policy.fallback_to_frozen {
             if let Some(frozen) = self.metadata.latest_frozen_satisfying(name, requested)? {
                 // Frozen bytes are immutable, but vulnerability knowledge changes.
-                let findings = self.vulns.query(Ecosystem::Npm, name, &frozen.version)?;
+                let findings = self.vulns.query(ecosystem.clone(), name, &frozen.version)?;
                 if let Some(fallback_reason) = self.vulnerability_reason(&findings) {
                     return Ok(Decision::block(
                         name,
@@ -167,6 +204,168 @@ impl WorkflowScanReport {
         self.findings
             .iter()
             .any(|d| matches!(d.status, DecisionStatus::Block))
+    }
+}
+
+pub fn extract_dockerfile_from(content: &str) -> Vec<(String, usize)> {
+    let mut references = Vec::new();
+    for (index, raw_line) in content.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.len() < 4 || !line[..4].eq_ignore_ascii_case("FROM") {
+            continue;
+        }
+        if line
+            .as_bytes()
+            .get(4)
+            .is_some_and(|byte| !byte.is_ascii_whitespace())
+        {
+            continue;
+        }
+        let image = line[4..]
+            .split_whitespace()
+            .find(|token| !token.starts_with('-') && !token.is_empty());
+        if let Some(image) = image {
+            references.push((image.to_string(), index + 1));
+        }
+    }
+    references
+}
+
+pub fn extract_compose_images(content: &str) -> Vec<(String, usize)> {
+    let mut references = Vec::new();
+    for (index, raw_line) in content.lines().enumerate() {
+        let line = raw_line.split('#').next().unwrap_or("").trim();
+        let Some(value) = line.strip_prefix("image:") else {
+            continue;
+        };
+        let value = value.trim().trim_matches(['"', '\'']);
+        if !value.is_empty() {
+            references.push((value.to_string(), index + 1));
+        }
+    }
+    references
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DockerImageReference {
+    pub raw: String,
+    pub file: String,
+    pub line: usize,
+    pub pin_kind: ImagePinKind,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DockerScanReport {
+    pub references: Vec<DockerImageReference>,
+    pub findings: Vec<Decision>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub finding_locations: Vec<DockerImageReference>,
+}
+impl DockerScanReport {
+    pub fn is_blocking(&self) -> bool {
+        self.findings
+            .iter()
+            .any(|finding| matches!(finding.status, DecisionStatus::Block))
+    }
+}
+
+pub struct DockerScanner<'a> {
+    pub policy: &'a Policy,
+}
+impl<'a> DockerScanner<'a> {
+    pub fn scan(&self, root: &Path) -> Result<DockerScanReport> {
+        const SKIP: &[&str] = &[
+            "node_modules",
+            "target",
+            ".git",
+            "vendor",
+            "dist",
+            "build",
+            ".venv",
+            "venv",
+            "__pycache__",
+            ".next",
+            ".cache",
+        ];
+        let mut references = Vec::new();
+        let mut findings = Vec::new();
+        let mut finding_locations = Vec::new();
+        let walker = walkdir::WalkDir::new(root)
+            .max_depth(8)
+            .into_iter()
+            .filter_entry(|entry| {
+                !(entry.file_type().is_dir()
+                    && SKIP.contains(&entry.file_name().to_string_lossy().as_ref()))
+            });
+        for entry in walker.filter_map(|entry| entry.ok()) {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            let lower = name.to_ascii_lowercase();
+            let is_dockerfile = name.starts_with("Dockerfile") || lower.ends_with(".dockerfile");
+            let is_compose = (lower.starts_with("docker-compose")
+                || lower == "compose.yml"
+                || lower == "compose.yaml")
+                && (lower.ends_with(".yml") || lower.ends_with(".yaml"));
+            if !is_dockerfile && !is_compose {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            let extracted = if is_dockerfile {
+                extract_dockerfile_from(&content)
+            } else {
+                extract_compose_images(&content)
+            };
+            let file = entry
+                .path()
+                .strip_prefix(root)
+                .unwrap_or(entry.path())
+                .display()
+                .to_string();
+            for (raw, line) in extracted {
+                if raw == "scratch" {
+                    continue;
+                }
+                let pin_kind = classify_image_ref(&raw);
+                if self.policy.docker.require_digest_pin {
+                    let block = match pin_kind {
+                        ImagePinKind::Digest => None,
+                        ImagePinKind::Unresolved => {
+                            Some("container image reference is not statically resolvable")
+                        }
+                        _ => Some("container image is not pinned to a sha256 digest"),
+                    };
+                    if let Some(reason) = block {
+                        let reference = DockerImageReference {
+                            raw: raw.clone(),
+                            file: file.clone(),
+                            line,
+                            pin_kind: pin_kind.clone(),
+                        };
+                        finding_locations.push(reference);
+                        findings.push(Decision::block(
+                            raw.clone(),
+                            None,
+                            format!("{reason} at {file}:{line}"),
+                        ));
+                    }
+                }
+                references.push(DockerImageReference {
+                    raw,
+                    file: file.clone(),
+                    line,
+                    pin_kind,
+                });
+            }
+        }
+        Ok(DockerScanReport {
+            references,
+            findings,
+            finding_locations,
+        })
     }
 }
 
@@ -794,6 +993,125 @@ mod tests {
         let d = e.evaluate(&package(Some(now - Duration::days(30))), None)?;
         assert_eq!(d.status, DecisionStatus::Block);
         assert!(d.reasons[0].contains("GHSA-medium"));
+        Ok(())
+    }
+    #[test]
+    fn dockerfile_references_are_classified_and_blocked() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(
+            dir.path().join("Dockerfile"),
+            "FROM alpine:3.20\nFROM ghcr.io/org/app@sha256:abc123\nFROM ubuntu\nFROM scratch\nCOPY x /x\n",
+        )?;
+        let p = Policy::default();
+        let report = DockerScanner { policy: &p }.scan(dir.path())?;
+        assert_eq!(report.references.len(), 3);
+        assert_eq!(report.findings.len(), 2);
+        assert!(report
+            .findings
+            .iter()
+            .all(|finding| finding.reasons.join(" ").contains("digest")));
+        Ok(())
+    }
+    #[test]
+    fn compose_images_are_scanned() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(
+            dir.path().join("docker-compose.yml"),
+            "services:\n  web:\n    image: nginx:1.27\n  db:\n    image: redis@sha256:deadbeef\n  queue:\n    image: ${BASE_IMAGE}:latest\n",
+        )?;
+        let p = Policy::default();
+        let report = DockerScanner { policy: &p }.scan(dir.path())?;
+        assert_eq!(report.references.len(), 3);
+        assert_eq!(report.findings.len(), 2);
+        Ok(())
+    }
+    #[test]
+    fn docker_policy_can_be_disabled() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("Dockerfile"), "FROM alpine:3.20\n")?;
+        let mut p = Policy::default();
+        p.docker.require_digest_pin = false;
+        let report = DockerScanner { policy: &p }.scan(dir.path())?;
+        assert_eq!(report.references.len(), 1);
+        assert!(report.findings.is_empty());
+        Ok(())
+    }
+    #[test]
+    fn pip_integrity_policy_is_ecosystem_scoped() -> Result<()> {
+        let now = Utc::now();
+        let mut p = Policy::default();
+        p.pip.require_integrity = false;
+        let c = FixedClock(now);
+        let m = M(Mutex::new(None));
+        let e = PackageEvaluator {
+            policy: &p,
+            clock: &c,
+            vulns: &NoVulns,
+            metadata: &m,
+        };
+        let pv = PackageVersion {
+            package: PackageCoordinate {
+                ecosystem: Ecosystem::PyPi,
+                name: "requests".into(),
+            },
+            version: Version::parse("2.32.3").unwrap(),
+            published_at: Some(now - Duration::days(30)),
+            integrity: None,
+            tarball_url: None,
+        };
+        let d = e.evaluate(&pv, None)?;
+        assert_eq!(
+            d.status,
+            DecisionStatus::Allow,
+            "pip policy, not npm policy, must decide pip integrity"
+        );
+        Ok(())
+    }
+    struct OnlyPyPiVulns;
+    impl VulnerabilitySource for OnlyPyPiVulns {
+        fn query(
+            &self,
+            ecosystem: Ecosystem,
+            _: &str,
+            _: &Version,
+        ) -> Result<Vec<VulnerabilityFinding>> {
+            if ecosystem == Ecosystem::PyPi {
+                Ok(vec![VulnerabilityFinding {
+                    source: "OSV".into(),
+                    id: "GHSA-pip".into(),
+                    severity: Severity::Medium,
+                    summary: "pip advisory".into(),
+                }])
+            } else {
+                Ok(vec![])
+            }
+        }
+    }
+    #[test]
+    fn vulnerability_query_uses_package_ecosystem() -> Result<()> {
+        let now = Utc::now();
+        let p = Policy::default();
+        let c = FixedClock(now);
+        let m = M(Mutex::new(None));
+        let e = PackageEvaluator {
+            policy: &p,
+            clock: &c,
+            vulns: &OnlyPyPiVulns,
+            metadata: &m,
+        };
+        let pv = PackageVersion {
+            package: PackageCoordinate {
+                ecosystem: Ecosystem::PyPi,
+                name: "requests".into(),
+            },
+            version: Version::parse("2.32.3").unwrap(),
+            published_at: Some(now - Duration::days(30)),
+            integrity: Some("sha256-abc".into()),
+            tarball_url: None,
+        };
+        let d = e.evaluate(&pv, None)?;
+        assert_eq!(d.status, DecisionStatus::Block);
+        assert!(d.reasons[0].contains("GHSA-pip"));
         Ok(())
     }
     #[test]
