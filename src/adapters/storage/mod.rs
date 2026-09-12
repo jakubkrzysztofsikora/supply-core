@@ -130,6 +130,7 @@ impl MetadataStore for MemoryMetadataStore {
     }
     fn latest_frozen_satisfying(
         &self,
+        ecosystem: &Ecosystem,
         name: &str,
         requested: Option<&VersionReq>,
     ) -> Result<Option<FrozenArtifact>> {
@@ -138,18 +139,26 @@ impl MetadataStore for MemoryMetadataStore {
             .lock()
             .map_err(|_| anyhow::anyhow!("lock poisoned"))?
             .iter()
+            .filter(|a| a.package.ecosystem == *ecosystem)
             .filter(|a| a.package.name == name)
             .filter(|a| requested.is_none_or(|r| r.matches(&a.version)))
             .max_by(|a, b| a.version.cmp(&b.version))
             .cloned())
     }
-    fn get_frozen(&self, name: &str, version: &Version) -> Result<Option<FrozenArtifact>> {
+    fn get_frozen(
+        &self,
+        ecosystem: &Ecosystem,
+        name: &str,
+        version: &Version,
+    ) -> Result<Option<FrozenArtifact>> {
         Ok(self
             .frozen
             .lock()
             .map_err(|_| anyhow::anyhow!("lock poisoned"))?
             .iter()
-            .find(|a| a.package.name == name && a.version == *version)
+            .find(|a| {
+                a.package.ecosystem == *ecosystem && a.package.name == name && a.version == *version
+            })
             .cloned())
     }
     fn put_frozen(&self, a: FrozenArtifact) -> Result<()> {
@@ -166,6 +175,50 @@ impl MetadataStore for MemoryMetadataStore {
 mod tests {
     use super::*;
 
+    #[test]
+    fn frozen_lookup_is_ecosystem_scoped() {
+        let store = MemoryMetadataStore::default();
+        let artifact = |ecosystem, version: &str, sha: &str| FrozenArtifact {
+            package: PackageCoordinate {
+                ecosystem,
+                name: "requests".to_string(),
+            },
+            version: Version::parse(version).unwrap(),
+            sha256: sha.to_string(),
+            integrity: None,
+            path: format!("/tmp/{version}"),
+            frozen_at: chrono::Utc::now(),
+        };
+        store
+            .put_frozen(artifact(Ecosystem::Npm, "9.9.9", "npm"))
+            .unwrap();
+        store
+            .put_frozen(artifact(Ecosystem::PyPi, "2.32.3", "pypi"))
+            .unwrap();
+        let found = store
+            .latest_frozen_satisfying(&Ecosystem::PyPi, "requests", None)
+            .unwrap();
+        assert_eq!(
+            found.map(|a| a.version.to_string()),
+            Some("2.32.3".to_string()),
+            "a pip fallback must never resolve to the npm artifact"
+        );
+        let found = store
+            .latest_frozen_satisfying(&Ecosystem::Npm, "requests", None)
+            .unwrap();
+        assert_eq!(
+            found.map(|a| a.version.to_string()),
+            Some("9.9.9".to_string())
+        );
+        assert!(store
+            .get_frozen(
+                &Ecosystem::PyPi,
+                "requests",
+                &Version::parse("9.9.9").unwrap()
+            )
+            .unwrap()
+            .is_none());
+    }
     #[test]
     fn rejects_traversal_names() {
         let store = FsArtifactStore {

@@ -8,7 +8,7 @@ use supply_core::adapters::npm::{package_version_from_metadata, HttpNpmRegistry}
 use supply_core::adapters::osv::NoopVulnerabilitySource;
 use supply_core::adapters::storage::{FsArtifactStore, MemoryMetadataStore};
 use supply_core::application::{IngestService, PackageEvaluator};
-use supply_core::domain::{DecisionStatus, FrozenArtifact, PackageVersion, Policy};
+use supply_core::domain::{DecisionStatus, Ecosystem, FrozenArtifact, PackageVersion, Policy};
 use supply_core::ports::{Clock, MetadataStore, UpstreamNpmRegistry};
 
 struct SystemClock;
@@ -95,7 +95,10 @@ fn left_pad_end_to_end() -> Result<()> {
     .freeze_verified(&pv)
     .context("verified freeze of real tarball")?;
     assert_eq!(frozen.version, version);
-    assert_eq!(store.latest_frozen(name)?.unwrap().version, version);
+    assert_eq!(
+        store.latest_frozen(&Ecosystem::Npm, name)?.unwrap().version,
+        version
+    );
 
     let quarantined_clock = FixedClock(published_at + Duration::days(2));
     let fallback = PackageEvaluator {
@@ -299,7 +302,10 @@ fn same_version_republish_detected() -> Result<()> {
         "expected immutability violation, got: {err}"
     );
     assert_eq!(
-        store.latest_frozen("left-pad")?.unwrap().sha256,
+        store
+            .latest_frozen(&Ecosystem::Npm, "left-pad")?
+            .unwrap()
+            .sha256,
         baseline.sha256,
         "ledger must keep original bytes after refused re-publish"
     );

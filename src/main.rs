@@ -420,7 +420,9 @@ fn snapshot_pip(
         .into_iter()
         .map(|gap| serde_json::json!({ "input": gap }))
         .collect();
-    for (name, pinned) in &pins {
+    for pin in &pins {
+        let name = &pin.name;
+        let pinned = &pin.version;
         let Ok(version) = semver::Version::parse(pinned) else {
             errors.push(serde_json::json!({
                 "package": name,
@@ -435,7 +437,7 @@ fn snapshot_pip(
                 continue;
             }
         };
-        let pv = match package_version_from_pypi(&payload, name, &version) {
+        let pv = match package_version_from_pypi(&payload, name, &version, &pin.hashes) {
             Ok(pv) => pv,
             Err(error) => {
                 errors.push(serde_json::json!({ "package": name, "error": error.to_string() }));
@@ -490,7 +492,9 @@ fn snapshot_nuget(
         .into_iter()
         .map(|gap| serde_json::json!({ "input": gap }))
         .collect();
-    for (name, pinned) in &pins {
+    for pin in &pins {
+        let name = &pin.name;
+        let pinned = &pin.version;
         let Ok(version) = semver::Version::parse(pinned) else {
             errors.push(serde_json::json!({
                 "package": name,
@@ -505,13 +509,15 @@ fn snapshot_nuget(
                 continue;
             }
         };
-        let pv = match package_version_from_nuget(&payload, name, &version) {
-            Ok(pv) => pv,
-            Err(error) => {
-                errors.push(serde_json::json!({ "package": name, "error": error.to_string() }));
-                continue;
-            }
-        };
+        let pv =
+            match package_version_from_nuget(&payload, name, &version, pin.content_hash.as_deref())
+            {
+                Ok(pv) => pv,
+                Err(error) => {
+                    errors.push(serde_json::json!({ "package": name, "error": error.to_string() }));
+                    continue;
+                }
+            };
         let age_days = pv
             .published_at
             .map(|t| now.signed_duration_since(t).num_days())

@@ -157,6 +157,7 @@ impl Default for VulnerabilityPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ImagePinKind {
     Digest,
+    InvalidDigest,
     Tag,
     Latest,
     MissingTag,
@@ -168,10 +169,15 @@ pub fn classify_image_ref(raw: &str) -> ImagePinKind {
     if trimmed.is_empty() || trimmed.contains('$') {
         return ImagePinKind::Unresolved;
     }
-    if let Some((_, digest)) = trimmed.split_once("@sha256:") {
-        if !digest.is_empty() {
-            return ImagePinKind::Digest;
-        }
+    if let Some((_, digest)) = trimmed.split_once('@') {
+        let valid = digest
+            .strip_prefix("sha256:")
+            .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        return if valid {
+            ImagePinKind::Digest
+        } else {
+            ImagePinKind::InvalidDigest
+        };
     }
     let last_slash = trimmed.rfind('/');
     let last_colon = trimmed.rfind(':');
@@ -536,16 +542,18 @@ mod tests {
     }
     #[test]
     fn classifies_image_references() {
+        let pinned = format!("nginx@sha256:{}", "a".repeat(64));
+        assert_eq!(classify_image_ref(&pinned), ImagePinKind::Digest);
         assert_eq!(
             classify_image_ref("nginx@sha256:deadbeef"),
-            ImagePinKind::Digest
+            ImagePinKind::InvalidDigest
         );
         assert_eq!(classify_image_ref("nginx:1.27-alpine"), ImagePinKind::Tag);
         assert_eq!(classify_image_ref("nginx:latest"), ImagePinKind::Latest);
         assert_eq!(classify_image_ref("nginx"), ImagePinKind::MissingTag);
         assert_eq!(
             classify_image_ref("ghcr.io/org/app@sha256:abc123"),
-            ImagePinKind::Digest
+            ImagePinKind::InvalidDigest
         );
         assert_eq!(
             classify_image_ref("localhost:5000/app:1.2"),

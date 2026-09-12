@@ -149,9 +149,9 @@ kubectl apply -k deploy/k8s
 | Ecosystem | Inputs | Checks | Command |
 |---|---|---|---|
 | npm | `package.json` deps | age quarantine, integrity, OSV, frozen fallback | `snapshot-npm` |
-| PyPI (pip) | `requirements.txt` exact pins (`==`, `===`) | age quarantine, sha256 integrity, OSV | `snapshot-pip` |
-| NuGet | `packages.lock.json` | age quarantine, SHA-512 package hash, OSV | `snapshot-nuget` |
-| Docker images | `Dockerfile*`, `docker-compose*.yml`, `compose.yml` | static `@sha256:` digest pinning | `scan-docker` |
+| PyPI (pip) | `requirements.txt` exact pins (`==`, `===`) | age quarantine, sha256 integrity, `--hash` validation, OSV | `snapshot-pip` |
+| NuGet | `packages.lock.json` | age quarantine, lockfile `contentHash` verified against the SHA-512 package hash, OSV | `snapshot-nuget` |
+| Docker images | `Dockerfile*`, `docker-compose*.yml`, `compose.yml` | static `@sha256:<64-hex>` digest pinning | `scan-docker` |
 | GitHub Actions | `.github/workflows/*` | full-SHA pinning, `docker://` digest rule | `scan-actions` |
 | Azure Pipelines | `azure-pipelines*.yml` | task pinning rules | `scan-pipelines` |
 
@@ -228,7 +228,7 @@ github_actions:
 ## Development & Testing
 
 ```bash
-# Run all unit and integration tests (86 tests)
+# Run all unit and integration tests (95 tests)
 cargo test
 
 # Run Python machine-eval test suite

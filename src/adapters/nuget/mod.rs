@@ -53,7 +53,14 @@ impl UpstreamNuGetRegistry for HttpNuGetRegistry {
     }
 }
 
-pub type ParsedPins = (Vec<(String, String)>, Vec<String>);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NuGetPin {
+    pub name: String,
+    pub version: String,
+    pub content_hash: Option<String>,
+}
+
+pub type ParsedPins = (Vec<NuGetPin>, Vec<String>);
 
 pub fn parse_packages_lock(content: &str) -> Result<ParsedPins> {
     let lock: serde_json::Value =
@@ -62,7 +69,7 @@ pub fn parse_packages_lock(content: &str) -> Result<ParsedPins> {
         .get("dependencies")
         .and_then(|dependencies| dependencies.as_object())
         .context("packages.lock.json has no dependencies object")?;
-    let mut pins: Vec<(String, String)> = Vec::new();
+    let mut pins: Vec<NuGetPin> = Vec::new();
     let mut gaps = Vec::new();
     for (target, packages) in targets {
         let Some(packages) = packages.as_object() else {
@@ -72,8 +79,16 @@ pub fn parse_packages_lock(content: &str) -> Result<ParsedPins> {
         for (name, details) in packages {
             match details.get("resolved").and_then(|r| r.as_str()) {
                 Some(resolved) if !resolved.is_empty() => {
-                    if !pins.iter().any(|(known, _)| known == name) {
-                        pins.push((name.clone(), resolved.to_string()));
+                    if !pins.iter().any(|pin| pin.name == *name) {
+                        pins.push(NuGetPin {
+                            name: name.clone(),
+                            version: resolved.to_string(),
+                            content_hash: details
+                                .get("contentHash")
+                                .and_then(|hash| hash.as_str())
+                                .filter(|hash| !hash.is_empty())
+                                .map(str::to_string),
+                        });
                     }
                 }
                 _ => {
@@ -90,15 +105,44 @@ pub fn parse_packages_lock(content: &str) -> Result<ParsedPins> {
             }
         }
     }
-    pins.sort_by(|a, b| a.0.cmp(&b.0));
+    pins.sort_by(|a, b| a.name.cmp(&b.name));
     Ok((pins, gaps))
+}
+
+fn strip_sha512_prefix(raw: &str) -> &str {
+    raw.strip_prefix("sha512-")
+        .or_else(|| raw.strip_prefix("SHA512-"))
+        .unwrap_or(raw)
 }
 
 pub fn package_version_from_nuget(
     payload: &serde_json::Value,
     name: &str,
     version: &Version,
+    lockfile_hash: Option<&str>,
 ) -> Result<PackageVersion> {
+    let catalog_hash = payload
+        .get("packageHash")
+        .and_then(|hash| hash.as_str())
+        .filter(|hash| !hash.is_empty());
+    let lock_payload = lockfile_hash
+        .map(strip_sha512_prefix)
+        .filter(|hash| !hash.is_empty());
+    match (lock_payload, catalog_hash) {
+        (Some(lock), Some(catalog)) => {
+            if lock != catalog {
+                anyhow::bail!(
+                    "lockfile contentHash does not match registry packageHash for {name}@{version}"
+                );
+            }
+        }
+        (Some(_), None) => {
+            anyhow::bail!(
+                "registry response is missing packageHash for {name}@{version}; cannot verify lockfile contentHash"
+            );
+        }
+        _ => {}
+    }
     let listed = payload
         .get("listed")
         .and_then(|listed| listed.as_bool())
@@ -112,18 +156,18 @@ pub fn package_version_from_nuget(
     } else {
         None
     };
-    let integrity = payload
-        .get("packageHash")
-        .and_then(|hash| hash.as_str())
-        .filter(|hash| !hash.is_empty())
-        .map(|hash| {
+    let integrity = match (lock_payload, catalog_hash) {
+        (Some(lock), _) => Some(format!("sha512-{lock}")),
+        (None, Some(hash)) => Some({
             let algorithm = payload
                 .get("packageHashAlgorithm")
                 .and_then(|algorithm| algorithm.as_str())
                 .unwrap_or("sha512")
                 .to_ascii_lowercase();
             format!("{algorithm}-{hash}")
-        });
+        }),
+        (None, None) => None,
+    };
     let tarball_url = payload
         .get("packageContent")
         .and_then(|content| content.as_str())
@@ -174,12 +218,53 @@ mod tests {
         assert_eq!(
             pins,
             vec![
-                ("Newtonsoft.Json".to_string(), "13.0.3".to_string()),
-                ("Serilog".to_string(), "3.1.1".to_string()),
+                NuGetPin {
+                    name: "Newtonsoft.Json".to_string(),
+                    version: "13.0.3".to_string(),
+                    content_hash: Some("abc".to_string()),
+                },
+                NuGetPin {
+                    name: "Serilog".to_string(),
+                    version: "3.1.1".to_string(),
+                    content_hash: None,
+                },
             ]
         );
         assert_eq!(gaps.len(), 1);
         assert!(gaps[0].contains("RangeOnly"));
+        Ok(())
+    }
+
+    #[test]
+    fn lockfile_hash_must_match_registry_hash() -> Result<()> {
+        let version = Version::parse("1.0.0").unwrap();
+        let base = serde_json::json!({
+            "published": "2023-03-08T07:42:54.647Z",
+            "listed": true,
+            "packageHash": "AAAA",
+            "packageHashAlgorithm": "SHA512",
+            "packageContent": "https://x/y.nupkg"
+        });
+        let matching = package_version_from_nuget(&base, "Example", &version, Some("AAAA"))?;
+        assert_eq!(matching.integrity.as_deref(), Some("sha512-AAAA"));
+        let prefixed = package_version_from_nuget(&base, "Example", &version, Some("sha512-AAAA"))?;
+        assert_eq!(
+            prefixed.integrity.as_deref(),
+            Some("sha512-AAAA"),
+            "a prefixed contentHash must not double the prefix"
+        );
+        assert!(
+            package_version_from_nuget(&base, "Example", &version, Some("BBBB")).is_err(),
+            "a lockfile contentHash that disagrees with the registry must fail closed"
+        );
+
+        let hashless = serde_json::json!({ "listed": true, "packageContent": "https://x/y.nupkg" });
+        assert!(
+            package_version_from_nuget(&hashless, "Example", &version, Some("LOCK")).is_err(),
+            "when the lockfile asserts a hash the registry hash is mandatory"
+        );
+        let unlocked = package_version_from_nuget(&hashless, "Example", &version, None)?;
+        assert_eq!(unlocked.integrity, None);
         Ok(())
     }
 
@@ -193,7 +278,7 @@ mod tests {
             "packageContent": "https://api.nuget.org/v3-flatcontainer/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg"
         });
         let version = Version::parse("13.0.3").unwrap();
-        let pv = package_version_from_nuget(&payload, "Newtonsoft.Json", &version)?;
+        let pv = package_version_from_nuget(&payload, "Newtonsoft.Json", &version, None)?;
         assert_eq!(pv.package.ecosystem, Ecosystem::NuGet);
         assert_eq!(pv.integrity.as_deref(), Some("sha512-mbJSvHfRxfX3tR"));
         assert_eq!(
@@ -208,7 +293,7 @@ mod tests {
     fn unlisted_versions_have_no_published_date() -> Result<()> {
         let payload = json!({ "listed": false, "packageContent": "https://x/y.nupkg" });
         let version = Version::parse("1.0.0").unwrap();
-        let pv = package_version_from_nuget(&payload, "Example", &version)?;
+        let pv = package_version_from_nuget(&payload, "Example", &version, None)?;
         assert!(pv.published_at.is_none());
         Ok(())
     }

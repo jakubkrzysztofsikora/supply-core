@@ -18,14 +18,20 @@ pub trait VulnerabilitySource: Send + Sync {
 pub trait MetadataStore: Send + Sync {
     fn save_decision(&self, decision: &Decision) -> Result<()>;
     fn put_frozen(&self, artifact: FrozenArtifact) -> Result<()>;
-    fn get_frozen(&self, name: &str, version: &Version) -> Result<Option<FrozenArtifact>>;
+    fn get_frozen(
+        &self,
+        ecosystem: &Ecosystem,
+        name: &str,
+        version: &Version,
+    ) -> Result<Option<FrozenArtifact>>;
     fn latest_frozen_satisfying(
         &self,
+        ecosystem: &Ecosystem,
         name: &str,
         requested: Option<&VersionReq>,
     ) -> Result<Option<FrozenArtifact>>;
-    fn latest_frozen(&self, name: &str) -> Result<Option<FrozenArtifact>> {
-        self.latest_frozen_satisfying(name, None)
+    fn latest_frozen(&self, ecosystem: &Ecosystem, name: &str) -> Result<Option<FrozenArtifact>> {
+        self.latest_frozen_satisfying(ecosystem, name, None)
     }
 }
 pub trait ArtifactStore: Send + Sync {
