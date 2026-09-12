@@ -41,12 +41,16 @@ pub fn finding_from_guarddog(
     name: &str,
     version: &Version,
 ) -> Result<Option<ContentFinding>> {
-    if let Some(errors) = payload.get("errors").and_then(|errors| errors.as_object()) {
-        if !errors.is_empty() {
-            anyhow::bail!(
-                "guarddog reported scan errors: {}",
-                serde_json::to_string(errors)?
-            );
+    if let Some(errors) = payload.get("errors") {
+        match errors.as_object() {
+            Some(map) if map.is_empty() => {}
+            Some(map) => {
+                anyhow::bail!(
+                    "guarddog reported scan errors: {}",
+                    serde_json::to_string(map)?
+                );
+            }
+            None => anyhow::bail!("guarddog report has a malformed errors field"),
         }
     }
     let score = payload
@@ -389,6 +393,17 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn guarddog_malformed_errors_field_fails_closed() {
+        let array_errors: serde_json::Value =
+            serde_json::from_str(r#"{"risk_score": {"score": 0.0}, "errors": ["boom"]}"#).unwrap();
+        assert!(finding_from_guarddog(&array_errors, &Ecosystem::Npm, "odd", &version()).is_err());
+        let string_errors: serde_json::Value =
+            serde_json::from_str(r#"{"risk_score": {"score": 0.0}, "errors": "scan failed"}"#)
+                .unwrap();
+        assert!(finding_from_guarddog(&string_errors, &Ecosystem::Npm, "odd", &version()).is_err());
     }
 
     #[test]

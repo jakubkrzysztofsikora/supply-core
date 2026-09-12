@@ -142,10 +142,6 @@ enum Command {
         /// Also run GuardDog (`$GUARDDOG_BIN` or `guarddog` on PATH).
         #[arg(long)]
         guarddog: bool,
-        /// The registry reports a verified build attestation for this
-        /// version; lower the static score accordingly.
-        #[arg(long)]
-        provenance: bool,
         /// Append the finding as JSONL to this file for later evaluation.
         #[arg(long)]
         findings_out: Option<PathBuf>,
@@ -320,60 +316,21 @@ async fn main() -> Result<()> {
             version,
             external,
             guarddog,
-            provenance,
             findings_out,
         } => {
-            let ecosystem = match ecosystem.as_str() {
-                "npm" => supply_core::domain::Ecosystem::Npm,
-                "pypi" | "pip" => supply_core::domain::Ecosystem::PyPi,
-                other => anyhow::bail!("unsupported ecosystem: {other}"),
-            };
-            let parsed = semver::Version::parse(&version)?;
-            let bytes = std::fs::read(&archive)?;
-            let store = MemoryMetadataStore::default();
-            let static_finding =
-                supply_core::application::scanner::scan_archive_bytes_with_provenance(
-                    &store, &ecosystem, &name, &parsed, &bytes, provenance,
-                )?;
-            let mut all_findings: Vec<supply_core::domain::ContentFinding> = Vec::new();
-            if let Some(finding) = static_finding {
-                all_findings.push(finding);
-            }
-            let mut external_scanners = Vec::new();
-            if let Some(command) = external {
-                external_scanners.push(
-                    supply_core::adapters::command_scanner::CommandScanner::new(
-                        command,
-                        "external-scan",
-                    ),
-                );
-            }
-            if guarddog {
-                let command =
-                    std::env::var("GUARDDOG_BIN").unwrap_or_else(|_| "guarddog".to_string());
-                external_scanners.push(
-                    supply_core::adapters::command_scanner::CommandScanner::guarddog(command),
-                );
-            }
-            for scanner in external_scanners {
-                if let Some(external_finding) =
-                    scanner.scan_archive(&ecosystem, &archive, &name, &parsed)?
-                {
-                    store.save_content_finding(&external_finding)?;
-                    all_findings.push(external_finding);
-                }
-            }
-            if all_findings.is_empty() {
-                println!("no content finding for {name}@{version}");
-            } else {
-                println!("{}", serde_json::to_string_pretty(&all_findings)?);
-                if let Some(path) = findings_out {
-                    let file = supply_core::adapters::storage::FindingFile::new(path);
-                    for finding in &all_findings {
-                        file.append(finding)?;
-                    }
-                }
-            }
+            tokio::task::spawn_blocking(move || {
+                scan_package(
+                    &ecosystem,
+                    &archive,
+                    &name,
+                    &version,
+                    external.as_deref(),
+                    guarddog,
+                    findings_out.as_deref(),
+                )
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("scan task failed: {e}"))??;
         }
         Command::Report { findings, submit } => {
             let content = std::fs::read_to_string(&findings)?;
@@ -391,6 +348,78 @@ async fn main() -> Result<()> {
                 eprintln!(
                     "  4. non-malicious vulnerability: maintainers privately, then GitHub Advisory Database"
                 );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn scan_package(
+    ecosystem: &str,
+    archive: &std::path::Path,
+    name: &str,
+    version: &str,
+    external: Option<&std::path::Path>,
+    guarddog: bool,
+    findings_out: Option<&std::path::Path>,
+) -> Result<()> {
+    let ecosystem = match ecosystem {
+        "npm" => supply_core::domain::Ecosystem::Npm,
+        "pypi" | "pip" => supply_core::domain::Ecosystem::PyPi,
+        other => anyhow::bail!("unsupported ecosystem: {other}"),
+    };
+    let parsed = semver::Version::parse(version)?;
+    let bytes = std::fs::read(archive)?;
+    let store = MemoryMetadataStore::default();
+    let attested = match ecosystem {
+        supply_core::domain::Ecosystem::Npm => {
+            use supply_core::ports::UpstreamNpmRegistry;
+            let registry = supply_core::adapters::npm::HttpNpmRegistry::new()?;
+            match registry.metadata(name) {
+                Ok(metadata) => supply_core::adapters::npm::has_provenance(&metadata, version),
+                Err(error) => {
+                    eprintln!(
+                        "warning: provenance lookup failed ({error}); treating as unattested"
+                    );
+                    false
+                }
+            }
+        }
+        _ => false,
+    };
+    let static_finding = supply_core::application::scanner::scan_archive_bytes_with_provenance(
+        &store, &ecosystem, name, &parsed, &bytes, attested,
+    )?;
+    let mut all_findings: Vec<supply_core::domain::ContentFinding> = Vec::new();
+    if let Some(finding) = static_finding {
+        all_findings.push(finding);
+    }
+    let mut external_scanners = Vec::new();
+    if let Some(command) = external {
+        external_scanners.push(supply_core::adapters::command_scanner::CommandScanner::new(
+            command,
+            "external-scan",
+        ));
+    }
+    if guarddog {
+        let command = std::env::var("GUARDDOG_BIN").unwrap_or_else(|_| "guarddog".to_string());
+        external_scanners
+            .push(supply_core::adapters::command_scanner::CommandScanner::guarddog(command));
+    }
+    for scanner in external_scanners {
+        if let Some(external_finding) = scanner.scan_archive(&ecosystem, archive, name, &parsed)? {
+            store.save_content_finding(&external_finding)?;
+            all_findings.push(external_finding);
+        }
+    }
+    if all_findings.is_empty() {
+        println!("no content finding for {name}@{version}");
+    } else {
+        println!("{}", serde_json::to_string_pretty(&all_findings)?);
+        if let Some(path) = findings_out {
+            let file = supply_core::adapters::storage::FindingFile::new(path);
+            for finding in &all_findings {
+                file.append(finding)?;
             }
         }
     }
@@ -726,15 +755,10 @@ mod cli_tests {
             "--version",
             "1.2.3",
             "--guarddog",
-            "--provenance",
         ])?;
         assert!(matches!(
             cli.command,
-            Command::ScanPackage {
-                guarddog: true,
-                provenance: true,
-                ..
-            }
+            Command::ScanPackage { guarddog: true, .. }
         ));
         let cli = Cli::try_parse_from([
             "supply",
