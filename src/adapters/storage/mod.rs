@@ -228,12 +228,33 @@ impl FindingFile {
     }
 
     pub fn append(&self, finding: &ContentFinding) -> Result<()> {
-        use std::io::Write;
         if let Some(parent) = self.path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)?;
             }
         }
+        // Serialize the read/truncate/append sequence across processes; a
+        // torn-tail truncation based on a stale snapshot must not delete a
+        // record another process just wrote.
+        let lock_path = self.path.with_extension("lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)?;
+        {
+            use std::os::unix::io::AsRawFd;
+            unsafe {
+                libc::flock(lock.as_raw_fd(), libc::LOCK_EX);
+            }
+        }
+        let result = self.append_locked(finding);
+        drop(lock);
+        result
+    }
+
+    fn append_locked(&self, finding: &ContentFinding) -> Result<()> {
+        use std::io::Write;
         let mut existing = std::fs::read_to_string(&self.path).unwrap_or_default();
         if existing.trim_start().starts_with('[') {
             let mut findings = parse_findings(&existing)?;
@@ -410,6 +431,37 @@ mod tests {
         file.append(&finding("b")).unwrap();
         let store = MemoryMetadataStore::default();
         assert_eq!(file.load_into(&store).unwrap(), 2);
+    }
+
+    #[test]
+    fn concurrent_appends_are_serialized() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("findings.jsonl");
+        let mut handles = Vec::new();
+        for thread in 0..8 {
+            let path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                let file = FindingFile::new(&path);
+                for index in 0..20 {
+                    let finding = ContentFinding {
+                        ecosystem: Ecosystem::Npm,
+                        package: format!("pkg-{thread}-{index}"),
+                        version: Version::parse("1.0.0").unwrap(),
+                        source: "static-heuristics".to_string(),
+                        score: 9,
+                        rules: vec![],
+                        summary: "concurrent".to_string(),
+                        detected_at: chrono::Utc::now(),
+                    };
+                    file.append(&finding).unwrap();
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let store = MemoryMetadataStore::default();
+        assert_eq!(FindingFile::new(&path).load_into(&store).unwrap(), 160);
     }
 
     #[test]
