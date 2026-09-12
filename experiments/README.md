@@ -1,8 +1,7 @@
 # Week-Long Field Test
 
-Real-repo evaluation of supply-core before the next slice. 12 candidates
-across two tracks; daily captures for ~7 days; report compares baseline
-to latest.
+Real-repo evaluation of supply-core across npm and workflow tracks;
+daily captures for ~7 days; report compares baseline to latest.
 
 ## What this measures
 
@@ -12,11 +11,13 @@ to latest.
 - **What doesn't:** parser edge cases (block scalars, comments), error
   paths (unparseable ranges, missing metadata) — surfaced as `errors[]`.
 - **Efficiency:** per-repo wall time in `*.time` files (sequential
-  fetches; parallelism is a next-slice optimization if voxel's ~28s hurts).
+  fetches; parallelism is a next-slice optimization if the slowest
+  repo's ~28s hurts).
 
 ## Running
 
 ```bash
+cp candidates.example.txt candidates.txt   # then point entries at your checkouts
 ./run.sh                    # capture today (baseline = first day)
 ./run.sh                    # re-run any later day
 python3 report.py           # baseline vs latest diff
@@ -41,10 +42,10 @@ Log: `experiments/data/cron.log`.
 
 - `llama.cpp`: 249 action refs — 195 tag-pinned, 18 SHA-pinned, 36 local.
   Real-world hygiene baseline: ~78% unpinned.
-- `voxel`: 66 deps, 6 quarantined **right now** (`next` age 1d,
+- A large web app: 66 deps, 6 quarantined **right now** (`next` age 1d,
   `zustand` 2d, `next-intl` 4d …) — the quarantine window fires on real
   dependency churn without any synthetic fixture.
-- `sikoras-chat`: 51 deps, 3 quarantined, 0 errors.
+- A chat service: 51 deps, 3 quarantined, 0 errors.
 - Runtimes: scanner 0.03–0.04s/repo (line parser is cheap); npm snapshot
   0.5–28s (registry-bound, sequential).
 

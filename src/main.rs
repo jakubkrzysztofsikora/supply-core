@@ -149,6 +149,7 @@ async fn main() -> Result<()> {
                 artifacts_dir,
                 status_file,
                 auth_token,
+                tailnet_domain: supply_core::adapters::http::configured_domain(),
             };
             eprintln!(
                 "Starting supply-core server '{}' listening on {}",

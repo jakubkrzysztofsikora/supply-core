@@ -1,5 +1,5 @@
 server:
-  service_url: "https://supply-core.tail5d39b4.ts.net"  # Official service is primary by default
+  service_url: "https://supply-core.example.com"  # Override with your own deployment
   allow_fallback: false  # Overwritable only by explicit config
   force_official: true
 quarantine:

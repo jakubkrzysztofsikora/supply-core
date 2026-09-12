@@ -29,6 +29,7 @@ pub struct ServerConfig {
     pub artifacts_dir: Option<PathBuf>,
     pub status_file: Option<PathBuf>,
     pub auth_token: Option<String>,
+    pub tailnet_domain: Option<String>,
 }
 
 fn configured_token(raw: Option<String>) -> Option<String> {
@@ -36,16 +37,21 @@ fn configured_token(raw: Option<String>) -> Option<String> {
         .filter(|token| !token.is_empty())
 }
 
+pub fn configured_domain() -> Option<String> {
+    configured_token(std::env::var("SUPPLY_TAILNET_DOMAIN").ok())
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             service_name: std::env::var("SUPPLY_SERVICE_NAME")
-                .unwrap_or_else(|_| "supply-core-official".to_string()),
+                .unwrap_or_else(|_| "supply-core".to_string()),
             artifacts_dir: std::env::var("SUPPLY_ARTIFACTS_DIR")
                 .ok()
                 .map(PathBuf::from),
             status_file: std::env::var("SUPPLY_STATUS_FILE").ok().map(PathBuf::from),
             auth_token: configured_token(std::env::var("SUPPLY_AUTH_TOKEN").ok()),
+            tailnet_domain: configured_domain(),
         }
     }
 }
@@ -260,11 +266,10 @@ async fn health_check(State(state): State<Arc<ServerConfig>>) -> Json<Value> {
 }
 
 async fn detailed_health(State(state): State<Arc<ServerConfig>>) -> Json<Value> {
-    Json(json!({
+    let mut document = json!({
         "status": "ok",
         "service": state.service_name,
         "version": env!("CARGO_PKG_VERSION"),
-        "tailnet": "tail5d39b4.ts.net",
         "features": [
             "azure-pipelines-scan",
             "github-actions-scan",
@@ -273,7 +278,11 @@ async fn detailed_health(State(state): State<Arc<ServerConfig>>) -> Json<Value> 
         ],
         "artifacts_dir_configured": state.artifacts_dir.is_some(),
         "auth_configured": state.auth_token.is_some()
-    }))
+    });
+    if let Some(domain) = &state.tailnet_domain {
+        document["tailnet"] = json!(domain);
+    }
+    Json(document)
 }
 
 async fn version_info(State(state): State<Arc<ServerConfig>>) -> Json<Value> {
@@ -463,6 +472,52 @@ mod tests {
             .unwrap_or_else(|_| panic!("request succeeds"));
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn detailed_health_reports_configured_tailnet_only() {
+        let app = app_with_config(ServerConfig {
+            tailnet_domain: None,
+            ..ServerConfig::default()
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .body(axum::body::Body::empty())
+                    .unwrap_or_else(|_| panic!("valid request")),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("request succeeds"));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap_or_else(|_| panic!("body"));
+        let document: serde_json::Value =
+            serde_json::from_slice(&body).unwrap_or_else(|_| panic!("json"));
+        assert!(
+            document.get("tailnet").is_none(),
+            "unset deployment domain must not be reported"
+        );
+
+        let app = app_with_config(ServerConfig {
+            tailnet_domain: Some("example.ts.net".into()),
+            ..ServerConfig::default()
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .body(axum::body::Body::empty())
+                    .unwrap_or_else(|_| panic!("valid request")),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("request succeeds"));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap_or_else(|_| panic!("body"));
+        let document: serde_json::Value =
+            serde_json::from_slice(&body).unwrap_or_else(|_| panic!("json"));
+        assert_eq!(document["tailnet"], "example.ts.net");
     }
 
     #[tokio::test]
