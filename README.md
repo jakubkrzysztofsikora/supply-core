@@ -139,7 +139,28 @@ kubectl apply -k deploy/k8s
 | **Actions SHA Pinning** | Enforces immutable 40-character commit SHAs in CI | Blocks malicious workflow tag mutability attacks |
 | **OSV.dev Integration** | Real-time vulnerability batch query with CVSS & severity | Immediate awareness of newly disclosed CVEs |
 | **Passive Machine Scan** | Fast traversal of 100+ repos, worktree deduplication | Total situational awareness of local attack surface |
+| **PyPI Quarantine** | `snapshot-pip` checks exact requirements.txt pins: publish age, sha256, OSV advisories | Catches fresh malicious pip uploads before they reach your build |
+| **NuGet Quarantine** | `snapshot-nuget` checks resolved `packages.lock.json`: publish age, SHA-512 package hash, OSV | Catches fresh NuGet publishes with the same policy engine |
+| **Docker Digest Pinning** | `scan-docker` flags `FROM`/`image:` references that lack an `@sha256:` digest | Mutable tags can be silently replaced under you |
 | **100% Local & Airgapped** | Operates strictly on local files and local caching | Your private code and lockfiles never leave your machine |
+
+### Supported ecosystems
+
+| Ecosystem | Inputs | Checks | Command |
+|---|---|---|---|
+| npm | `package.json` deps | age quarantine, integrity, OSV, frozen fallback | `snapshot-npm` |
+| PyPI (pip) | `requirements.txt` exact pins (`==`, `===`) | age quarantine, sha256 integrity, OSV | `snapshot-pip` |
+| NuGet | `packages.lock.json` | age quarantine, SHA-512 package hash, OSV | `snapshot-nuget` |
+| Docker images | `Dockerfile*`, `docker-compose*.yml`, `compose.yml` | static `@sha256:` digest pinning | `scan-docker` |
+| GitHub Actions | `.github/workflows/*` | full-SHA pinning, `docker://` digest rule | `scan-actions` |
+| Azure Pipelines | `azure-pipelines*.yml` | task pinning rules | `scan-pipelines` |
+
+**Not yet supported:** RubyGems, Cargo, Maven/Gradle, Go modules, pnpm/bun
+lockfiles, Yarn Berry (classic Yarn is mapped). pip requirements that are ranges
+(`>=`, `~=`) or carry markers/URLs are reported as coverage gaps — only exact
+pins are evaluated. Docker scanning is static: it does not query registries for
+image age or CVEs. NuGet hashes come from nuget.org catalog metadata; pip
+hashes come from the PyPI JSON API.
 
 ---
 
@@ -207,7 +228,7 @@ github_actions:
 ## Development & Testing
 
 ```bash
-# Run all unit and integration tests (70 tests)
+# Run all unit and integration tests (86 tests)
 cargo test
 
 # Run Python machine-eval test suite

@@ -109,6 +109,9 @@ impl OsvVulnerabilitySource {
 fn ecosystem_label(e: &Ecosystem) -> &'static str {
     match *e {
         Ecosystem::Npm => "npm",
+        Ecosystem::PyPi => "PyPI",
+        Ecosystem::NuGet => "NuGet",
+        Ecosystem::DockerImage => "docker",
         Ecosystem::GitHubActions => "github",
         Ecosystem::AzurePipelines => "azure",
     }
@@ -129,7 +132,7 @@ impl VulnerabilitySource for OsvVulnerabilitySource {
     ) -> Result<Vec<VulnerabilityFinding>> {
         if matches!(
             ecosystem,
-            Ecosystem::GitHubActions | Ecosystem::AzurePipelines
+            Ecosystem::GitHubActions | Ecosystem::AzurePipelines | Ecosystem::DockerImage
         ) {
             // OSV does not index Actions or Pipelines; the firewall does not act on
             // them. Return empty rather than spending a request.

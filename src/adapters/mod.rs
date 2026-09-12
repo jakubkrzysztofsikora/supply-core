@@ -4,5 +4,7 @@ pub mod crypto;
 pub mod github;
 pub mod http;
 pub mod npm;
+pub mod nuget;
 pub mod osv;
+pub mod pypi;
 pub mod storage;

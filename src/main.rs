@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::Path, path::PathBuf};
 use supply_core::{
     adapters::{
         azure_devops::{pipeline_annotations, FsAzurePipelineReader},
@@ -8,10 +8,13 @@ use supply_core::{
         github::{workflow_annotations, FsWorkflowReader},
         http::app_with_config,
         npm::HttpNpmRegistry,
+        nuget::{package_version_from_nuget, parse_packages_lock, HttpNuGetRegistry},
         osv::{NoopVulnerabilitySource, OsvVulnerabilitySource, ReqwestOsvTransport},
+        pypi::{package_version_from_pypi, parse_requirements, HttpPyPiRegistry},
         storage::MemoryMetadataStore,
     },
-    application::{AzurePipelinesScanner, GitHubActionsScanner, PackageEvaluator},
+    application::{AzurePipelinesScanner, DockerScanner, GitHubActionsScanner, PackageEvaluator},
+    ports::{UpstreamNuGetRegistry, UpstreamPyPiRegistry},
 };
 
 #[derive(Parser)]
@@ -80,6 +83,47 @@ enum Command {
         /// `$HOME/.local/share/supply-core/osv-cache`.
         #[arg(long)]
         osv_cache: Option<PathBuf>,
+    },
+    /// Snapshot exact pins from requirements.txt against PyPI: publish
+    /// age, sha256, policy decision.
+    SnapshotPip {
+        #[arg(default_value = ".")]
+        root: PathBuf,
+        #[arg(long)]
+        policy: Option<PathBuf>,
+        /// Query the real OSV.dev API for known vulnerabilities.
+        #[arg(long)]
+        osv: bool,
+        /// Directory to cache OSV responses in. Defaults to
+        /// `$HOME/.local/share/supply-core/osv-cache`.
+        #[arg(long)]
+        osv_cache: Option<PathBuf>,
+    },
+    /// Snapshot resolved packages from packages.lock.json against
+    /// nuget.org: publish age, package hash, policy decision.
+    #[command(name = "snapshot-nuget")]
+    SnapshotNuGet {
+        #[arg(default_value = ".")]
+        root: PathBuf,
+        #[arg(long)]
+        policy: Option<PathBuf>,
+        /// Query the real OSV.dev API for known vulnerabilities.
+        #[arg(long)]
+        osv: bool,
+        /// Directory to cache OSV responses in. Defaults to
+        /// `$HOME/.local/share/supply-core/osv-cache`.
+        #[arg(long)]
+        osv_cache: Option<PathBuf>,
+    },
+    /// Scan Dockerfiles and compose files for container images that are
+    /// not pinned to a sha256 digest.
+    ScanDocker {
+        #[arg(default_value = ".")]
+        root: PathBuf,
+        #[arg(long)]
+        policy: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
     },
 }
 struct SystemClock;
@@ -178,6 +222,45 @@ async fn main() -> Result<()> {
             tokio::task::spawn_blocking(move || snapshot_npm(&root, &p, osv, osv_cache.as_deref()))
                 .await
                 .map_err(|e| anyhow::anyhow!("snapshot task failed: {e}"))??;
+        }
+        Command::SnapshotPip {
+            root,
+            policy,
+            osv,
+            osv_cache,
+        } => {
+            let p = load_policy(policy.as_deref())?;
+            tokio::task::spawn_blocking(move || snapshot_pip(&root, &p, osv, osv_cache.as_deref()))
+                .await
+                .map_err(|e| anyhow::anyhow!("snapshot task failed: {e}"))??;
+        }
+        Command::SnapshotNuGet {
+            root,
+            policy,
+            osv,
+            osv_cache,
+        } => {
+            let p = load_policy(policy.as_deref())?;
+            tokio::task::spawn_blocking(move || {
+                snapshot_nuget(&root, &p, osv, osv_cache.as_deref())
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("snapshot task failed: {e}"))??;
+        }
+        Command::ScanDocker { root, policy, json } => {
+            let p = load_policy(policy.as_deref())?;
+            let report = DockerScanner { policy: &p }.scan(&root)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                for finding in &report.findings {
+                    println!("BLOCK: {}", finding.reasons.join("; "));
+                }
+                println!("scanned {} image references", report.references.len());
+            }
+            if report.is_blocking() {
+                std::process::exit(2);
+            }
         }
     }
     Ok(())
@@ -302,10 +385,181 @@ fn snapshot_npm(
     Ok(())
 }
 
+fn vulnerability_source(
+    use_osv: bool,
+    osv_cache: Option<&Path>,
+) -> Result<Box<dyn supply_core::ports::VulnerabilitySource>> {
+    if !use_osv {
+        return Ok(Box::new(NoopVulnerabilitySource));
+    }
+    let cache = osv_cache.map(Path::to_path_buf).unwrap_or_else(|| {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(".local/share/supply-core/osv-cache")
+    });
+    Ok(Box::new(
+        OsvVulnerabilitySource::new(Box::new(ReqwestOsvTransport::new()?)).with_cache(cache),
+    ))
+}
+
+fn snapshot_pip(
+    root: &Path,
+    policy: &supply_core::domain::Policy,
+    use_osv: bool,
+    osv_cache: Option<&Path>,
+) -> Result<()> {
+    let content = std::fs::read_to_string(root.join("requirements.txt"))?;
+    let (pins, gaps) = parse_requirements(&content);
+    let registry = HttpPyPiRegistry::new()?;
+    let store = MemoryMetadataStore::default();
+    let vulns = vulnerability_source(use_osv, osv_cache)?;
+    let now = chrono::Utc::now();
+    let mut entries = vec![];
+    let mut errors: Vec<serde_json::Value> = gaps
+        .into_iter()
+        .map(|gap| serde_json::json!({ "input": gap }))
+        .collect();
+    for (name, pinned) in &pins {
+        let Ok(version) = semver::Version::parse(pinned) else {
+            errors.push(serde_json::json!({
+                "package": name,
+                "error": format!("non-semver version {pinned}; not evaluated"),
+            }));
+            continue;
+        };
+        let payload = match registry.release(name, pinned) {
+            Ok(payload) => payload,
+            Err(error) => {
+                errors.push(serde_json::json!({ "package": name, "error": error.to_string() }));
+                continue;
+            }
+        };
+        let pv = match package_version_from_pypi(&payload, name, &version) {
+            Ok(pv) => pv,
+            Err(error) => {
+                errors.push(serde_json::json!({ "package": name, "error": error.to_string() }));
+                continue;
+            }
+        };
+        let age_days = pv
+            .published_at
+            .map(|t| now.signed_duration_since(t).num_days())
+            .unwrap_or(-1);
+        let decision = PackageEvaluator {
+            policy,
+            clock: &SystemClock,
+            vulns: vulns.as_ref(),
+            metadata: &store,
+        }
+        .evaluate(&pv, None)?;
+        entries.push(serde_json::json!({
+            "package": name,
+            "pinned": pinned,
+            "age_days": age_days,
+            "status": format!("{:?}", decision.status),
+            "reasons": decision.reasons,
+            "warnings": decision.warnings,
+        }));
+    }
+    let out = serde_json::json!({
+        "captured_at": now.to_rfc3339(),
+        "repository": root.display().to_string(),
+        "ecosystem": "pypi",
+        "dependencies": entries,
+        "errors": errors,
+    });
+    println!("{}", serde_json::to_string_pretty(&out)?);
+    Ok(())
+}
+
+fn snapshot_nuget(
+    root: &Path,
+    policy: &supply_core::domain::Policy,
+    use_osv: bool,
+    osv_cache: Option<&Path>,
+) -> Result<()> {
+    let content = std::fs::read_to_string(root.join("packages.lock.json"))?;
+    let (pins, gaps) = parse_packages_lock(&content)?;
+    let registry = HttpNuGetRegistry::new()?;
+    let store = MemoryMetadataStore::default();
+    let vulns = vulnerability_source(use_osv, osv_cache)?;
+    let now = chrono::Utc::now();
+    let mut entries = vec![];
+    let mut errors: Vec<serde_json::Value> = gaps
+        .into_iter()
+        .map(|gap| serde_json::json!({ "input": gap }))
+        .collect();
+    for (name, pinned) in &pins {
+        let Ok(version) = semver::Version::parse(pinned) else {
+            errors.push(serde_json::json!({
+                "package": name,
+                "error": format!("non-semver version {pinned}; not evaluated"),
+            }));
+            continue;
+        };
+        let payload = match registry.release(name, pinned) {
+            Ok(payload) => payload,
+            Err(error) => {
+                errors.push(serde_json::json!({ "package": name, "error": error.to_string() }));
+                continue;
+            }
+        };
+        let pv = match package_version_from_nuget(&payload, name, &version) {
+            Ok(pv) => pv,
+            Err(error) => {
+                errors.push(serde_json::json!({ "package": name, "error": error.to_string() }));
+                continue;
+            }
+        };
+        let age_days = pv
+            .published_at
+            .map(|t| now.signed_duration_since(t).num_days())
+            .unwrap_or(-1);
+        let decision = PackageEvaluator {
+            policy,
+            clock: &SystemClock,
+            vulns: vulns.as_ref(),
+            metadata: &store,
+        }
+        .evaluate(&pv, None)?;
+        entries.push(serde_json::json!({
+            "package": name,
+            "pinned": pinned,
+            "age_days": age_days,
+            "status": format!("{:?}", decision.status),
+            "reasons": decision.reasons,
+            "warnings": decision.warnings,
+        }));
+    }
+    let out = serde_json::json!({
+        "captured_at": now.to_rfc3339(),
+        "repository": root.display().to_string(),
+        "ecosystem": "nuget",
+        "dependencies": entries,
+        "errors": errors,
+    });
+    println!("{}", serde_json::to_string_pretty(&out)?);
+    Ok(())
+}
+
 #[cfg(test)]
 mod cli_tests {
     use super::*;
 
+    #[test]
+    fn ecosystem_subcommands_parse() -> Result<()> {
+        let cli = Cli::try_parse_from(["supply", "snapshot-pip"])?;
+        assert!(matches!(cli.command, Command::SnapshotPip { .. }));
+        let cli = Cli::try_parse_from(["supply", "snapshot-nuget", "dir"])?;
+        assert!(matches!(cli.command, Command::SnapshotNuGet { .. }));
+        let cli = Cli::try_parse_from(["supply", "scan-docker", "--json"])?;
+        assert!(matches!(
+            cli.command,
+            Command::ScanDocker { json: true, .. }
+        ));
+        Ok(())
+    }
     #[test]
     fn annotations_flag_is_accepted() -> Result<()> {
         let cli = Cli::try_parse_from(["supply", "scan-actions", "--annotations"])?;

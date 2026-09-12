@@ -48,6 +48,12 @@ pub trait UpstreamNpmRegistry: Send + Sync {
     fn metadata(&self, package: &str) -> Result<serde_json::Value>;
     fn tarball(&self, url: &str) -> Result<Vec<u8>>;
 }
+pub trait UpstreamPyPiRegistry: Send + Sync {
+    fn release(&self, package: &str, version: &str) -> Result<serde_json::Value>;
+}
+pub trait UpstreamNuGetRegistry: Send + Sync {
+    fn release(&self, package: &str, version: &str) -> Result<serde_json::Value>;
+}
 pub trait WorkflowReader: Send + Sync {
     fn read(&self, root: &Path) -> Result<Vec<(String, String)>>;
 }

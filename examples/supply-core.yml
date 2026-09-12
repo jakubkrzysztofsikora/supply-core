@@ -14,6 +14,14 @@ npm:
   require_integrity: true
   fallback_to_frozen: true
   deny_packages: []
+pip:
+  require_integrity: true
+  fallback_to_frozen: true
+nuget:
+  require_integrity: true
+  fallback_to_frozen: true
+docker:
+  require_digest_pin: true
 github_actions:
   require_full_sha_pin: true
   allow_local_actions: true
