@@ -228,7 +228,7 @@ github_actions:
 ## Development & Testing
 
 ```bash
-# Run all unit and integration tests (91 tests)
+# Run all unit and integration tests
 cargo test
 
 # Run Python machine-eval test suite
