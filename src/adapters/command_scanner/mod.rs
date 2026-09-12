@@ -12,6 +12,96 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_MAX_OUTPUT: usize = 8 * 1024 * 1024;
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportFormat {
+    /// `command <ecosystem> <archive>` with `{"score","rules","summary"}` JSON.
+    Normalized,
+    /// `command <ecosystem> scan <archive> --output-format json`, GuardDog v3.
+    GuardDog,
+}
+
+fn scanner_args(format: ReportFormat, ecosystem: &Ecosystem, archive: &Path) -> Vec<String> {
+    let archive = archive.to_string_lossy().to_string();
+    match format {
+        ReportFormat::Normalized => vec![ecosystem_label(ecosystem).to_string(), archive],
+        ReportFormat::GuardDog => vec![
+            ecosystem_label(ecosystem).to_string(),
+            "scan".to_string(),
+            archive,
+            "--output-format".to_string(),
+            "json".to_string(),
+        ],
+    }
+}
+
+/// Maps a real GuardDog v3 report (risk_score/results/errors) into a finding.
+pub fn finding_from_guarddog(
+    payload: &serde_json::Value,
+    ecosystem: &Ecosystem,
+    name: &str,
+    version: &Version,
+) -> Result<Option<ContentFinding>> {
+    if let Some(errors) = payload.get("errors").and_then(|errors| errors.as_object()) {
+        if !errors.is_empty() {
+            anyhow::bail!(
+                "guarddog reported scan errors: {}",
+                serde_json::to_string(errors)?
+            );
+        }
+    }
+    let score = payload
+        .get("risk_score")
+        .and_then(|risk| risk.get("score"))
+        .and_then(|score| score.as_f64())
+        .context("guarddog report is missing risk_score.score")?
+        .round()
+        .clamp(0.0, 10.0) as u8;
+    if score == 0 {
+        return Ok(None);
+    }
+    let results = payload
+        .get("results")
+        .and_then(|results| results.as_object());
+    let mut rules: Vec<String> = results
+        .map(|results| {
+            results
+                .iter()
+                .filter(|(_, hits)| hits.as_array().is_some_and(|hits| !hits.is_empty()))
+                .map(|(rule, _)| rule.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    rules.sort();
+    let label = payload
+        .get("risk_score")
+        .and_then(|risk| risk.get("label"))
+        .and_then(|label| label.as_str())
+        .unwrap_or("risk");
+    let top_message = results
+        .and_then(|results| {
+            let threat = results
+                .iter()
+                .filter(|(rule, _)| rule.starts_with("threat-"))
+                .find_map(|(_, hits)| first_message(hits));
+            threat.or_else(|| results.values().find_map(first_message))
+        })
+        .unwrap_or("guarddog flagged this package");
+    Ok(Some(ContentFinding {
+        ecosystem: ecosystem.clone(),
+        package: name.to_string(),
+        version: version.clone(),
+        source: "guarddog".to_string(),
+        score,
+        rules,
+        summary: format!("{label}: {top_message}"),
+        detected_at: Utc::now(),
+    }))
+}
+
+fn first_message(hits: &serde_json::Value) -> Option<&str> {
+    hits.as_array()?.first()?.get("message")?.as_str()
+}
+
 fn kill_process_group(pid: i32) {
     unsafe {
         libc::kill(-pid, libc::SIGKILL);
@@ -28,6 +118,7 @@ pub struct CommandScanner {
     pub source: String,
     pub timeout: Duration,
     pub max_output_bytes: usize,
+    pub format: ReportFormat,
 }
 
 impl CommandScanner {
@@ -37,7 +128,23 @@ impl CommandScanner {
             source: source.into(),
             timeout: DEFAULT_TIMEOUT,
             max_output_bytes: DEFAULT_MAX_OUTPUT,
+            format: ReportFormat::Normalized,
         }
+    }
+
+    pub fn guarddog(command: impl Into<PathBuf>) -> Self {
+        Self {
+            command: command.into(),
+            source: "guarddog".to_string(),
+            timeout: DEFAULT_TIMEOUT,
+            max_output_bytes: DEFAULT_MAX_OUTPUT,
+            format: ReportFormat::GuardDog,
+        }
+    }
+
+    pub fn with_format(mut self, format: ReportFormat) -> Self {
+        self.format = format;
+        self
     }
 
     pub fn with_limits(mut self, timeout: Duration, max_output_bytes: usize) -> Self {
@@ -48,9 +155,11 @@ impl CommandScanner {
 
     fn run(&self, ecosystem: &Ecosystem, archive: &Path) -> Result<String> {
         use std::os::unix::process::CommandExt;
-        let mut child = Command::new(&self.command)
-            .arg(ecosystem_label(ecosystem))
-            .arg(archive)
+        let mut child = Command::new(&self.command);
+        for argument in scanner_args(self.format, ecosystem, archive) {
+            child.arg(argument);
+        }
+        let mut child = child
             .process_group(0)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -160,6 +269,9 @@ impl ContentScanner for CommandScanner {
         let stdout = self.run(ecosystem, archive)?;
         let report: serde_json::Value =
             serde_json::from_str(stdout.trim()).context("scanner report is not valid JSON")?;
+        if self.format == ReportFormat::GuardDog {
+            return finding_from_guarddog(&report, ecosystem, name, version);
+        }
         let score = report
             .get("score")
             .and_then(|score| score.as_u64())
@@ -246,6 +358,95 @@ mod tests {
     fn version() -> Version {
         Version::parse("1.2.3").unwrap()
     }
+
+    #[test]
+    fn parses_real_guarddog_report() {
+        let payload: serde_json::Value = serde_json::from_str(GUARDDOG_EVIL).unwrap();
+        let finding = finding_from_guarddog(&payload, &Ecosystem::Npm, "evil", &version())
+            .unwrap()
+            .unwrap();
+        assert_eq!(finding.score, 8);
+        assert!(finding
+            .rules
+            .contains(&"capability-network-download".to_string()));
+        assert!(finding
+            .rules
+            .contains(&"threat-network-exfiltration".to_string()));
+        assert!(finding.summary.contains("high_risk"), "{}", finding.summary);
+        assert!(
+            finding.summary.contains("exfiltration"),
+            "{}",
+            finding.summary
+        );
+        assert_eq!(finding.source, "guarddog");
+    }
+
+    #[test]
+    fn guarddog_clean_report_is_not_a_finding() {
+        let payload: serde_json::Value = serde_json::from_str(GUARDDOG_CLEAN).unwrap();
+        assert!(
+            finding_from_guarddog(&payload, &Ecosystem::Npm, "lib", &version())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn guarddog_errors_fail_closed() {
+        let payload: serde_json::Value =
+            serde_json::from_str(r#"{"risk_score": {"score": 3.0}, "errors": {"a": "boom"}}"#)
+                .unwrap();
+        assert!(finding_from_guarddog(&payload, &Ecosystem::Npm, "odd", &version()).is_err());
+    }
+
+    #[test]
+    fn guarddog_missing_score_is_an_error() {
+        let payload: serde_json::Value = serde_json::from_str(r#"{"results": {}}"#).unwrap();
+        assert!(finding_from_guarddog(&payload, &Ecosystem::Npm, "odd", &version()).is_err());
+    }
+
+    #[test]
+    fn guarddog_arguments_include_scan_and_json_output() {
+        let args = scanner_args(
+            ReportFormat::GuardDog,
+            &Ecosystem::Npm,
+            Path::new("/tmp/evil.tgz"),
+        );
+        assert_eq!(
+            args,
+            vec!["npm", "scan", "/tmp/evil.tgz", "--output-format", "json"]
+        );
+        let args = scanner_args(
+            ReportFormat::Normalized,
+            &Ecosystem::PyPi,
+            Path::new("/tmp/x.tgz"),
+        );
+        assert_eq!(args, vec!["pypi", "/tmp/x.tgz"]);
+    }
+
+    const GUARDDOG_EVIL: &str = r#"{
+      "package": "/tmp/evil.tgz",
+      "results": {
+        "capability-network-download": [{"location": "package/beacon.js:1", "match": "https.get(", "message": "Detects downloading files from network"}],
+        "capability-process-hooks": [{"location": "package/package.json:1", "match": "postinstall", "message": "has_npm_hook rule matched"}],
+        "threat-network-exfil-messenger": [{"location": "package/beacon.js:1", "match": "discord.com/api/webhooks/1/", "message": "Detects hardcoded messaging platform tokens/webhooks used for data exfiltration"}],
+        "threat-network-exfiltration": [{"location": "package/beacon.js:1", "match": "discord.com/api/webhooks", "message": "Detects URLs to suspicious domains often used for exfiltration or C2"}],
+        "threat-process-hooks": [{"location": "package/package.json:1", "match": "postinstall", "message": "hook threat"}]
+      },
+      "risk_score": {"score": 8.0, "label": "high_risk", "findings_count": 6, "score_breakdown": {}},
+      "risks": [{"name": "risk.network.outbound", "severity": "high"}],
+      "issues": 7,
+      "errors": {}
+    }"#;
+
+    const GUARDDOG_CLEAN: &str = r#"{
+      "package": "/tmp/benign.tgz",
+      "results": {"capability-network-download": {}, "threat-network-exfiltration": {}},
+      "risk_score": {"score": 0.0, "label": "no_risks_detected", "findings_count": 0, "score_breakdown": {}},
+      "risks": [],
+      "issues": 0,
+      "errors": {}
+    }"#;
 
     #[test]
     fn parses_normalized_report_into_finding() {

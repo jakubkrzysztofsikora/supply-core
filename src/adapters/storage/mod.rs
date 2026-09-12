@@ -206,10 +206,120 @@ impl MetadataStore for MemoryMetadataStore {
     }
 }
 
+/// Parse findings from either a JSON array or JSON Lines content.
+pub fn parse_findings(content: &str) -> Result<Vec<ContentFinding>> {
+    if content.trim_start().starts_with('[') {
+        return Ok(serde_json::from_str(content)?);
+    }
+    content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).map_err(Into::into))
+        .collect()
+}
+
+/// File-backed persistence for content findings.
+pub struct FindingFile {
+    path: PathBuf,
+}
+impl FindingFile {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub fn append(&self, finding: &ContentFinding) -> Result<()> {
+        use std::io::Write;
+        if let Some(parent) = self.path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        writeln!(file, "{}", serde_json::to_string(finding)?)?;
+        Ok(())
+    }
+
+    pub fn load_into(&self, store: &MemoryMetadataStore) -> Result<usize> {
+        let content = std::fs::read_to_string(&self.path)?;
+        let findings = parse_findings(&content)?;
+        for finding in &findings {
+            store.save_content_finding(finding)?;
+        }
+        Ok(findings.len())
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finding_file_round_trips_jsonl_and_array() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("findings.jsonl");
+        let file = FindingFile::new(&path);
+        let finding = |package: &str| ContentFinding {
+            ecosystem: Ecosystem::Npm,
+            package: package.to_string(),
+            version: Version::parse("1.0.0").unwrap(),
+            source: "static-heuristics".to_string(),
+            score: 9,
+            rules: vec![],
+            summary: package.to_string(),
+            detected_at: chrono::Utc::now(),
+        };
+        file.append(&finding("a")).unwrap();
+        file.append(&finding("b")).unwrap();
+
+        let store = MemoryMetadataStore::default();
+        assert_eq!(file.load_into(&store).unwrap(), 2);
+        assert!(store
+            .content_finding(&Ecosystem::Npm, "a", &Version::parse("1.0.0").unwrap())
+            .unwrap()
+            .is_some());
+        assert!(store
+            .content_finding(&Ecosystem::Npm, "b", &Version::parse("1.0.0").unwrap())
+            .unwrap()
+            .is_some());
+
+        let array_path = directory.path().join("array.json");
+        std::fs::write(
+            &array_path,
+            format!("[{}]", serde_json::to_string(&finding("c")).unwrap()),
+        )
+        .unwrap();
+        let store = MemoryMetadataStore::default();
+        assert_eq!(FindingFile::new(&array_path).load_into(&store).unwrap(), 1);
+        assert!(store
+            .content_finding(&Ecosystem::Npm, "c", &Version::parse("1.0.0").unwrap())
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn finding_file_missing_or_malformed_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(FindingFile::new(directory.path().join("missing.jsonl"))
+            .load_into(&MemoryMetadataStore::default())
+            .is_err());
+        std::fs::write(directory.path().join("bad.jsonl"), "not json\n").unwrap();
+        assert!(FindingFile::new(directory.path().join("bad.jsonl"))
+            .load_into(&MemoryMetadataStore::default())
+            .is_err());
+    }
+
+    #[test]
+    fn parse_findings_handles_array_and_jsonl() {
+        let one = r#"{"ecosystem":"Npm","package":"a","version":"1.0.0","source":"s","score":9,"rules":[],"summary":"x"}"#;
+        assert_eq!(parse_findings(&format!("[{one}]")).unwrap().len(), 1);
+        assert_eq!(parse_findings(one).unwrap().len(), 1);
+        assert_eq!(parse_findings(&format!("{one}\n{one}")).unwrap().len(), 2);
+        assert!(parse_findings("broken").is_err());
+    }
 
     #[test]
     fn findings_from_multiple_sources_keep_the_highest_score() {

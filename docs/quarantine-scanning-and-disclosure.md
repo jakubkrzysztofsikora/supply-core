@@ -145,19 +145,23 @@ Guardrails before any automated submission:
    (`enabled=false`, `review_score=4`, `block_score=8`) and
    `ContentFinding`; the evaluator blocks at/above `block_score`, warns on
    `review_score`, and re-checks frozen fallback candidates.
-2. **Finding store** — done for the in-memory store (`save_content_finding`
-   / `content_finding`); file-backed persistence is pending.
+2. **Finding store** — in-memory store plus `FindingFile` JSONL persistence
+   (`append`/`load_into`, array or JSONL input, fails closed on missing or
+   malformed files); multiple sources keep the highest score.
 3. **Static correlation scanner** — done (`application::scanner`):
    capability + threat correlation per file, install-script network/pipe
    rules, cross-file install-script chain, benign build tooling stays clean
    (fixture-tested).
 4. **External scanner adapter** — done (`adapters::command_scanner`):
-   runs a configured command against the archive and parses a normalized
-   `{"score","rules","summary"}` report; GuardDog can be wrapped by a script
-   emitting that shape. A first-class GuardDog parser lands once we can pin
-   its output schema against a real install.
-5. **Provenance** — helper done (`has_provenance`, npm `dist.attestations`);
-   score integration pending.
+   normalized `{"score","rules","summary"}` reports plus a **first-class
+   GuardDog v3 parser** (`CommandScanner::guarddog`, pinned against GuardDog
+   3.2.0 output: `risk_score.score`, matched `results` rules, `errors` fail
+   closed). `scan-package --guarddog` runs it via `$GUARDDOG_BIN`; both
+   findings persist with their source intact.
+5. **Provenance** — done: `has_provenance` (npm `dist.attestations`) plus
+   score downgrade via `apply_provenance`/`PROVENANCE_RELIEF` (3 points) and
+   the `scan-package --provenance` flag; an attested archive drops from
+   Block to a review warning in the evaluator.
 6. **Version diff** — done (`diff_package_files`, `scan_version_diff`):
    newly introduced lifecycle scripts score 9 with rule `new-install-script`.
 7. **OSV export + CLI** — done: `ContentFinding::to_osv()` and

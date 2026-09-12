@@ -139,6 +139,13 @@ enum Command {
         /// `{"score","rules","summary"}` JSON report.
         #[arg(long)]
         external: Option<PathBuf>,
+        /// Also run GuardDog (`$GUARDDOG_BIN` or `guarddog` on PATH).
+        #[arg(long)]
+        guarddog: bool,
+        /// The registry reports a verified build attestation for this
+        /// version; lower the static score accordingly.
+        #[arg(long)]
+        provenance: bool,
         /// Append the finding as JSONL to this file for later evaluation.
         #[arg(long)]
         findings_out: Option<PathBuf>,
@@ -312,6 +319,8 @@ async fn main() -> Result<()> {
             name,
             version,
             external,
+            guarddog,
+            provenance,
             findings_out,
         } => {
             let ecosystem = match ecosystem.as_str() {
@@ -322,44 +331,53 @@ async fn main() -> Result<()> {
             let parsed = semver::Version::parse(&version)?;
             let bytes = std::fs::read(&archive)?;
             let store = MemoryMetadataStore::default();
-            let mut finding = supply_core::application::scanner::scan_archive_bytes(
-                &store, &ecosystem, &name, &parsed, &bytes,
-            )?;
+            let static_finding =
+                supply_core::application::scanner::scan_archive_bytes_with_provenance(
+                    &store, &ecosystem, &name, &parsed, &bytes, provenance,
+                )?;
+            let mut all_findings: Vec<supply_core::domain::ContentFinding> = Vec::new();
+            if let Some(finding) = static_finding {
+                all_findings.push(finding);
+            }
+            let mut external_scanners = Vec::new();
             if let Some(command) = external {
-                let scanner = supply_core::adapters::command_scanner::CommandScanner::new(
-                    command,
-                    "external-scan",
+                external_scanners.push(
+                    supply_core::adapters::command_scanner::CommandScanner::new(
+                        command,
+                        "external-scan",
+                    ),
                 );
+            }
+            if guarddog {
+                let command =
+                    std::env::var("GUARDDOG_BIN").unwrap_or_else(|_| "guarddog".to_string());
+                external_scanners.push(
+                    supply_core::adapters::command_scanner::CommandScanner::guarddog(command),
+                );
+            }
+            for scanner in external_scanners {
                 if let Some(external_finding) =
                     scanner.scan_archive(&ecosystem, &archive, &name, &parsed)?
                 {
                     store.save_content_finding(&external_finding)?;
-                    let better = finding
-                        .as_ref()
-                        .is_none_or(|current| external_finding.score > current.score);
-                    if better {
-                        finding = Some(external_finding);
-                    }
+                    all_findings.push(external_finding);
                 }
             }
-            match &finding {
-                Some(finding) => {
-                    println!("{}", serde_json::to_string_pretty(finding)?);
-                    if let Some(path) = findings_out {
-                        use std::io::Write;
-                        let mut file = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(&path)?;
-                        writeln!(file, "{}", serde_json::to_string(finding)?)?;
+            if all_findings.is_empty() {
+                println!("no content finding for {name}@{version}");
+            } else {
+                println!("{}", serde_json::to_string_pretty(&all_findings)?);
+                if let Some(path) = findings_out {
+                    let file = supply_core::adapters::storage::FindingFile::new(path);
+                    for finding in &all_findings {
+                        file.append(finding)?;
                     }
                 }
-                None => println!("no content finding for {name}@{version}"),
             }
         }
         Command::Report { findings, submit } => {
             let content = std::fs::read_to_string(&findings)?;
-            let stored = parse_findings(&content)?;
+            let stored = supply_core::adapters::storage::parse_findings(&content)?;
             let records: Vec<serde_json::Value> =
                 stored.iter().map(|finding| finding.to_osv()).collect();
             println!("{}", serde_json::to_string_pretty(&records)?);
@@ -375,25 +393,6 @@ async fn main() -> Result<()> {
                 );
             }
         }
-    }
-    Ok(())
-}
-
-fn parse_findings(content: &str) -> Result<Vec<supply_core::domain::ContentFinding>> {
-    if content.trim_start().starts_with('[') {
-        return Ok(serde_json::from_str(content)?);
-    }
-    content
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str(line).map_err(Into::into))
-        .collect()
-}
-
-fn load_findings(store: &MemoryMetadataStore, path: &std::path::Path) -> Result<()> {
-    let content = std::fs::read_to_string(path)?;
-    for finding in parse_findings(&content)? {
-        store.save_content_finding(&finding)?;
     }
     Ok(())
 }
@@ -424,7 +423,7 @@ fn snapshot_npm(
     let registry = HttpNpmRegistry::new()?;
     let store = MemoryMetadataStore::default();
     if let Some(path) = findings {
-        load_findings(&store, path)?;
+        supply_core::adapters::storage::FindingFile::new(path).load_into(&store)?;
     }
     let now = chrono::Utc::now();
     let mut entries = vec![];
@@ -551,7 +550,7 @@ fn snapshot_pip(
     let registry = HttpPyPiRegistry::new()?;
     let store = MemoryMetadataStore::default();
     if let Some(path) = findings {
-        load_findings(&store, path)?;
+        supply_core::adapters::storage::FindingFile::new(path).load_into(&store)?;
     }
     let vulns = vulnerability_source(use_osv, osv_cache)?;
     let now = chrono::Utc::now();
@@ -627,7 +626,7 @@ fn snapshot_nuget(
     let registry = HttpNuGetRegistry::new()?;
     let store = MemoryMetadataStore::default();
     if let Some(path) = findings {
-        load_findings(&store, path)?;
+        supply_core::adapters::storage::FindingFile::new(path).load_into(&store)?;
     }
     let vulns = vulnerability_source(use_osv, osv_cache)?;
     let now = chrono::Utc::now();
@@ -698,14 +697,6 @@ mod cli_tests {
     use super::*;
 
     #[test]
-    fn parses_findings_array_and_jsonl() -> Result<()> {
-        let one = r#"{"ecosystem":"Npm","package":"a","version":"1.0.0","source":"s","score":9,"rules":[],"summary":"x"}"#;
-        assert_eq!(parse_findings(&format!("[{one}]"))?.len(), 1);
-        assert_eq!(parse_findings(one)?.len(), 1);
-        assert_eq!(parse_findings(&format!("{one}\n{one}"))?.len(), 2);
-        Ok(())
-    }
-    #[test]
     fn version_flag_is_supported() {
         match Cli::try_parse_from(["supply", "--version"]) {
             Ok(_) => panic!("--version must not parse as a subcommand"),
@@ -734,8 +725,17 @@ mod cli_tests {
             "evil",
             "--version",
             "1.2.3",
+            "--guarddog",
+            "--provenance",
         ])?;
-        assert!(matches!(cli.command, Command::ScanPackage { .. }));
+        assert!(matches!(
+            cli.command,
+            Command::ScanPackage {
+                guarddog: true,
+                provenance: true,
+                ..
+            }
+        ));
         let cli = Cli::try_parse_from([
             "supply",
             "snapshot-pip",
