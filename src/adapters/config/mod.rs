@@ -17,7 +17,6 @@ pub fn parse_policy_str(content: &str) -> Result<Policy> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::OFFICIAL_SERVICE_URL;
 
     #[test]
     fn explicit_missing_policy_errors() {
@@ -31,12 +30,12 @@ mod tests {
     }
 
     #[test]
-    fn server_defaults_to_official_service() -> Result<()> {
+    fn server_defaults_are_neutral() -> Result<()> {
         let policy = parse_policy_str("quarantine:\n  enabled: false\n")?;
 
-        assert_eq!(policy.server.service_url, OFFICIAL_SERVICE_URL);
+        assert!(policy.server.service_url.is_empty());
         assert!(!policy.server.allow_fallback);
-        assert!(policy.server.force_official);
+        assert!(!policy.server.force_official);
         Ok(())
     }
 

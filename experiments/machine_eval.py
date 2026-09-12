@@ -26,7 +26,7 @@ PRUNE = {'.git', 'node_modules', 'target', '.venv', 'venv', '__pycache__',
          '.next', 'dist', 'build', 'Library', '.Trash', '.cache', '.npm',
          '.cargo', '.rustup', '.codex', '.claude', '.local', '.ssh', '.orbstack',
          '.bun', '.nuget', '.m2', '.gradle', '.terraform', '.yarn', '.pnpm-store',
-         '.vscode', '.cursor', 'vendor', '.worktrees', 'worktrees', 'lustro-worktrees',
+         '.vscode', '.cursor', 'vendor', '.worktrees', 'worktrees',
          'Applications', 'Pictures', 'Movies', 'Music', 'OrbStack'}
 
 

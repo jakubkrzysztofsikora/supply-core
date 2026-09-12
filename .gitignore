@@ -13,3 +13,4 @@ artifacts/
 radar/data/
 radar/candidates.txt
 workspace/
+experiments/candidates.txt

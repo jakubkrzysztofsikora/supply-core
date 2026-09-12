@@ -15,8 +15,6 @@ spec:
       labels:
         app: supply-core-official
     spec:
-      nodeSelector:
-        kubernetes.io/hostname: k3s-cp-1
       containers:
       - name: app
         image: ghcr.io/jakubkrzysztofsikora/supply-core:v0.2.2

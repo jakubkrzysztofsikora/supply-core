@@ -18,7 +18,7 @@ Every modern project imports hundreds of third-party dependencies and uses unpin
 
 - **0-Day NPM Poisoning**: Malicious packages sit on the public registry for an average of 48 hours before takedown. `supply-core` automatically quarantines packages published <24h/72h and transparently falls back to known-good frozen versions.
 - **Floating GitHub Actions**: If you use `actions/checkout@v4`, anyone compromising that tag gets write tokens in your CI pipeline. `supply-core` catches and flags floating tags in milliseconds.
-- **Morning Snapshot**: A passive daily LaunchAgent checks all 100+ repositories across your Mac, inventories lockfiles (`package-lock.json`, `yarn.lock`, `requirements.txt`, `packages.lock.json`), checks OSV.dev, and leaves a crisp `report.md` on your desk.
+- **Morning Snapshot**: A passive daily LaunchAgent checks every Git repository under your configured roots, inventories lockfiles (`package-lock.json`, `yarn.lock`, `requirements.txt`, `packages.lock.json`), checks OSV.dev, and leaves a crisp `report.md` on your desk.
 
 ---
 
@@ -119,31 +119,27 @@ The radar container runs the quarantine capture immediately and every 24 h
 server over the compose network. Captures land in `radar/data/`. Without the
 `radar` profile the server alone needs no token.
 
-**Official Cluster Service (Homelab / Tailscale Funnel):**
-- Tailscale MagicDNS: `supply-core.tail5d39b4.ts.net`
-- Public HTTPS Funnel: `https://supply-core.tail5d39b4.ts.net`
-- Public dashboard: `https://supply-core.tail5d39b4.ts.net/`
-- Health check: `curl https://supply-core.tail5d39b4.ts.net/health`
-- Pre-built binary download: `curl -sSL https://supply-core.tail5d39b4.ts.net/api/v1/download/supply-core-linux-x86_64 -o supply-core` (falls back to a redirect to GitHub Releases when the artifact cache is empty)
+**Self-hosted service (optional public endpoint):**
+- Service URL (example): `https://supply-core.example.com`
+- Local health check: `curl http://localhost:4873/health`
+- Pre-built binary download: `curl -sSL https://supply-core.example.com/api/v1/download/supply-core-linux-x86_64 -o supply-core` (falls back to a redirect to GitHub Releases when the artifact cache is empty)
 - Remote pipeline scan: set `SUPPLY_AUTH_TOKEN` on the server and include a matching bearer token in scan requests.
 - Quarantine dashboard: the daily capture publishes only package name, version, age, and decision using the same token. Store its local configuration outside the repository at `~/.config/supply-core/status-publisher.env`:
 
   ```bash
-  SUPPLY_STATUS_URL=https://supply-core.tail5d39b4.ts.net
+  SUPPLY_STATUS_URL=https://supply-core.example.com
   SUPPLY_STATUS_AUTH_TOKEN=the-matching-SUPPLY_AUTH_TOKEN
   ```
 
-  The next successful capture updates the public dashboard; its snapshot contains no repository paths, ranges, or advisory details.
+  The next successful capture updates the dashboard; its snapshot contains no repository paths, ranges, or advisory details.
 
-**Deploy to Kubernetes (K3s):**
+**Deploy to Kubernetes:**
 ```bash
-# Apply the SOPS-managed cluster secrets from the homelab-cluster repository first
-# (tailnet Funnel auth key + the server/publisher SUPPLY_AUTH_TOKEN):
-SOPS_AGE_KEY_FILE=~/cluster-migration/.secrets/age-key.txt \
-  ~/cluster-migration/homelab-cluster/scripts/secrets-apply.sh \
-  ~/cluster-migration/homelab-cluster/secrets/ts-sidecar-auth.enc.yaml \
-  ~/cluster-migration/homelab-cluster/secrets/supply-core-auth.enc.yaml
-# Then deploy manifests with the Tailscale Funnel sidecar.
+# Create the runtime secrets first (Tailscale sidecar auth key + server token):
+kubectl create namespace supply-core
+kubectl -n supply-core create secret generic ts-sidecar-auth --from-literal=TS_AUTHKEY=<tailscale-auth-key>
+kubectl -n supply-core create secret generic supply-core-auth --from-literal=SUPPLY_AUTH_TOKEN=<long-random-token>
+# Then deploy the manifests (adjust storageClassName and sizing in deploy/k8s/*.yaml to your cluster):
 kubectl apply -k deploy/k8s
 ```
 
@@ -157,7 +153,7 @@ kubectl apply -k deploy/k8s
 | **Frozen Fallback** | Serves latest frozen version satisfying your semver range | Prevents builds from breaking while staying safe |
 | **Actions SHA Pinning** | Enforces immutable 40-character commit SHAs in CI | Blocks malicious workflow tag mutability attacks |
 | **OSV.dev Integration** | Real-time vulnerability batch query with CVSS & severity | Immediate awareness of newly disclosed CVEs |
-| **Passive Machine Scan** | Fast traversal of 100+ repos, worktree deduplication; npm, pip and NuGet advisories | Total situational awareness of local attack surface |
+| **Passive Machine Scan** | Fast traversal of your repositories, worktree deduplication; npm, pip and NuGet advisories | Total situational awareness of local attack surface |
 | **PyPI Quarantine** | `snapshot-pip` checks exact requirements.txt pins: publish age, sha256, OSV advisories | Catches fresh malicious pip uploads before they reach your build |
 | **NuGet Quarantine** | `snapshot-nuget` checks resolved `packages.lock.json`: publish age, SHA-512 package hash, OSV | Catches fresh NuGet publishes with the same policy engine |
 | **Docker Digest Pinning** | `scan-docker` flags `FROM`/`image:` references that lack an `@sha256:` digest | Mutable tags can be silently replaced under you |
@@ -194,7 +190,7 @@ hashes come from the PyPI JSON API.
          │                                        ├── Age < 72h? ──► Quarantine + Fallback
          │                                        └── Vulnerable? ──► Block or Warn
          │
-         └───► Daily LaunchAgent (08:30) ──────► Discovers all ~/Repos
+         └───► Daily LaunchAgent (08:30) ──────► Discovers Git repositories under configured roots
                                                   ├── Maps lockfiles (npm, Yarn, pip, NuGet)
                                                   ├── Queries OSV batch API (cached 24h)
                                                   └── Generates runs/<ts>/report.md
@@ -208,14 +204,14 @@ Every morning, open `~/.local/share/supply-core/latest.json` or `runs/<timestamp
 
 ```markdown
 # Machine-wide supply-chain evaluation
-**Timestamp:** 2026-09-07T18:42:30Z | **Repositories:** 105 | **Exact versions:** 10,201
+**Timestamp:** 2026-09-07T18:42:30Z | **Repositories:** 24 | **Exact versions:** 1,830
 
 ### Top Findings
 - `Repos/dashboard` (yarn.lock): 411 advisory hits (Prototype Pollution, ReDoS)
 - `Repos/api` (.github/workflows/deploy.yml): 8 unpinned actions (`actions/checkout@v4`)
 
 ### Status
-- Cached OSV lookups: 9,840 / 10,201 (96.4% cache hit rate)
+- Cached OSV lookups: 1,772 / 1,830 (96.8% cache hit rate)
 - Evaluation runtime: 4.2 seconds
 ```
 

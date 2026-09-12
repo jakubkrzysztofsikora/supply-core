@@ -1,0 +1,11 @@
+# supply-core field-test candidates
+# format: name<TAB>repo-root<TAB>track(s)
+# tracks: npm = dependency snapshots (upstream churn matters, repo activity irrelevant)
+#         actions = workflow scanner (needs commit churn to produce drift signal)
+#
+# Copy this file to candidates.txt (gitignored) and point the entries at your
+# own checkouts. Missing paths are skipped with a warning, so keep the list to
+# what exists on your machine.
+example-webapp	/Users/you/code/example-webapp	npm actions
+example-service	/Users/you/code/example-service	npm
+example-infra	/Users/you/code/example-infra	actions
