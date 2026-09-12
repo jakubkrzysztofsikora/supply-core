@@ -220,7 +220,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("case.sh");
         let mut file = std::fs::File::create(&path).unwrap();
-        write!(file, "{body}\n").unwrap();
+        writeln!(file, "{body}").unwrap();
         file.sync_all().unwrap();
         (directory, path)
     }
