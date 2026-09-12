@@ -1417,6 +1417,7 @@ dependencies = [
  "flate2",
  "hex",
  "http",
+ "libc",
  "regex",
  "reqwest",
  "semver",

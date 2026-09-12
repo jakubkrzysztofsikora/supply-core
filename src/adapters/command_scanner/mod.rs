@@ -10,6 +10,13 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_MAX_OUTPUT: usize = 8 * 1024 * 1024;
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+fn kill_process_group(pid: i32) {
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
+}
 
 /// Runs an external analyzer against a package archive and expects a
 /// normalized JSON report on stdout: `{"score": 0-10, "rules": [...],
@@ -40,18 +47,27 @@ impl CommandScanner {
     }
 
     fn run(&self, ecosystem: &Ecosystem, archive: &Path) -> Result<String> {
+        use std::os::unix::process::CommandExt;
         let mut child = Command::new(&self.command)
             .arg(ecosystem_label(ecosystem))
             .arg(archive)
+            .process_group(0)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("failed to run {}", self.command.display()))?;
+        let pid = child.id() as i32;
         let stdout = child.stdout.take().context("scanner stdout missing")?;
         let stderr = child.stderr.take().context("scanner stderr missing")?;
         let limit = self.max_output_bytes;
-        let stdout_reader = std::thread::spawn(move || read_capped(stdout, limit));
-        let stderr_reader = std::thread::spawn(move || read_capped(stderr, limit));
+        let (out_tx, out_rx) = std::sync::mpsc::channel();
+        let (err_tx, err_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = out_tx.send(read_capped(stdout, limit));
+        });
+        std::thread::spawn(move || {
+            let _ = err_tx.send(read_capped(stderr, limit));
+        });
 
         let deadline = Instant::now() + self.timeout;
         let status = loop {
@@ -59,7 +75,7 @@ impl CommandScanner {
                 break status;
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
+                kill_process_group(pid);
                 let _ = child.wait();
                 anyhow::bail!(
                     "{} timed out after {:?}",
@@ -70,8 +86,29 @@ impl CommandScanner {
             std::thread::sleep(Duration::from_millis(20));
         };
 
-        let (stdout_bytes, stdout_truncated) = stdout_reader.join().unwrap_or_default();
-        let (stderr_bytes, stderr_truncated) = stderr_reader.join().unwrap_or_default();
+        // The direct child can exit while a background grandchild still holds
+        // the pipe descriptors open; draining must respect the deadline too.
+        let drain_window = DRAIN_GRACE.min(deadline.saturating_duration_since(Instant::now()));
+        let (stdout_bytes, stdout_truncated) = match out_rx.recv_timeout(drain_window) {
+            Ok(result) => result,
+            Err(_) => {
+                kill_process_group(pid);
+                anyhow::bail!(
+                    "{} timed out while draining scanner output",
+                    self.command.display()
+                );
+            }
+        };
+        let (stderr_bytes, stderr_truncated) = match err_rx.recv_timeout(drain_window) {
+            Ok(result) => result,
+            Err(_) => {
+                kill_process_group(pid);
+                anyhow::bail!(
+                    "{} timed out while draining scanner output",
+                    self.command.display()
+                );
+            }
+        };
         if stdout_truncated || stderr_truncated {
             anyhow::bail!(
                 "{} output exceeded {} bytes",
@@ -255,6 +292,24 @@ EOF"#,
         assert!(scanner
             .scan_archive(&Ecosystem::Npm, Path::new("/tmp/a.tgz"), "odd", &version())
             .is_err());
+    }
+
+    #[test]
+    fn background_pipe_holder_cannot_hang_the_scan() {
+        let (_directory, path) = script("sleep 300 & exit 0");
+        let scanner = CommandScanner::new(path, "guarddog")
+            .with_limits(std::time::Duration::from_secs(30), 1024 * 1024);
+        let started = std::time::Instant::now();
+        let error = scanner
+            .scan_archive(&Ecosystem::Npm, Path::new("/tmp/a.tgz"), "odd", &version())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("timed out"), "{error}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "drain blocked for {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
