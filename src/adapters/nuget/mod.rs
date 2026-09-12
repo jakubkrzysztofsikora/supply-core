@@ -71,6 +71,7 @@ pub fn parse_packages_lock(content: &str) -> Result<ParsedPins> {
         .context("packages.lock.json has no dependencies object")?;
     let mut pins: Vec<NuGetPin> = Vec::new();
     let mut gaps = Vec::new();
+    let mut conflicted: Vec<(String, String)> = Vec::new();
     for (target, packages) in targets {
         let Some(packages) = packages.as_object() else {
             gaps.push(format!("target {target}: dependencies are not an object"));
@@ -89,7 +90,22 @@ pub fn parse_packages_lock(content: &str) -> Result<ParsedPins> {
                         ));
                         continue;
                     };
-                    if pins.iter().any(|pin| pin.name == *name) {
+                    let key = (name.clone(), resolved.to_string());
+                    if conflicted.contains(&key) {
+                        continue;
+                    }
+                    if let Some(position) = pins
+                        .iter()
+                        .position(|pin| pin.name == *name && pin.version == resolved)
+                    {
+                        if pins[position].content_hash.as_deref() == Some(content_hash) {
+                            continue;
+                        }
+                        pins.remove(position);
+                        conflicted.push(key);
+                        gaps.push(format!(
+                            "target {target}: {name} {resolved} has conflicting contentHash across targets; not evaluated"
+                        ));
                         continue;
                     }
                     pins.push(NuGetPin {
@@ -233,6 +249,24 @@ mod tests {
         assert_eq!(gaps.len(), 2);
         assert!(gaps[0].contains("RangeOnly"));
         assert!(gaps.iter().any(|gap| gap.contains("contentHash")));
+        Ok(())
+    }
+
+    #[test]
+    fn conflicting_hashes_across_targets_are_a_gap() -> Result<()> {
+        let content = r#"{
+          "version": 1,
+          "dependencies": {
+            "net8.0": { "Foo": { "type": "Direct", "resolved": "1.0.0", "contentHash": "h1" } },
+            "net8.0/win-x64": { "Foo": { "type": "Direct", "resolved": "1.0.0", "contentHash": "h2" } }
+          }
+        }"#;
+        let (pins, gaps) = parse_packages_lock(content)?;
+        assert!(pins.is_empty(), "pins: {pins:?}");
+        assert!(
+            gaps.iter().any(|gap| gap.contains("conflicting")),
+            "gaps: {gaps:?}"
+        );
         Ok(())
     }
 
