@@ -18,7 +18,7 @@ Every modern project imports hundreds of third-party dependencies and uses unpin
 
 - **0-Day NPM Poisoning**: Malicious packages sit on the public registry for an average of 48 hours before takedown. `supply-core` automatically quarantines packages published <24h/72h and transparently falls back to known-good frozen versions.
 - **Floating GitHub Actions**: If you use `actions/checkout@v4`, anyone compromising that tag gets write tokens in your CI pipeline. `supply-core` catches and flags floating tags in milliseconds.
-- **Morning Snapshot**: A passive daily LaunchAgent checks all 100+ repositories across your Mac, inventories lockfiles (`package-lock.json`, `yarn.lock`), checks OSV.dev, and leaves a crisp `report.md` on your desk.
+- **Morning Snapshot**: A passive daily LaunchAgent checks all 100+ repositories across your Mac, inventories lockfiles (`package-lock.json`, `yarn.lock`, `requirements.txt`, `packages.lock.json`), checks OSV.dev, and leaves a crisp `report.md` on your desk.
 
 ---
 
@@ -58,7 +58,26 @@ cargo run -- scan-pipelines . --annotations
 ```
 *Emits escaped Azure DevOps error logging commands (`##vso[task.logissue...]`) and exits `2` on policy findings.*
 
-### 4. Machine-Wide Daily Radar (macOS)
+### 4. Package & Container Policy Scans
+Evaluate exact dependency pins before you install them:
+
+```bash
+# npm: semver deps -> registry metadata, age quarantine, integrity, OSV
+cargo run -- snapshot-npm .
+
+# pip: exact requirements.txt pins -> PyPI age, sha256, --hash validation
+cargo run -- snapshot-pip .
+
+# NuGet: packages.lock.json -> nuget.org age, contentHash verification
+cargo run -- snapshot-nuget .
+
+# Docker: flag FROM/image references without a sha256 digest
+cargo run -- scan-docker .
+```
+
+*`snapshot-*` prints a JSON report; `scan-docker` exits `2` when an image is unpinned.*
+
+### 5. Machine-Wide Daily Radar (macOS)
 Scan **all** git repositories across your machine every morning at 08:30 AM:
 
 ```bash
@@ -66,11 +85,11 @@ cargo build --release --locked && python3 experiments/install_machine_eval.py --
 ```
 
 - Discovers all git checkouts under your home directory.
-- Maps and parses `package-lock.json` and Yarn Classic `yarn.lock`.
+- Maps and parses `package-lock.json`, Yarn Classic `yarn.lock`, exact `requirements.txt` pins, and resolved `packages.lock.json` entries.
 - Queries OSV.dev with local 24-hour response caching.
 - Zero battery drain: runs while logged in, coalesces sleep events.
 
-### 5. Official Server & Self-Hosting
+### 6. Official Server & Self-Hosting
 Run `supply-core` as an HTTP microservice with remote scanning and binary distribution endpoints:
 
 ```bash
@@ -176,7 +195,7 @@ hashes come from the PyPI JSON API.
          │                                        └── Vulnerable? ──► Block or Warn
          │
          └───► Daily LaunchAgent (08:30) ──────► Discovers all ~/Repos
-                                                  ├── Maps lockfiles (npm, Yarn)
+                                                  ├── Maps lockfiles (npm, Yarn, pip, NuGet)
                                                   ├── Queries OSV batch API (cached 24h)
                                                   └── Generates runs/<ts>/report.md
 ```
@@ -218,6 +237,17 @@ vulnerabilities:
 npm:
   require_integrity: true
   fallback_to_frozen: true
+
+pip:
+  require_integrity: true
+  fallback_to_frozen: true
+
+nuget:
+  require_integrity: true
+  fallback_to_frozen: true
+
+docker:
+  require_digest_pin: true
 
 github_actions:
   require_full_sha_pin: true
