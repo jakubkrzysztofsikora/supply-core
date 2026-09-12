@@ -106,7 +106,10 @@ impl<'a> PackageEvaluator<'a> {
         let reason = reason.into();
         let ecosystem_policy = self.ecosystem_policy(ecosystem);
         if ecosystem_policy.fallback_to_frozen {
-            if let Some(frozen) = self.metadata.latest_frozen_satisfying(name, requested)? {
+            if let Some(frozen) = self
+                .metadata
+                .latest_frozen_satisfying(ecosystem, name, requested)?
+            {
                 // Frozen bytes are immutable, but vulnerability knowledge changes.
                 let findings = self.vulns.query(ecosystem.clone(), name, &frozen.version)?;
                 if let Some(fallback_reason) = self.vulnerability_reason(&findings) {
@@ -168,7 +171,10 @@ impl<'a> IngestService<'a> {
             );
         }
         let sha256 = self.hasher.sha256(&bytes);
-        if let Some(existing) = self.metadata.get_frozen(name, &version.version)? {
+        if let Some(existing) =
+            self.metadata
+                .get_frozen(&version.package.ecosystem, name, &version.version)?
+        {
             if existing.sha256 != sha256 {
                 anyhow::bail!(
                     "registry immutability violation: {name}@{} already frozen with different bytes",
@@ -333,6 +339,9 @@ impl<'a> DockerScanner<'a> {
                 if self.policy.docker.require_digest_pin {
                     let block = match pin_kind {
                         ImagePinKind::Digest => None,
+                        ImagePinKind::InvalidDigest => {
+                            Some("container image digest is not a valid sha256 digest")
+                        }
                         ImagePinKind::Unresolved => {
                             Some("container image reference is not statically resolvable")
                         }
@@ -774,6 +783,7 @@ mod tests {
         }
         fn latest_frozen_satisfying(
             &self,
+            ecosystem: &Ecosystem,
             _: &str,
             requested: Option<&VersionReq>,
         ) -> Result<Option<FrozenArtifact>> {
@@ -782,15 +792,22 @@ mod tests {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("lock poisoned"))?
                 .clone();
-            Ok(frozen.filter(|a| requested.is_none_or(|r| r.matches(&a.version))))
+            Ok(frozen.filter(|a| {
+                a.package.ecosystem == *ecosystem && requested.is_none_or(|r| r.matches(&a.version))
+            }))
         }
-        fn get_frozen(&self, _: &str, version: &Version) -> Result<Option<FrozenArtifact>> {
+        fn get_frozen(
+            &self,
+            ecosystem: &Ecosystem,
+            _: &str,
+            version: &Version,
+        ) -> Result<Option<FrozenArtifact>> {
             let frozen = self
                 .0
                 .lock()
                 .map_err(|_| anyhow::anyhow!("lock poisoned"))?
                 .clone();
-            Ok(frozen.filter(|a| a.version == *version))
+            Ok(frozen.filter(|a| a.package.ecosystem == *ecosystem && a.version == *version))
         }
         fn put_frozen(&self, _: FrozenArtifact) -> Result<()> {
             Ok(())
@@ -1000,7 +1017,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         std::fs::write(
             dir.path().join("Dockerfile"),
-            "FROM alpine:3.20\nFROM ghcr.io/org/app@sha256:abc123\nFROM ubuntu\nFROM scratch\nCOPY x /x\n",
+            "FROM alpine:3.20\nFROM ghcr.io/org/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nFROM ubuntu\nFROM scratch\nCOPY x /x\n",
         )?;
         let p = Policy::default();
         let report = DockerScanner { policy: &p }.scan(dir.path())?;
@@ -1017,7 +1034,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         std::fs::write(
             dir.path().join("docker-compose.yml"),
-            "services:\n  web:\n    image: nginx:1.27\n  db:\n    image: redis@sha256:deadbeef\n  queue:\n    image: ${BASE_IMAGE}:latest\n",
+            "services:\n  web:\n    image: nginx:1.27\n  db:\n    image: redis@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n  queue:\n    image: ${BASE_IMAGE}:latest\n",
         )?;
         let p = Policy::default();
         let report = DockerScanner { policy: &p }.scan(dir.path())?;
