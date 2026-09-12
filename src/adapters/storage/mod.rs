@@ -119,8 +119,42 @@ impl ArtifactStore for FsArtifactStore {
 pub struct MemoryMetadataStore {
     frozen: Mutex<Vec<FrozenArtifact>>,
     decisions: Mutex<Vec<Decision>>,
+    findings: Mutex<Vec<ContentFinding>>,
 }
 impl MetadataStore for MemoryMetadataStore {
+    fn save_content_finding(&self, finding: &ContentFinding) -> Result<()> {
+        let mut findings = self
+            .findings
+            .lock()
+            .map_err(|_| anyhow::anyhow!("lock poisoned"))?;
+        findings.retain(|existing| {
+            !(existing.package == finding.package
+                && existing.ecosystem == finding.ecosystem
+                && existing.version == finding.version)
+        });
+        findings.push(finding.clone());
+        Ok(())
+    }
+
+    fn content_finding(
+        &self,
+        ecosystem: &Ecosystem,
+        name: &str,
+        version: &Version,
+    ) -> Result<Option<ContentFinding>> {
+        Ok(self
+            .findings
+            .lock()
+            .map_err(|_| anyhow::anyhow!("lock poisoned"))?
+            .iter()
+            .find(|finding| {
+                finding.ecosystem == *ecosystem
+                    && finding.package == name
+                    && finding.version == *version
+            })
+            .cloned())
+    }
+
     fn save_decision(&self, d: &Decision) -> Result<()> {
         self.decisions
             .lock()
@@ -175,6 +209,48 @@ impl MetadataStore for MemoryMetadataStore {
 mod tests {
     use super::*;
 
+    #[test]
+    fn content_findings_round_trip_and_replace() {
+        let store = MemoryMetadataStore::default();
+        assert!(store
+            .content_finding(
+                &Ecosystem::Npm,
+                "left-pad",
+                &Version::parse("2.0.0").unwrap()
+            )
+            .unwrap()
+            .is_none());
+        let finding = |score: u8, summary: &str| ContentFinding {
+            ecosystem: Ecosystem::Npm,
+            package: "left-pad".to_string(),
+            version: Version::parse("2.0.0").unwrap(),
+            source: "static-heuristics".to_string(),
+            score,
+            rules: vec!["install-script-network".to_string()],
+            summary: summary.to_string(),
+        };
+        store.save_content_finding(&finding(5, "first")).unwrap();
+        let stored = store
+            .content_finding(
+                &Ecosystem::Npm,
+                "left-pad",
+                &Version::parse("2.0.0").unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.score, 5);
+        store.save_content_finding(&finding(9, "updated")).unwrap();
+        let stored = store
+            .content_finding(
+                &Ecosystem::Npm,
+                "left-pad",
+                &Version::parse("2.0.0").unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.score, 9);
+        assert_eq!(stored.summary, "updated");
+    }
     #[test]
     fn frozen_lookup_is_ecosystem_scoped() {
         let store = MemoryMetadataStore::default();

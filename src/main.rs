@@ -116,6 +116,14 @@ enum Command {
         #[arg(long)]
         osv_cache: Option<PathBuf>,
     },
+    /// Emit OSV records for stored content findings (dry run by default).
+    Report {
+        /// JSON file containing an array of content findings.
+        findings: PathBuf,
+        /// Print the manual submission checklist for public disclosure.
+        #[arg(long)]
+        submit: bool,
+    },
     /// Scan Dockerfiles and compose files for container images that are
     /// not pinned to a sha256 digest.
     ScanDocker {
@@ -262,6 +270,24 @@ async fn main() -> Result<()> {
             }
             if report.is_blocking() {
                 std::process::exit(2);
+            }
+        }
+        Command::Report { findings, submit } => {
+            let content = std::fs::read_to_string(&findings)?;
+            let stored: Vec<supply_core::domain::ContentFinding> = serde_json::from_str(&content)?;
+            let records: Vec<serde_json::Value> =
+                stored.iter().map(|finding| finding.to_osv()).collect();
+            println!("{}", serde_json::to_string_pretty(&records)?);
+            if submit {
+                eprintln!("Public disclosure remains a manual, reviewed step:");
+                eprintln!("  1. malicious npm package: use 'Report malware' on the package page");
+                eprintln!(
+                    "  2. malicious PyPI project: use 'Report project as malware' (cite inspector.pypi.io lines)"
+                );
+                eprintln!("  3. open a PR against ossf/malicious-packages with these OSV records");
+                eprintln!(
+                    "  4. non-malicious vulnerability: maintainers privately, then GitHub Advisory Database"
+                );
             }
         }
     }
@@ -573,6 +599,8 @@ mod cli_tests {
             cli.command,
             Command::ScanDocker { json: true, .. }
         ));
+        let cli = Cli::try_parse_from(["supply", "report", "findings.json", "--submit"])?;
+        assert!(matches!(cli.command, Command::Report { submit: true, .. }));
         Ok(())
     }
     #[test]
