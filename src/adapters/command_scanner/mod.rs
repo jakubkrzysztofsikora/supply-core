@@ -216,12 +216,16 @@ mod tests {
     fn script(body: &str) -> (tempfile::TempDir, PathBuf) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("scanner.sh");
-        let mut file = std::fs::File::create(&path).unwrap();
-        write!(file, "#!/bin/sh\n{body}\n").unwrap();
-        file.sync_all().unwrap();
-        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&path, permissions).unwrap();
+        let staging = directory.path().join("scanner.sh.staging");
+        {
+            let mut file = std::fs::File::create(&staging).unwrap();
+            write!(file, "#!/bin/sh\n{body}\n").unwrap();
+            file.sync_all().unwrap();
+        }
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Rename into place so the executed path is never open for writing,
+        // which can otherwise race into ETXTBSY on Linux runners.
+        std::fs::rename(&staging, &path).unwrap();
         (directory, path)
     }
 
@@ -298,20 +302,19 @@ EOF"#,
 
     #[test]
     fn drain_honours_a_single_grace_window() {
-        let (_directory, path) = script("(sleep 1.4; echo '{}') & sleep 300 >/dev/null & exit 0");
+        // stdout closes at ~1s; stderr is held until ~2.4s. With one 2s
+        // grace window computed up front the stderr wait must time out; with
+        // a fresh per-stream window the call would incorrectly succeed.
+        let (_directory, path) = script(
+            "(sleep 1; echo '{\"score\":0,\"rules\":[],\"summary\":\"\"}') 2>/dev/null & (sleep 2.4; echo x 1>&2) 1>/dev/null & exit 0",
+        );
         let scanner = CommandScanner::new(path, "guarddog")
             .with_limits(std::time::Duration::from_secs(30), 1024 * 1024);
-        let started = std::time::Instant::now();
         let error = scanner
             .scan_archive(&Ecosystem::Npm, Path::new("/tmp/a.tgz"), "odd", &version())
             .unwrap_err()
             .to_string();
         assert!(error.contains("timed out"), "{error}");
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(3),
-            "drain used more than one grace window: {:?}",
-            started.elapsed()
-        );
     }
 
     #[test]
