@@ -117,6 +117,16 @@ pub fn has_provenance(metadata: &serde_json::Value, version: &str) -> bool {
         .is_some()
 }
 
+pub fn integrity_for(metadata: &serde_json::Value, version: &str) -> Option<String> {
+    metadata
+        .get("versions")
+        .and_then(|versions| versions.get(version))
+        .and_then(|entry| entry.get("dist"))
+        .and_then(|dist| dist.get("integrity"))
+        .and_then(|integrity| integrity.as_str())
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,6 +142,16 @@ mod tests {
         assert!(has_provenance(&with, "1.2.3"));
         assert!(!has_provenance(&without, "1.2.3"));
         assert!(!has_provenance(&with, "9.9.9"));
+    }
+    #[test]
+    fn extracts_integrity_for_a_version() {
+        let metadata =
+            serde_json::json!({"versions": {"1.3.0": {"dist": {"integrity": "sha512-abc"}}}});
+        assert_eq!(
+            integrity_for(&metadata, "1.3.0").as_deref(),
+            Some("sha512-abc")
+        );
+        assert_eq!(integrity_for(&metadata, "9.9.9"), None);
     }
     #[test]
     fn rewrites() {

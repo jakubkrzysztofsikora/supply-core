@@ -234,7 +234,7 @@ impl FindingFile {
                 std::fs::create_dir_all(parent)?;
             }
         }
-        let existing = std::fs::read_to_string(&self.path).unwrap_or_default();
+        let mut existing = std::fs::read_to_string(&self.path).unwrap_or_default();
         if existing.trim_start().starts_with('[') {
             let mut findings = parse_findings(&existing)?;
             findings.push(finding.clone());
@@ -252,6 +252,16 @@ impl FindingFile {
         }
         let mut record = serde_json::to_string(finding)?;
         record.push('\n');
+        if !existing.is_empty() && !existing.ends_with('\n') {
+            let file = std::fs::OpenOptions::new().write(true).open(&self.path)?;
+            let length = match existing.rfind('\n') {
+                Some(index) => (index + 1) as u64,
+                None => 0,
+            };
+            file.set_len(length)?;
+            file.sync_data()?;
+            existing.truncate(length as usize);
+        }
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -376,6 +386,30 @@ mod tests {
             .content_finding(&Ecosystem::Npm, "a", &Version::parse("1.0.0").unwrap())
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn append_after_torn_tail_keeps_both_findings() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("findings.jsonl");
+        let file = FindingFile::new(&path);
+        let finding = |package: &str| ContentFinding {
+            ecosystem: Ecosystem::Npm,
+            package: package.to_string(),
+            version: Version::parse("1.0.0").unwrap(),
+            source: "static-heuristics".to_string(),
+            score: 9,
+            rules: vec![],
+            summary: package.to_string(),
+            detected_at: chrono::Utc::now(),
+        };
+        file.append(&finding("a")).unwrap();
+        let mut content = std::fs::read_to_string(&path).unwrap();
+        content.push_str("{\"partial\"");
+        std::fs::write(&path, content).unwrap();
+        file.append(&finding("b")).unwrap();
+        let store = MemoryMetadataStore::default();
+        assert_eq!(file.load_into(&store).unwrap(), 2);
     }
 
     #[test]
