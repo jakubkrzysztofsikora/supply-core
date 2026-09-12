@@ -87,28 +87,30 @@ impl CommandScanner {
         };
 
         // The direct child can exit while a background grandchild still holds
-        // the pipe descriptors open; draining must respect the deadline too.
-        let drain_window = DRAIN_GRACE.min(deadline.saturating_duration_since(Instant::now()));
-        let (stdout_bytes, stdout_truncated) = match out_rx.recv_timeout(drain_window) {
-            Ok(result) => result,
-            Err(_) => {
-                kill_process_group(pid);
-                anyhow::bail!(
-                    "{} timed out while draining scanner output",
-                    self.command.display()
-                );
-            }
-        };
-        let (stderr_bytes, stderr_truncated) = match err_rx.recv_timeout(drain_window) {
-            Ok(result) => result,
-            Err(_) => {
-                kill_process_group(pid);
-                anyhow::bail!(
-                    "{} timed out while draining scanner output",
-                    self.command.display()
-                );
-            }
-        };
+        // the pipe descriptors open; both drains share one grace window.
+        let drain_deadline = deadline.min(Instant::now() + DRAIN_GRACE);
+        let (stdout_bytes, stdout_truncated) =
+            match out_rx.recv_timeout(drain_deadline.saturating_duration_since(Instant::now())) {
+                Ok(result) => result,
+                Err(_) => {
+                    kill_process_group(pid);
+                    anyhow::bail!(
+                        "{} timed out while draining scanner output",
+                        self.command.display()
+                    );
+                }
+            };
+        let (stderr_bytes, stderr_truncated) =
+            match err_rx.recv_timeout(drain_deadline.saturating_duration_since(Instant::now())) {
+                Ok(result) => result,
+                Err(_) => {
+                    kill_process_group(pid);
+                    anyhow::bail!(
+                        "{} timed out while draining scanner output",
+                        self.command.display()
+                    );
+                }
+            };
         if stdout_truncated || stderr_truncated {
             anyhow::bail!(
                 "{} output exceeded {} bytes",
@@ -292,6 +294,24 @@ EOF"#,
         assert!(scanner
             .scan_archive(&Ecosystem::Npm, Path::new("/tmp/a.tgz"), "odd", &version())
             .is_err());
+    }
+
+    #[test]
+    fn drain_honours_a_single_grace_window() {
+        let (_directory, path) = script("(sleep 1.4; echo '{}') & sleep 300 >/dev/null & exit 0");
+        let scanner = CommandScanner::new(path, "guarddog")
+            .with_limits(std::time::Duration::from_secs(30), 1024 * 1024);
+        let started = std::time::Instant::now();
+        let error = scanner
+            .scan_archive(&Ecosystem::Npm, Path::new("/tmp/a.tgz"), "odd", &version())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("timed out"), "{error}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "drain used more than one grace window: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
