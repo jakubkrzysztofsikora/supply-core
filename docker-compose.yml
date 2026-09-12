@@ -1,6 +1,6 @@
 services:
   supply-core:
-    image: ghcr.io/jakubkrzysztofsikora/supply-core:v0.1.4
+    image: ghcr.io/jakubkrzysztofsikora/supply-core:v0.2.0
     build:
       context: .
       dockerfile: Dockerfile
@@ -25,7 +25,7 @@ services:
       start_period: 5s
 
   radar:
-    image: ghcr.io/jakubkrzysztofsikora/supply-core-radar:v0.1.4
+    image: ghcr.io/jakubkrzysztofsikora/supply-core-radar:v0.2.0
     build:
       context: .
       dockerfile: Dockerfile
