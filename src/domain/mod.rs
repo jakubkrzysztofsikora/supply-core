@@ -237,6 +237,76 @@ impl Default for DockerPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentFinding {
+    pub ecosystem: Ecosystem,
+    pub package: String,
+    pub version: Version,
+    pub source: String,
+    pub score: u8,
+    pub rules: Vec<String>,
+    pub summary: String,
+}
+impl ContentFinding {
+    /// OSV-shaped record, ready to attach to an `ossf/malicious-packages`
+    /// contribution or a GitHub advisory.
+    pub fn to_osv(&self) -> serde_json::Value {
+        let ecosystem = match self.ecosystem {
+            Ecosystem::Npm => "npm",
+            Ecosystem::PyPi => "PyPI",
+            Ecosystem::NuGet => "NuGet",
+            _ => "unknown",
+        };
+        let sanitized = |raw: &str| -> String {
+            raw.chars()
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() {
+                        character.to_ascii_uppercase()
+                    } else {
+                        '-'
+                    }
+                })
+                .collect()
+        };
+        serde_json::json!({
+            "schema_version": "1.7.0",
+            "id": format!(
+                "SUPPLY-{}-{}",
+                sanitized(&self.package),
+                sanitized(&self.version.to_string())
+            ),
+            "summary": self.summary,
+            "details": format!(
+                "rules: {}; source: {}",
+                self.rules.join(", "),
+                self.source
+            ),
+            "affected": [{
+                "package": { "ecosystem": ecosystem, "name": self.package },
+                "versions": [self.version.to_string()]
+            }],
+            "references": []
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QuarantineScannerPolicy {
+    pub enabled: bool,
+    pub review_score: u8,
+    pub block_score: u8,
+}
+impl Default for QuarantineScannerPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            review_score: 4,
+            block_score: 8,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NpmPolicy {
     pub require_integrity: bool,
@@ -315,6 +385,8 @@ pub struct Policy {
     pub nuget: NuGetPolicy,
     #[serde(default)]
     pub docker: DockerPolicy,
+    #[serde(default)]
+    pub quarantine_scanner: QuarantineScannerPolicy,
     #[serde(default)]
     pub github_actions: GitHubActionsPolicy,
     #[serde(default)]
@@ -528,6 +600,34 @@ mod tests {
                 cve_keeps_quarantined: true
             }
         ));
+    }
+    #[test]
+    fn content_finding_serializes_to_osv_record() {
+        let finding = ContentFinding {
+            ecosystem: Ecosystem::Npm,
+            package: "evil-pkg".into(),
+            version: Version::parse("1.2.3").unwrap_or_else(|_| panic!("valid semver")),
+            source: "static-heuristics".into(),
+            score: 9,
+            rules: vec!["install-script-network".into()],
+            summary: "postinstall beacon".into(),
+        };
+        let record = finding.to_osv();
+        assert_eq!(record["id"], "SUPPLY-EVIL-PKG-1-2-3");
+        assert_eq!(record["affected"][0]["package"]["ecosystem"], "npm");
+        assert_eq!(record["affected"][0]["package"]["name"], "evil-pkg");
+        assert_eq!(record["affected"][0]["versions"][0], "1.2.3");
+        assert_eq!(record["summary"], "postinstall beacon");
+        assert!(record["details"]
+            .as_str()
+            .is_some_and(|details| details.contains("install-script-network")));
+    }
+    #[test]
+    fn scanner_policy_defaults_are_disabled() {
+        let p = Policy::default();
+        assert!(!p.quarantine_scanner.enabled);
+        assert_eq!(p.quarantine_scanner.review_score, 4);
+        assert_eq!(p.quarantine_scanner.block_score, 8);
     }
     #[test]
     fn classifies_image_references() {

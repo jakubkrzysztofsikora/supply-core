@@ -108,9 +108,31 @@ pub fn package_version_from_metadata(
     })
 }
 
+pub fn has_provenance(metadata: &serde_json::Value, version: &str) -> bool {
+    metadata
+        .get("versions")
+        .and_then(|versions| versions.get(version))
+        .and_then(|entry| entry.get("dist"))
+        .and_then(|dist| dist.get("attestations"))
+        .is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn detects_provenance_attestations() {
+        let with = serde_json::json!({
+            "versions": {"1.2.3": {"dist": {"attestations": {
+                "url": "https://registry.npmjs.org/-/npm/v1/attestations/x@1.2.3",
+                "provenance": {"predicateType": "https://slsa.dev/provenance/v1"}}}}}
+        });
+        let without =
+            serde_json::json!({"versions": {"1.2.3": {"dist": {"integrity": "sha512-x"}}}});
+        assert!(has_provenance(&with, "1.2.3"));
+        assert!(!has_provenance(&without, "1.2.3"));
+        assert!(!has_provenance(&with, "9.9.9"));
+    }
     #[test]
     fn rewrites() {
         let v = serde_json::json!({"name":"left-pad","versions":{"1.0.0":{"dist":{"tarball":"https://x"}}}});

@@ -33,6 +33,22 @@ pub trait MetadataStore: Send + Sync {
     fn latest_frozen(&self, ecosystem: &Ecosystem, name: &str) -> Result<Option<FrozenArtifact>> {
         self.latest_frozen_satisfying(ecosystem, name, None)
     }
+    fn save_content_finding(&self, finding: &ContentFinding) -> Result<()>;
+    fn content_finding(
+        &self,
+        ecosystem: &Ecosystem,
+        name: &str,
+        version: &Version,
+    ) -> Result<Option<ContentFinding>>;
+}
+pub trait ContentScanner: Send + Sync {
+    fn scan_archive(
+        &self,
+        ecosystem: &Ecosystem,
+        archive: &Path,
+        name: &str,
+        version: &Version,
+    ) -> Result<Option<ContentFinding>>;
 }
 pub trait ArtifactStore: Send + Sync {
     fn put(&self, name: &str, version: &Version, bytes: &[u8]) -> Result<String>;

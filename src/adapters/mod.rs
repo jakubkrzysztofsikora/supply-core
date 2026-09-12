@@ -1,4 +1,5 @@
 pub mod azure_devops;
+pub mod command_scanner;
 pub mod config;
 pub mod crypto;
 pub mod github;

@@ -130,7 +130,35 @@ Guardrails before any automated submission:
 5. Rate-limit submissions to avoid burning bridges with a noisy false-positive
    stream; fix rules before resubmitting.
 
-## Integration plan (TDD slices)
+## Implementation status (2026-09-12)
+
+1. **Policy + finding model** — done. `Policy.quarantine_scanner`
+   (`enabled=false`, `review_score=4`, `block_score=8`) and
+   `ContentFinding`; the evaluator blocks at/above `block_score`, warns on
+   `review_score`, and re-checks frozen fallback candidates.
+2. **Finding store** — done for the in-memory store (`save_content_finding`
+   / `content_finding`); file-backed persistence is pending.
+3. **Static correlation scanner** — done (`application::scanner`):
+   capability + threat correlation per file, install-script network/pipe
+   rules, cross-file install-script chain, benign build tooling stays clean
+   (fixture-tested).
+4. **External scanner adapter** — done (`adapters::command_scanner`):
+   runs a configured command against the archive and parses a normalized
+   `{"score","rules","summary"}` report; GuardDog can be wrapped by a script
+   emitting that shape. A first-class GuardDog parser lands once we can pin
+   its output schema against a real install.
+5. **Provenance** — helper done (`has_provenance`, npm `dist.attestations`);
+   score integration pending.
+6. **Version diff** — done (`diff_package_files`, `scan_version_diff`):
+   newly introduced lifecycle scripts score 9 with rule `new-install-script`.
+7. **OSV export + CLI** — done: `ContentFinding::to_osv()` and
+   `supply report <findings.json> [--submit]` (prints OSV records plus the
+   manual disclosure checklist).
+8. **Submission** — manual gate by design: the CLI emits the checklist;
+   automated registry/OpenSSF submission stays out until the false-positive
+   rate is measured on real releases.
+
+## Original plan
 
 1. `Policy.quarantine_scanner` + `ContentFinding` domain type + evaluator test
    matrix (block/fallback/deny interactions).

@@ -5,6 +5,8 @@ use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+pub mod scanner;
+
 pub struct PackageEvaluator<'a> {
     pub policy: &'a Policy,
     pub clock: &'a dyn Clock,
@@ -67,6 +69,35 @@ impl<'a> PackageEvaluator<'a> {
                 "package version is missing integrity",
             );
         }
+        let mut review_warning = None;
+        if self.policy.quarantine_scanner.enabled {
+            if let Some(finding) =
+                self.metadata
+                    .content_finding(&ecosystem, name, &version.version)?
+            {
+                if finding.score >= self.policy.quarantine_scanner.block_score {
+                    return self.fallback_or_block(
+                        &ecosystem,
+                        name,
+                        &version.version,
+                        requested,
+                        format!(
+                            "content scan: {} [{}]",
+                            finding.summary,
+                            finding.rules.join(", ")
+                        ),
+                    );
+                }
+                if finding.score >= self.policy.quarantine_scanner.review_score {
+                    review_warning = Some(format!(
+                        "content scan review (score {}): {} [{}]",
+                        finding.score,
+                        finding.summary,
+                        finding.rules.join(", ")
+                    ));
+                }
+            }
+        }
         let findings = self
             .vulns
             .query(ecosystem.clone(), name, &version.version)?;
@@ -86,7 +117,11 @@ impl<'a> PackageEvaluator<'a> {
                 "package version is inside quarantine window",
             );
         }
-        Ok(Decision::allow(name.clone(), version.version.to_string()))
+        let mut decision = Decision::allow(name.clone(), version.version.to_string());
+        if let Some(warning) = review_warning {
+            decision.warnings.push(warning);
+        }
+        Ok(decision)
     }
     fn vulnerability_reason(&self, findings: &[VulnerabilityFinding]) -> Option<String> {
         if self.policy.quarantine.cve_keeps_quarantined {
@@ -121,6 +156,23 @@ impl<'a> PackageEvaluator<'a> {
                             frozen.version
                         ),
                     ));
+                }
+                if self.policy.quarantine_scanner.enabled {
+                    if let Some(finding) =
+                        self.metadata
+                            .content_finding(ecosystem, name, &frozen.version)?
+                    {
+                        if finding.score >= self.policy.quarantine_scanner.block_score {
+                            return Ok(Decision::block(
+                                name,
+                                Some(requested_version.to_string()),
+                                format!(
+                                    "{reason}; frozen fallback {} blocked: content scan {}",
+                                    frozen.version, finding.summary
+                                ),
+                            ));
+                        }
+                    }
                 }
                 return Ok(Decision::fallback(
                     name,
@@ -817,6 +869,17 @@ mod tests {
                 .clone();
             Ok(frozen.filter(|a| a.package.ecosystem == *ecosystem && a.version == *version))
         }
+        fn save_content_finding(&self, _: &ContentFinding) -> Result<()> {
+            Ok(())
+        }
+        fn content_finding(
+            &self,
+            _: &Ecosystem,
+            _: &str,
+            _: &Version,
+        ) -> Result<Option<ContentFinding>> {
+            Ok(None)
+        }
         fn put_frozen(&self, _: FrozenArtifact) -> Result<()> {
             Ok(())
         }
@@ -1157,6 +1220,166 @@ mod tests {
         let d = e.evaluate(&pv, None)?;
         assert_eq!(d.status, DecisionStatus::Block);
         assert!(d.reasons[0].contains("GHSA-pip"));
+        Ok(())
+    }
+    fn finding(score: u8) -> ContentFinding {
+        ContentFinding {
+            ecosystem: Ecosystem::Npm,
+            package: "left-pad".into(),
+            version: Version::parse("2.0.0").unwrap(),
+            source: "static-heuristics".into(),
+            score,
+            rules: vec!["install-script-network".into()],
+            summary: "postinstall script posts environment to a webhook".into(),
+        }
+    }
+    struct FindingM {
+        frozen: Mutex<Option<FrozenArtifact>>,
+        finding: Mutex<Option<ContentFinding>>,
+    }
+    impl MetadataStore for FindingM {
+        fn save_decision(&self, _: &Decision) -> Result<()> {
+            Ok(())
+        }
+        fn put_frozen(&self, _: FrozenArtifact) -> Result<()> {
+            Ok(())
+        }
+        fn latest_frozen_satisfying(
+            &self,
+            ecosystem: &Ecosystem,
+            _: &str,
+            requested: Option<&VersionReq>,
+        ) -> Result<Option<FrozenArtifact>> {
+            let frozen = self
+                .frozen
+                .lock()
+                .map_err(|_| anyhow::anyhow!("lock poisoned"))?
+                .clone();
+            Ok(frozen.filter(|a| {
+                a.package.ecosystem == *ecosystem && requested.is_none_or(|r| r.matches(&a.version))
+            }))
+        }
+        fn get_frozen(
+            &self,
+            ecosystem: &Ecosystem,
+            _: &str,
+            version: &Version,
+        ) -> Result<Option<FrozenArtifact>> {
+            let frozen = self
+                .frozen
+                .lock()
+                .map_err(|_| anyhow::anyhow!("lock poisoned"))?
+                .clone();
+            Ok(frozen.filter(|a| a.package.ecosystem == *ecosystem && a.version == *version))
+        }
+        fn save_content_finding(&self, finding: &ContentFinding) -> Result<()> {
+            *self
+                .finding
+                .lock()
+                .map_err(|_| anyhow::anyhow!("lock poisoned"))? = Some(finding.clone());
+            Ok(())
+        }
+        fn content_finding(
+            &self,
+            ecosystem: &Ecosystem,
+            _: &str,
+            version: &Version,
+        ) -> Result<Option<ContentFinding>> {
+            let finding = self
+                .finding
+                .lock()
+                .map_err(|_| anyhow::anyhow!("lock poisoned"))?
+                .clone();
+            Ok(finding.filter(|f| f.ecosystem == *ecosystem && f.version == *version))
+        }
+    }
+    #[test]
+    fn content_finding_blocks_high_score_when_scanner_enabled() -> Result<()> {
+        let now = Utc::now();
+        let mut p = Policy::default();
+        p.quarantine_scanner.enabled = true;
+        let c = FixedClock(now);
+        let m = FindingM {
+            frozen: Mutex::new(None),
+            finding: Mutex::new(Some(finding(9))),
+        };
+        let e = PackageEvaluator {
+            policy: &p,
+            clock: &c,
+            vulns: &NoVulns,
+            metadata: &m,
+        };
+        let d = e.evaluate(&package(Some(now - Duration::days(30))), None)?;
+        assert_eq!(d.status, DecisionStatus::Block);
+        assert!(d.reasons[0].contains("content scan"), "{:?}", d.reasons);
+        assert!(d.reasons[0].contains("install-script-network"));
+        Ok(())
+    }
+    #[test]
+    fn content_finding_is_ignored_when_scanner_disabled() -> Result<()> {
+        let now = Utc::now();
+        let p = Policy::default();
+        let c = FixedClock(now);
+        let m = FindingM {
+            frozen: Mutex::new(None),
+            finding: Mutex::new(Some(finding(9))),
+        };
+        let e = PackageEvaluator {
+            policy: &p,
+            clock: &c,
+            vulns: &NoVulns,
+            metadata: &m,
+        };
+        let d = e.evaluate(&package(Some(now - Duration::days(30))), None)?;
+        assert_eq!(d.status, DecisionStatus::Allow);
+        Ok(())
+    }
+    #[test]
+    fn content_finding_review_score_warns_but_allows() -> Result<()> {
+        let now = Utc::now();
+        let mut p = Policy::default();
+        p.quarantine_scanner.enabled = true;
+        let c = FixedClock(now);
+        let m = FindingM {
+            frozen: Mutex::new(None),
+            finding: Mutex::new(Some(finding(5))),
+        };
+        let e = PackageEvaluator {
+            policy: &p,
+            clock: &c,
+            vulns: &NoVulns,
+            metadata: &m,
+        };
+        let d = e.evaluate(&package(Some(now - Duration::days(30))), None)?;
+        assert_eq!(d.status, DecisionStatus::Allow);
+        assert!(
+            d.warnings.iter().any(|warning| warning.contains("review")),
+            "{:?}",
+            d.warnings
+        );
+        Ok(())
+    }
+    #[test]
+    fn content_finding_blocks_frozen_fallback() -> Result<()> {
+        let now = Utc::now();
+        let mut p = Policy::default();
+        p.quarantine_scanner.enabled = true;
+        let c = FixedClock(now);
+        let mut frozen_finding = finding(9);
+        frozen_finding.version = Version::parse("1.0.0").unwrap();
+        let m = FindingM {
+            frozen: Mutex::new(Some(frozen("1.0.0"))),
+            finding: Mutex::new(Some(frozen_finding)),
+        };
+        let e = PackageEvaluator {
+            policy: &p,
+            clock: &c,
+            vulns: &NoVulns,
+            metadata: &m,
+        };
+        let d = e.evaluate(&package(Some(now - Duration::days(2))), None)?;
+        assert_eq!(d.status, DecisionStatus::Block);
+        assert!(d.reasons[0].contains("frozen fallback"), "{:?}", d.reasons);
         Ok(())
     }
     #[test]
