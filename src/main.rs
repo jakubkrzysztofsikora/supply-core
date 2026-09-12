@@ -14,7 +14,7 @@ use supply_core::{
         storage::MemoryMetadataStore,
     },
     application::{AzurePipelinesScanner, DockerScanner, GitHubActionsScanner, PackageEvaluator},
-    ports::{UpstreamNuGetRegistry, UpstreamPyPiRegistry},
+    ports::{ContentScanner, MetadataStore, UpstreamNuGetRegistry, UpstreamPyPiRegistry},
 };
 
 #[derive(Parser)]
@@ -84,6 +84,9 @@ enum Command {
         /// `$HOME/.local/share/supply-core/osv-cache`.
         #[arg(long)]
         osv_cache: Option<PathBuf>,
+        /// JSONL file of content findings to enforce while evaluating.
+        #[arg(long)]
+        findings: Option<PathBuf>,
     },
     /// Snapshot exact pins from requirements.txt against PyPI: publish
     /// age, sha256, policy decision.
@@ -115,6 +118,24 @@ enum Command {
         /// `$HOME/.local/share/supply-core/osv-cache`.
         #[arg(long)]
         osv_cache: Option<PathBuf>,
+    },
+    /// Record content findings for a package archive so later evaluations
+    /// can block it.
+    ScanPackage {
+        /// Ecosystem: npm or pypi.
+        ecosystem: String,
+        archive: PathBuf,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        version: String,
+        /// Optional external scanner command that prints a normalized
+        /// `{"score","rules","summary"}` JSON report.
+        #[arg(long)]
+        external: Option<PathBuf>,
+        /// Append the finding as JSONL to this file for later evaluation.
+        #[arg(long)]
+        findings_out: Option<PathBuf>,
     },
     /// Emit OSV records for stored content findings (dry run by default).
     Report {
@@ -227,11 +248,14 @@ async fn main() -> Result<()> {
             policy,
             osv,
             osv_cache,
+            findings,
         } => {
             let p = load_policy(policy.as_deref())?;
-            tokio::task::spawn_blocking(move || snapshot_npm(&root, &p, osv, osv_cache.as_deref()))
-                .await
-                .map_err(|e| anyhow::anyhow!("snapshot task failed: {e}"))??;
+            tokio::task::spawn_blocking(move || {
+                snapshot_npm(&root, &p, osv, osv_cache.as_deref(), findings.as_deref())
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("snapshot task failed: {e}"))??;
         }
         Command::SnapshotPip {
             root,
@@ -272,9 +296,60 @@ async fn main() -> Result<()> {
                 std::process::exit(2);
             }
         }
+        Command::ScanPackage {
+            ecosystem,
+            archive,
+            name,
+            version,
+            external,
+            findings_out,
+        } => {
+            let ecosystem = match ecosystem.as_str() {
+                "npm" => supply_core::domain::Ecosystem::Npm,
+                "pypi" | "pip" => supply_core::domain::Ecosystem::PyPi,
+                other => anyhow::bail!("unsupported ecosystem: {other}"),
+            };
+            let parsed = semver::Version::parse(&version)?;
+            let bytes = std::fs::read(&archive)?;
+            let store = MemoryMetadataStore::default();
+            let mut finding = supply_core::application::scanner::scan_archive_bytes(
+                &store, &ecosystem, &name, &parsed, &bytes,
+            )?;
+            if let Some(command) = external {
+                let scanner = supply_core::adapters::command_scanner::CommandScanner::new(
+                    command,
+                    "external-scan",
+                );
+                if let Some(external_finding) =
+                    scanner.scan_archive(&ecosystem, &archive, &name, &parsed)?
+                {
+                    store.save_content_finding(&external_finding)?;
+                    let better = finding
+                        .as_ref()
+                        .is_none_or(|current| external_finding.score > current.score);
+                    if better {
+                        finding = Some(external_finding);
+                    }
+                }
+            }
+            match &finding {
+                Some(finding) => {
+                    println!("{}", serde_json::to_string_pretty(finding)?);
+                    if let Some(path) = findings_out {
+                        use std::io::Write;
+                        let mut file = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&path)?;
+                        writeln!(file, "{}", serde_json::to_string(finding)?)?;
+                    }
+                }
+                None => println!("no content finding for {name}@{version}"),
+            }
+        }
         Command::Report { findings, submit } => {
             let content = std::fs::read_to_string(&findings)?;
-            let stored: Vec<supply_core::domain::ContentFinding> = serde_json::from_str(&content)?;
+            let stored = parse_findings(&content)?;
             let records: Vec<serde_json::Value> =
                 stored.iter().map(|finding| finding.to_osv()).collect();
             println!("{}", serde_json::to_string_pretty(&records)?);
@@ -294,11 +369,31 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn parse_findings(content: &str) -> Result<Vec<supply_core::domain::ContentFinding>> {
+    if content.trim_start().starts_with('[') {
+        return Ok(serde_json::from_str(content)?);
+    }
+    content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).map_err(Into::into))
+        .collect()
+}
+
+fn load_findings(store: &MemoryMetadataStore, path: &std::path::Path) -> Result<()> {
+    let content = std::fs::read_to_string(path)?;
+    for finding in parse_findings(&content)? {
+        store.save_content_finding(&finding)?;
+    }
+    Ok(())
+}
+
 fn snapshot_npm(
     root: &std::path::Path,
     policy: &supply_core::domain::Policy,
     use_osv: bool,
     osv_cache: Option<&std::path::Path>,
+    findings: Option<&std::path::Path>,
 ) -> Result<()> {
     use supply_core::adapters::npm::package_version_from_metadata;
     use supply_core::domain::PackageVersion;
@@ -318,6 +413,9 @@ fn snapshot_npm(
 
     let registry = HttpNpmRegistry::new()?;
     let store = MemoryMetadataStore::default();
+    if let Some(path) = findings {
+        load_findings(&store, path)?;
+    }
     let now = chrono::Utc::now();
     let mut entries = vec![];
     let mut errors = vec![];
@@ -582,6 +680,14 @@ mod cli_tests {
     use super::*;
 
     #[test]
+    fn parses_findings_array_and_jsonl() -> Result<()> {
+        let one = r#"{"ecosystem":"Npm","package":"a","version":"1.0.0","source":"s","score":9,"rules":[],"summary":"x"}"#;
+        assert_eq!(parse_findings(&format!("[{one}]"))?.len(), 1);
+        assert_eq!(parse_findings(one)?.len(), 1);
+        assert_eq!(parse_findings(&format!("{one}\n{one}"))?.len(), 2);
+        Ok(())
+    }
+    #[test]
     fn version_flag_is_supported() {
         match Cli::try_parse_from(["supply", "--version"]) {
             Ok(_) => panic!("--version must not parse as a subcommand"),
@@ -601,6 +707,17 @@ mod cli_tests {
         ));
         let cli = Cli::try_parse_from(["supply", "report", "findings.json", "--submit"])?;
         assert!(matches!(cli.command, Command::Report { submit: true, .. }));
+        let cli = Cli::try_parse_from([
+            "supply",
+            "scan-package",
+            "npm",
+            "evil.tgz",
+            "--name",
+            "evil",
+            "--version",
+            "1.2.3",
+        ])?;
+        assert!(matches!(cli.command, Command::ScanPackage { .. }));
         Ok(())
     }
     #[test]

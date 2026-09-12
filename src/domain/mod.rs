@@ -236,6 +236,10 @@ impl Default for DockerPolicy {
     }
 }
 
+fn default_detected_at() -> chrono::DateTime<chrono::Utc> {
+    chrono::Utc::now()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentFinding {
     pub ecosystem: Ecosystem,
@@ -245,6 +249,8 @@ pub struct ContentFinding {
     pub score: u8,
     pub rules: Vec<String>,
     pub summary: String,
+    #[serde(default = "default_detected_at")]
+    pub detected_at: chrono::DateTime<chrono::Utc>,
 }
 impl ContentFinding {
     /// OSV-shaped record, ready to attach to an `ossf/malicious-packages`
@@ -274,6 +280,7 @@ impl ContentFinding {
                 sanitized(&self.package),
                 sanitized(&self.version.to_string())
             ),
+            "modified": self.detected_at.to_rfc3339(),
             "summary": self.summary,
             "details": format!(
                 "rules: {}; source: {}",
@@ -611,9 +618,16 @@ mod tests {
             score: 9,
             rules: vec!["install-script-network".into()],
             summary: "postinstall beacon".into(),
+            detected_at: chrono::Utc::now(),
         };
         let record = finding.to_osv();
         assert_eq!(record["id"], "SUPPLY-EVIL-PKG-1-2-3");
+        assert!(
+            record["modified"]
+                .as_str()
+                .is_some_and(|modified| modified.contains('T')),
+            "OSV records need an RFC3339 modified timestamp"
+        );
         assert_eq!(record["affected"][0]["package"]["ecosystem"], "npm");
         assert_eq!(record["affected"][0]["package"]["name"], "evil-pkg");
         assert_eq!(record["affected"][0]["versions"][0], "1.2.3");

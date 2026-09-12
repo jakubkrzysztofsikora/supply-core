@@ -130,7 +130,8 @@ impl MetadataStore for MemoryMetadataStore {
         findings.retain(|existing| {
             !(existing.package == finding.package
                 && existing.ecosystem == finding.ecosystem
-                && existing.version == finding.version)
+                && existing.version == finding.version
+                && existing.source == finding.source)
         });
         findings.push(finding.clone());
         Ok(())
@@ -147,11 +148,12 @@ impl MetadataStore for MemoryMetadataStore {
             .lock()
             .map_err(|_| anyhow::anyhow!("lock poisoned"))?
             .iter()
-            .find(|finding| {
+            .filter(|finding| {
                 finding.ecosystem == *ecosystem
                     && finding.package == name
                     && finding.version == *version
             })
+            .max_by_key(|finding| finding.score)
             .cloned())
     }
 
@@ -210,6 +212,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn findings_from_multiple_sources_keep_the_highest_score() {
+        let store = MemoryMetadataStore::default();
+        let finding = |source: &str, score: u8| ContentFinding {
+            ecosystem: Ecosystem::Npm,
+            package: "evil".to_string(),
+            version: Version::parse("1.0.0").unwrap(),
+            source: source.to_string(),
+            score,
+            rules: vec![],
+            summary: source.to_string(),
+            detected_at: chrono::Utc::now(),
+        };
+        store
+            .save_content_finding(&finding("static-heuristics", 9))
+            .unwrap();
+        store.save_content_finding(&finding("guarddog", 1)).unwrap();
+        let stored = store
+            .content_finding(&Ecosystem::Npm, "evil", &Version::parse("1.0.0").unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.score, 9,
+            "a later low score must not weaken enforcement"
+        );
+
+        let store = MemoryMetadataStore::default();
+        store.save_content_finding(&finding("guarddog", 1)).unwrap();
+        store
+            .save_content_finding(&finding("static-heuristics", 9))
+            .unwrap();
+        let stored = store
+            .content_finding(&Ecosystem::Npm, "evil", &Version::parse("1.0.0").unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.score, 9);
+    }
+    #[test]
     fn content_findings_round_trip_and_replace() {
         let store = MemoryMetadataStore::default();
         assert!(store
@@ -228,6 +267,7 @@ mod tests {
             score,
             rules: vec!["install-script-network".to_string()],
             summary: summary.to_string(),
+            detected_at: chrono::Utc::now(),
         };
         store.save_content_finding(&finding(5, "first")).unwrap();
         let stored = store

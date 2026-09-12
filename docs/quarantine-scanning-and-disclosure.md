@@ -132,6 +132,13 @@ Guardrails before any automated submission:
 
 ## Implementation status (2026-09-12)
 
+0. **Wired path** — `supply scan-package <eco> <archive> --name --version
+   [--external <cmd>] [--findings-out <jsonl>]` extracts the archive
+   (file/size/traversal-limited), runs the static scanner and the optional
+   external scanner, and persists findings. `snapshot-npm --findings
+   <jsonl>` loads them into the evaluator, where `quarantine_scanner.enabled`
+   turns them into blocks/fallback. The scanner→store→evaluator chain is
+   covered by a fixture-archive test.
 1. **Policy + finding model** — done. `Policy.quarantine_scanner`
    (`enabled=false`, `review_score=4`, `block_score=8`) and
    `ContentFinding`; the evaluator blocks at/above `block_score`, warns on
