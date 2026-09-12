@@ -213,20 +213,34 @@ mod tests {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
 
+    /// Writes a shell body file. The file is handed to `sh` by the stable
+    /// dispatcher below and is never executed directly, so a fresh write can
+    /// never race `execve` into ETXTBSY on parallel Linux test threads.
     fn script(body: &str) -> (tempfile::TempDir, PathBuf) {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("scanner.sh");
-        let staging = directory.path().join("scanner.sh.staging");
-        {
-            let mut file = std::fs::File::create(&staging).unwrap();
-            write!(file, "#!/bin/sh\n{body}\n").unwrap();
-            file.sync_all().unwrap();
-        }
-        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // Rename into place so the executed path is never open for writing,
-        // which can otherwise race into ETXTBSY on Linux runners.
-        std::fs::rename(&staging, &path).unwrap();
+        let path = directory.path().join("case.sh");
+        let mut file = std::fs::File::create(&path).unwrap();
+        write!(file, "{body}\n").unwrap();
+        file.sync_all().unwrap();
         (directory, path)
+    }
+
+    /// One executable script per test binary (created once, never rewritten)
+    /// that runs the body file passed as the second argument.
+    fn dispatcher() -> PathBuf {
+        static DISPATCHER: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        DISPATCHER
+            .get_or_init(|| {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("dispatcher.sh");
+                let mut file = std::fs::File::create(&path).unwrap();
+                write!(file, "#!/bin/sh\nexec /bin/sh \"$2\"\n").unwrap();
+                file.sync_all().unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+                std::mem::forget(directory);
+                path
+            })
+            .clone()
     }
 
     fn version() -> Version {
@@ -240,14 +254,9 @@ mod tests {
 {"score": 9, "rules": ["install-script-network"], "summary": "postinstall beacon"}
 EOF"#,
         );
-        let scanner = CommandScanner::new(path, "guarddog");
+        let scanner = CommandScanner::new(dispatcher(), "guarddog");
         let finding = scanner
-            .scan_archive(
-                &Ecosystem::Npm,
-                Path::new("/tmp/archive.tgz"),
-                "evil",
-                &version(),
-            )
+            .scan_archive(&Ecosystem::Npm, &path, "evil", &version())
             .unwrap()
             .unwrap();
         assert_eq!(finding.score, 9);
@@ -264,14 +273,9 @@ EOF"#,
 {"score": 0, "rules": [], "summary": ""}
 EOF"#,
         );
-        let scanner = CommandScanner::new(path, "guarddog");
+        let scanner = CommandScanner::new(dispatcher(), "guarddog");
         let finding = scanner
-            .scan_archive(
-                &Ecosystem::Npm,
-                Path::new("/tmp/a.tgz"),
-                "clean",
-                &version(),
-            )
+            .scan_archive(&Ecosystem::Npm, &path, "clean", &version())
             .unwrap();
         assert!(finding.is_none());
     }
@@ -283,9 +287,9 @@ EOF"#,
 {"score": 42, "rules": ["x"], "summary": "over"}
 EOF"#,
         );
-        let scanner = CommandScanner::new(path, "guarddog");
+        let scanner = CommandScanner::new(dispatcher(), "guarddog");
         let finding = scanner
-            .scan_archive(&Ecosystem::Npm, Path::new("/tmp/a.tgz"), "odd", &version())
+            .scan_archive(&Ecosystem::Npm, &path, "odd", &version())
             .unwrap()
             .unwrap();
         assert_eq!(finding.score, 10);
@@ -294,9 +298,9 @@ EOF"#,
     #[test]
     fn invalid_json_is_an_error() {
         let (_directory, path) = script("echo not-json");
-        let scanner = CommandScanner::new(path, "guarddog");
+        let scanner = CommandScanner::new(dispatcher(), "guarddog");
         assert!(scanner
-            .scan_archive(&Ecosystem::Npm, Path::new("/tmp/a.tgz"), "odd", &version())
+            .scan_archive(&Ecosystem::Npm, &path, "odd", &version())
             .is_err());
     }
 
@@ -308,10 +312,10 @@ EOF"#,
         let (_directory, path) = script(
             "(sleep 1; echo '{\"score\":0,\"rules\":[],\"summary\":\"\"}') 2>/dev/null & (sleep 2.4; echo x 1>&2) 1>/dev/null & exit 0",
         );
-        let scanner = CommandScanner::new(path, "guarddog")
+        let scanner = CommandScanner::new(dispatcher(), "guarddog")
             .with_limits(std::time::Duration::from_secs(30), 1024 * 1024);
         let error = scanner
-            .scan_archive(&Ecosystem::Npm, Path::new("/tmp/a.tgz"), "odd", &version())
+            .scan_archive(&Ecosystem::Npm, &path, "odd", &version())
             .unwrap_err()
             .to_string();
         assert!(error.contains("timed out"), "{error}");
@@ -320,11 +324,11 @@ EOF"#,
     #[test]
     fn background_pipe_holder_cannot_hang_the_scan() {
         let (_directory, path) = script("sleep 300 & exit 0");
-        let scanner = CommandScanner::new(path, "guarddog")
+        let scanner = CommandScanner::new(dispatcher(), "guarddog")
             .with_limits(std::time::Duration::from_secs(30), 1024 * 1024);
         let started = std::time::Instant::now();
         let error = scanner
-            .scan_archive(&Ecosystem::Npm, Path::new("/tmp/a.tgz"), "odd", &version())
+            .scan_archive(&Ecosystem::Npm, &path, "odd", &version())
             .unwrap_err()
             .to_string();
         assert!(error.contains("timed out"), "{error}");
@@ -338,10 +342,10 @@ EOF"#,
     #[test]
     fn timeout_kills_a_hung_scanner() {
         let (_directory, path) = script("sleep 5");
-        let scanner = CommandScanner::new(path, "guarddog")
+        let scanner = CommandScanner::new(dispatcher(), "guarddog")
             .with_limits(std::time::Duration::from_millis(250), 1024 * 1024);
         let error = scanner
-            .scan_archive(&Ecosystem::Npm, Path::new("/tmp/a.tgz"), "odd", &version())
+            .scan_archive(&Ecosystem::Npm, &path, "odd", &version())
             .unwrap_err()
             .to_string();
         assert!(error.contains("timed out"), "{error}");
@@ -350,10 +354,10 @@ EOF"#,
     #[test]
     fn oversized_output_is_rejected() {
         let (_directory, path) = script("head -c 4096 /dev/zero | tr '\\0' 'a'");
-        let scanner = CommandScanner::new(path, "guarddog")
+        let scanner = CommandScanner::new(dispatcher(), "guarddog")
             .with_limits(std::time::Duration::from_secs(10), 1024);
         let error = scanner
-            .scan_archive(&Ecosystem::Npm, Path::new("/tmp/a.tgz"), "odd", &version())
+            .scan_archive(&Ecosystem::Npm, &path, "odd", &version())
             .unwrap_err()
             .to_string();
         assert!(error.contains("output"), "{error}");
@@ -362,9 +366,9 @@ EOF"#,
     #[test]
     fn non_zero_exit_is_an_error() {
         let (_directory, path) = script("echo boom >&2; exit 3");
-        let scanner = CommandScanner::new(path, "guarddog");
+        let scanner = CommandScanner::new(dispatcher(), "guarddog");
         let error = scanner
-            .scan_archive(&Ecosystem::Npm, Path::new("/tmp/a.tgz"), "odd", &version())
+            .scan_archive(&Ecosystem::Npm, &path, "odd", &version())
             .unwrap_err()
             .to_string();
         assert!(error.contains("exited"), "{error}");
