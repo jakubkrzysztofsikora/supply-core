@@ -1295,6 +1295,44 @@ mod tests {
         }
     }
     #[test]
+    fn pypi_content_finding_blocks_pip_evaluation() -> Result<()> {
+        use crate::adapters::storage::MemoryMetadataStore;
+        let store = MemoryMetadataStore::default();
+        store.save_content_finding(&ContentFinding {
+            ecosystem: Ecosystem::PyPi,
+            package: "evil".into(),
+            version: Version::parse("1.0.0").unwrap_or_else(|_| panic!("valid semver")),
+            source: "static-heuristics".into(),
+            score: 9,
+            rules: vec!["env-exfiltration".into()],
+            summary: "exfiltrates the environment".into(),
+            detected_at: Utc::now(),
+        })?;
+        let mut policy = Policy::default();
+        policy.quarantine_scanner.enabled = true;
+        let now = Utc::now();
+        let clock = FixedClock(now);
+        let evaluator = PackageEvaluator {
+            policy: &policy,
+            clock: &clock,
+            vulns: &NoVulns,
+            metadata: &store,
+        };
+        let pv = PackageVersion {
+            package: PackageCoordinate {
+                ecosystem: Ecosystem::PyPi,
+                name: "evil".into(),
+            },
+            version: Version::parse("1.0.0").unwrap_or_else(|_| panic!("valid semver")),
+            published_at: Some(now - Duration::days(30)),
+            integrity: Some("sha256-x".into()),
+            tarball_url: None,
+        };
+        let decision = evaluator.evaluate(&pv, None)?;
+        assert_eq!(decision.status, DecisionStatus::Block);
+        Ok(())
+    }
+    #[test]
     fn malicious_archive_blocks_through_store_and_evaluator() -> Result<()> {
         use crate::adapters::storage::MemoryMetadataStore;
         use crate::application::scanner::scan_archive_bytes;

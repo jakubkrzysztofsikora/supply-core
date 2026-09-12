@@ -49,12 +49,12 @@ pub fn extract_archive(ecosystem: &Ecosystem, bytes: &[u8]) -> Result<Vec<(Strin
         let path = archive_path(ecosystem, &raw_path)?;
         let size = entry.header().size().unwrap_or(0) as usize;
         if size > MAX_FILE_BYTES {
-            continue;
-        }
-        if total + size > MAX_TOTAL_BYTES {
-            anyhow::bail!("archive exceeds the total size limit");
+            anyhow::bail!("archive entry exceeds the per-file limit: {path}");
         }
         total += size;
+        if total > MAX_TOTAL_BYTES {
+            anyhow::bail!("archive exceeds the total size limit");
+        }
         let mut buffer = Vec::with_capacity(size.min(64 * 1024));
         entry
             .read_to_end(&mut buffer)
@@ -547,6 +547,25 @@ mod tests {
         let files = extract_archive(&Ecosystem::Npm, &bytes).unwrap();
         let paths: Vec<&str> = files.iter().map(|(path, _)| path.as_str()).collect();
         assert_eq!(paths, vec!["package.json", "index.js"]);
+    }
+
+    #[test]
+    fn oversized_entry_fails_closed() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        let payload = "a".repeat(MAX_FILE_BYTES + 1);
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(payload.len() as u64);
+        header.set_mode(0o644);
+        header.set_mtime(0);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "package/payload.js", payload.as_bytes())
+            .unwrap();
+        let bytes = builder.into_inner().unwrap().finish().unwrap();
+        assert!(extract_archive(&Ecosystem::Npm, &bytes).is_err());
     }
 
     #[test]

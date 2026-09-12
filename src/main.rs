@@ -102,6 +102,9 @@ enum Command {
         /// `$HOME/.local/share/supply-core/osv-cache`.
         #[arg(long)]
         osv_cache: Option<PathBuf>,
+        /// JSONL file of content findings to enforce while evaluating.
+        #[arg(long)]
+        findings: Option<PathBuf>,
     },
     /// Snapshot resolved packages from packages.lock.json against
     /// nuget.org: publish age, package hash, policy decision.
@@ -118,6 +121,9 @@ enum Command {
         /// `$HOME/.local/share/supply-core/osv-cache`.
         #[arg(long)]
         osv_cache: Option<PathBuf>,
+        /// JSONL file of content findings to enforce while evaluating.
+        #[arg(long)]
+        findings: Option<PathBuf>,
     },
     /// Record content findings for a package archive so later evaluations
     /// can block it.
@@ -262,21 +268,25 @@ async fn main() -> Result<()> {
             policy,
             osv,
             osv_cache,
+            findings,
         } => {
             let p = load_policy(policy.as_deref())?;
-            tokio::task::spawn_blocking(move || snapshot_pip(&root, &p, osv, osv_cache.as_deref()))
-                .await
-                .map_err(|e| anyhow::anyhow!("snapshot task failed: {e}"))??;
+            tokio::task::spawn_blocking(move || {
+                snapshot_pip(&root, &p, osv, osv_cache.as_deref(), findings.as_deref())
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("snapshot task failed: {e}"))??;
         }
         Command::SnapshotNuGet {
             root,
             policy,
             osv,
             osv_cache,
+            findings,
         } => {
             let p = load_policy(policy.as_deref())?;
             tokio::task::spawn_blocking(move || {
-                snapshot_nuget(&root, &p, osv, osv_cache.as_deref())
+                snapshot_nuget(&root, &p, osv, osv_cache.as_deref(), findings.as_deref())
             })
             .await
             .map_err(|e| anyhow::anyhow!("snapshot task failed: {e}"))??;
@@ -534,11 +544,15 @@ fn snapshot_pip(
     policy: &supply_core::domain::Policy,
     use_osv: bool,
     osv_cache: Option<&Path>,
+    findings: Option<&Path>,
 ) -> Result<()> {
     let content = std::fs::read_to_string(root.join("requirements.txt"))?;
     let (pins, gaps) = parse_requirements(&content);
     let registry = HttpPyPiRegistry::new()?;
     let store = MemoryMetadataStore::default();
+    if let Some(path) = findings {
+        load_findings(&store, path)?;
+    }
     let vulns = vulnerability_source(use_osv, osv_cache)?;
     let now = chrono::Utc::now();
     let mut entries = vec![];
@@ -606,11 +620,15 @@ fn snapshot_nuget(
     policy: &supply_core::domain::Policy,
     use_osv: bool,
     osv_cache: Option<&Path>,
+    findings: Option<&Path>,
 ) -> Result<()> {
     let content = std::fs::read_to_string(root.join("packages.lock.json"))?;
     let (pins, gaps) = parse_packages_lock(&content)?;
     let registry = HttpNuGetRegistry::new()?;
     let store = MemoryMetadataStore::default();
+    if let Some(path) = findings {
+        load_findings(&store, path)?;
+    }
     let vulns = vulnerability_source(use_osv, osv_cache)?;
     let now = chrono::Utc::now();
     let mut entries = vec![];
@@ -718,6 +736,22 @@ mod cli_tests {
             "1.2.3",
         ])?;
         assert!(matches!(cli.command, Command::ScanPackage { .. }));
+        let cli = Cli::try_parse_from([
+            "supply",
+            "snapshot-pip",
+            "dir",
+            "--findings",
+            "findings.jsonl",
+        ])?;
+        assert!(matches!(cli.command, Command::SnapshotPip { .. }));
+        let cli = Cli::try_parse_from([
+            "supply",
+            "snapshot-nuget",
+            "dir",
+            "--findings",
+            "findings.jsonl",
+        ])?;
+        assert!(matches!(cli.command, Command::SnapshotNuGet { .. }));
         Ok(())
     }
     #[test]
