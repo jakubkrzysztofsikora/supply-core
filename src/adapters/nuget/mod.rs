@@ -79,17 +79,24 @@ pub fn parse_packages_lock(content: &str) -> Result<ParsedPins> {
         for (name, details) in packages {
             match details.get("resolved").and_then(|r| r.as_str()) {
                 Some(resolved) if !resolved.is_empty() => {
-                    if !pins.iter().any(|pin| pin.name == *name) {
-                        pins.push(NuGetPin {
-                            name: name.clone(),
-                            version: resolved.to_string(),
-                            content_hash: details
-                                .get("contentHash")
-                                .and_then(|hash| hash.as_str())
-                                .filter(|hash| !hash.is_empty())
-                                .map(str::to_string),
-                        });
+                    let content_hash = details
+                        .get("contentHash")
+                        .and_then(|hash| hash.as_str())
+                        .filter(|hash| !hash.is_empty());
+                    let Some(content_hash) = content_hash else {
+                        gaps.push(format!(
+                            "target {target}: {name} is missing contentHash; not evaluated"
+                        ));
+                        continue;
+                    };
+                    if pins.iter().any(|pin| pin.name == *name) {
+                        continue;
                     }
+                    pins.push(NuGetPin {
+                        name: name.clone(),
+                        version: resolved.to_string(),
+                        content_hash: Some(content_hash.to_string()),
+                    });
                 }
                 _ => {
                     let kind = details
@@ -209,7 +216,7 @@ mod tests {
               "RangeOnly": { "type": "Direct", "requested": "[1.0.0, )" }
             },
             "net8.0/win-x64": {
-              "Newtonsoft.Json": { "type": "Direct", "resolved": "13.0.3" },
+              "Newtonsoft.Json": { "type": "Direct", "resolved": "13.0.3", "contentHash": "abc" },
               "Serilog": { "type": "Transitive", "resolved": "3.1.1" }
             }
           }
@@ -217,21 +224,34 @@ mod tests {
         let (pins, gaps) = parse_packages_lock(content)?;
         assert_eq!(
             pins,
-            vec![
-                NuGetPin {
-                    name: "Newtonsoft.Json".to_string(),
-                    version: "13.0.3".to_string(),
-                    content_hash: Some("abc".to_string()),
-                },
-                NuGetPin {
-                    name: "Serilog".to_string(),
-                    version: "3.1.1".to_string(),
-                    content_hash: None,
-                },
-            ]
+            vec![NuGetPin {
+                name: "Newtonsoft.Json".to_string(),
+                version: "13.0.3".to_string(),
+                content_hash: Some("abc".to_string()),
+            }]
         );
-        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps.len(), 2);
         assert!(gaps[0].contains("RangeOnly"));
+        assert!(gaps.iter().any(|gap| gap.contains("contentHash")));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_content_hash_in_one_target_is_a_gap() -> Result<()> {
+        let content = r#"{
+          "version": 1,
+          "dependencies": {
+            "net8.0": { "Foo": { "type": "Direct", "resolved": "1.0.0", "contentHash": "h" } },
+            "net8.0/win-x64": { "Foo": { "type": "Direct", "resolved": "1.0.0" } }
+          }
+        }"#;
+        let (pins, gaps) = parse_packages_lock(content)?;
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].content_hash.as_deref(), Some("h"));
+        assert!(
+            gaps.iter().any(|gap| gap.contains("contentHash")),
+            "an entry without a hash must be visible even when another target pinned it"
+        );
         Ok(())
     }
 
