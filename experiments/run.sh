@@ -9,6 +9,8 @@ DATA="$HERE/data"
 DAY="${1:-$(date +%Y-%m-%d)}"
 DIR="$DATA/$DAY"
 OSV_CACHE="$DATA/osv-cache"
+POLICY="$HERE/policy.yml"
+FINDINGS="$DATA/content-findings.jsonl"
 mkdir -p "$DIR"
 rm -f "$DIR"/*
 failed=0
@@ -21,8 +23,11 @@ while IFS=$'\t' read -r name root tracks; do
   case "$tracks" in
     *npm*)
       out="$DIR/$name.npm.json"
+      extra=()
+      if [ -f "$POLICY" ]; then extra+=(--policy "$POLICY"); fi
+      if [ -f "$FINDINGS" ]; then extra+=(--findings "$FINDINGS"); fi
       start=$(python3 -c 'import time; print(time.time())')
-      if "$BIN" snapshot-npm "$root" --osv --osv-cache "$OSV_CACHE" > "$out" 2>"$DIR/$name.npm.err"; then
+      if "$BIN" snapshot-npm "$root" --osv --osv-cache "$OSV_CACHE" ${extra[@]+"${extra[@]}"} > "$out" 2>"$DIR/$name.npm.err"; then
         if ! python3 - "$out" <<'PY'
 import json, sys
 doc = json.load(open(sys.argv[1]))

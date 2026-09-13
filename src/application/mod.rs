@@ -5,6 +5,7 @@ use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+pub mod ai_scanner;
 pub mod scanner;
 
 pub struct PackageEvaluator<'a> {
