@@ -15,10 +15,14 @@ The installer copies the binary and runner into a versioned directory under
 `~/.local/share/supply-core/releases`. Source edits do not change a scheduled
 evaluation until the installer is run again. The LaunchAgent runs at 08:30
 local time while the user is logged in. A second agent at 08:45 runs
-`experiments/daily-capture.sh`, which captures field-test quarantine snapshots
-and publishes them to the server configured in
-`~/.config/supply-core/status-publisher.env`. Missed calendar events during
-sleep are coalesced by launchd; this is not a system daemon for logged-out users.
+`experiments/daily-capture.sh`, which captures field-test quarantine snapshots,
+content-scans the held versions (GuardDog plus the static AI/agent rules), and
+publishes the snapshot (quarantine holds, confirmed advisories, suspected scan
+findings) to the server configured in
+`~/.config/supply-core/status-publisher.env`. The server renders it as JSON
+(`/api/v1/status`) and as the status card (`/api/v1/status/card.svg`). Missed
+calendar events during sleep are coalesced by launchd; this is not a system
+daemon for logged-out users.
 
 Configuration: `~/.local/share/supply-core/config.json`. `roots` lists discovery
 roots, `workers` bounds repository concurrency (default 4), and `binary` pins

@@ -113,9 +113,33 @@ struct QuarantinedPackage {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+struct ConfirmedFinding {
+    name: String,
+    version: String,
+    #[serde(default)]
+    advisory: String,
+    #[serde(default)]
+    severity: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+struct SuspectedFinding {
+    name: String,
+    version: String,
+    #[serde(default)]
+    score: u8,
+    #[serde(default)]
+    rules: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 struct QuarantineSnapshot {
     captured_at: String,
     packages: Vec<QuarantinedPackage>,
+    #[serde(default)]
+    confirmed: Vec<ConfirmedFinding>,
+    #[serde(default)]
+    suspected: Vec<SuspectedFinding>,
 }
 
 pub fn app() -> Router {
@@ -131,6 +155,7 @@ pub fn app_with_config(config: ServerConfig) -> Router {
         .route("/api/v1/health", get(detailed_health))
         .route("/api/v1/status", get(public_status))
         .route("/api/v1/status/quarantine", put(publish_quarantine_status))
+        .route("/api/v1/status/card.svg", get(status_card))
         .route("/api/v1/version", get(version_info))
         .route("/api/v1/download/:artifact", get(download_artifact))
         .route("/api/v1/scan/pipelines", post(scan_azure_pipelines))
@@ -187,9 +212,163 @@ async fn public_status(State(state): State<Arc<ServerConfig>>) -> Json<Value> {
             "enabled": true,
             "minimum_age_days": 7,
             "captured_at": snapshot.as_ref().map(|snapshot| &snapshot.captured_at),
-            "packages": snapshot.map(|snapshot| snapshot.packages).unwrap_or_default()
+            "packages": snapshot.as_ref().map(|snapshot| snapshot.packages.clone()).unwrap_or_default(),
+            "confirmed": snapshot.as_ref().map(|snapshot| snapshot.confirmed.clone()).unwrap_or_default(),
+            "suspected": snapshot.as_ref().map(|snapshot| snapshot.suspected.clone()).unwrap_or_default()
         }
     }))
+}
+
+const CARD_FONT: &str = "ui-monospace,SFMono-Regular,Menlo,monospace";
+const CARD_MAX_ROWS: usize = 8;
+
+fn xml_escape(raw: &str) -> String {
+    raw.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn card_section<T>(items: &[T], format_row: impl Fn(&T) -> String) -> (Vec<String>, usize) {
+    let mut lines: Vec<String> = items.iter().take(CARD_MAX_ROWS).map(format_row).collect();
+    let hidden = items.len().saturating_sub(lines.len());
+    if lines.is_empty() {
+        lines.push("(none captured yet)".to_string());
+    }
+    (lines, hidden)
+}
+
+/// Dynamic SVG listing quarantined, confirmed-CVE and scan-suspected packages.
+fn render_status_card(snapshot: Option<&QuarantineSnapshot>) -> String {
+    let empty_packages: Vec<QuarantinedPackage> = Vec::new();
+    let empty_confirmed: Vec<ConfirmedFinding> = Vec::new();
+    let empty_suspected: Vec<SuspectedFinding> = Vec::new();
+    let packages = snapshot
+        .map(|snapshot| &snapshot.packages)
+        .unwrap_or(&empty_packages);
+    let confirmed = snapshot
+        .map(|snapshot| &snapshot.confirmed)
+        .unwrap_or(&empty_confirmed);
+    let suspected = snapshot
+        .map(|snapshot| &snapshot.suspected)
+        .unwrap_or(&empty_suspected);
+    let captured_at = snapshot
+        .map(|snapshot| snapshot.captured_at.as_str())
+        .unwrap_or("no snapshot yet");
+
+    let (quarantine_lines, quarantine_hidden) = card_section(packages, |package| {
+        format!(
+            "{}@{} · {}d",
+            package.name, package.version, package.age_days
+        )
+    });
+    let (confirmed_lines, confirmed_hidden) = card_section(confirmed, |finding| {
+        let severity = if finding.severity.is_empty() {
+            String::new()
+        } else {
+            format!("{} ", finding.severity)
+        };
+        format!(
+            "{}@{} · {}{}",
+            finding.name, finding.version, severity, finding.advisory
+        )
+    });
+    let (suspected_lines, suspected_hidden) = card_section(suspected, |finding| {
+        let rules: Vec<&str> = finding.rules.iter().take(2).map(String::as_str).collect();
+        let suffix = if rules.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", rules.join(", "))
+        };
+        format!(
+            "{}@{} · score {}{}",
+            finding.name, finding.version, finding.score, suffix
+        )
+    });
+
+    let sections: [(&str, &str, &Vec<String>, usize, usize); 3] = [
+        (
+            "#58a6ff",
+            "QUARANTINED",
+            &quarantine_lines,
+            quarantine_hidden,
+            packages.len(),
+        ),
+        (
+            "#f85149",
+            "CONFIRMED CVE",
+            &confirmed_lines,
+            confirmed_hidden,
+            confirmed.len(),
+        ),
+        (
+            "#d29922",
+            "SUSPECTED (SCAN)",
+            &suspected_lines,
+            suspected_hidden,
+            suspected.len(),
+        ),
+    ];
+    let rows = sections
+        .iter()
+        .map(|(_, _, lines, hidden, _)| lines.len() + usize::from(*hidden > 0))
+        .max()
+        .unwrap_or(1);
+    let height = 130 + rows * 22 + 20;
+
+    let mut svg = String::new();
+    svg.push_str(&format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"900\" height=\"{height}\" viewBox=\"0 0 900 {height}\" role=\"img\" aria-label=\"supply-core package status\">"
+    ));
+    svg.push_str(&format!(
+        "<rect width=\"900\" height=\"{height}\" rx=\"14\" fill=\"#0d1117\"/>"
+    ));
+    svg.push_str(&format!(
+        "<text x=\"24\" y=\"40\" fill=\"#f0f6fc\" font-family=\"{CARD_FONT}\" font-size=\"19\" font-weight=\"700\">supply-core · package status</text>"
+    ));
+    svg.push_str(&format!(
+        "<text x=\"876\" y=\"40\" text-anchor=\"end\" fill=\"#8b949e\" font-family=\"{CARD_FONT}\" font-size=\"12\">{}</text>",
+        xml_escape(captured_at)
+    ));
+
+    for (index, (color, title, lines, hidden, total)) in sections.iter().enumerate() {
+        let x = 24 + index * 292;
+        svg.push_str(&format!(
+            "<text x=\"{x}\" y=\"78\" fill=\"{color}\" font-family=\"{CARD_FONT}\" font-size=\"13\" font-weight=\"700\">{title} ({total})</text>"
+        ));
+        let mut row = 0usize;
+        for line in lines.iter() {
+            let y = 104 + row * 22;
+            svg.push_str(&format!(
+                "<text x=\"{x}\" y=\"{y}\" fill=\"#c9d1d9\" font-family=\"{CARD_FONT}\" font-size=\"13\">{}</text>",
+                xml_escape(line)
+            ));
+            row += 1;
+        }
+        if *hidden > 0 {
+            let y = 104 + row * 22;
+            svg.push_str(&format!(
+                "<text x=\"{x}\" y=\"{y}\" fill=\"#8b949e\" font-family=\"{CARD_FONT}\" font-size=\"13\">+{hidden} more</text>"
+            ));
+        }
+    }
+    svg.push_str("</svg>");
+    svg
+}
+
+async fn status_card(State(state): State<Arc<ServerConfig>>) -> Response {
+    let snapshot = read_quarantine_snapshot(state.status_file.as_deref())
+        .ok()
+        .flatten();
+    (
+        [
+            (header::CONTENT_TYPE, "image/svg+xml; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=300"),
+        ],
+        render_status_card(snapshot.as_ref()),
+    )
+        .into_response()
 }
 
 async fn publish_quarantine_status(
@@ -225,7 +404,22 @@ fn validate_quarantine_snapshot(
                 && package.age_days >= 0
                 && matches!(package.status.as_str(), "Block" | "Fallback")
         });
-    if valid_time && valid_packages {
+    let valid_confirmed = snapshot.confirmed.len() <= 1_000
+        && snapshot.confirmed.iter().all(|finding| {
+            !finding.name.trim().is_empty()
+                && !finding.version.trim().is_empty()
+                && finding.advisory.len() <= 256
+                && finding.severity.len() <= 32
+        });
+    let valid_suspected = snapshot.suspected.len() <= 1_000
+        && snapshot.suspected.iter().all(|finding| {
+            !finding.name.trim().is_empty()
+                && !finding.version.trim().is_empty()
+                && finding.score <= 10
+                && finding.rules.len() <= 16
+                && finding.rules.iter().all(|rule| rule.len() <= 120)
+        });
+    if valid_time && valid_packages && valid_confirmed && valid_suspected {
         Ok(())
     } else {
         Err((
@@ -274,7 +468,8 @@ async fn detailed_health(State(state): State<Arc<ServerConfig>>) -> Json<Value> 
             "azure-pipelines-scan",
             "github-actions-scan",
             "artifact-distribution",
-            "policy-validation"
+            "policy-validation",
+            "status-card"
         ],
         "artifacts_dir_configured": state.artifacts_dir.is_some(),
         "auth_configured": state.auth_token.is_some()
@@ -605,6 +800,149 @@ mod tests {
             serde_json::from_slice(&body).unwrap_or_else(|_| panic!("response is JSON"));
         assert_eq!(status["quarantine"]["captured_at"], "2026-09-08T08:15:00Z");
         assert_eq!(status["quarantine"]["packages"], snapshot["packages"]);
+    }
+
+    #[test]
+    fn card_lists_sections_and_escapes_markup() {
+        let snapshot = QuarantineSnapshot {
+            captured_at: "2026-09-13T08:15:00Z".into(),
+            packages: vec![QuarantinedPackage {
+                name: "react<&>".into(),
+                version: "19.3.0".into(),
+                age_days: 0,
+                status: "Block".into(),
+            }],
+            confirmed: vec![ConfirmedFinding {
+                name: "lodash".into(),
+                version: "4.17.20".into(),
+                advisory: "GHSA-35jh".into(),
+                severity: "high".into(),
+            }],
+            suspected: vec![SuspectedFinding {
+                name: "odd".into(),
+                version: "1.0.0".into(),
+                score: 8,
+                rules: vec!["ai-prompt-injection".into()],
+            }],
+        };
+        let svg = render_status_card(Some(&snapshot));
+        assert!(svg.starts_with("<svg"), "card must be an SVG document");
+        assert!(svg.contains("QUARANTINED (1)"));
+        assert!(svg.contains("CONFIRMED CVE (1)"));
+        assert!(svg.contains("SUSPECTED (SCAN) (1)"));
+        assert!(svg.contains("react&lt;&amp;&gt;@19.3.0"), "{svg}");
+        assert!(svg.contains("high GHSA-35jh"));
+        assert!(svg.contains("ai-prompt-injection"));
+        assert!(svg.contains("2026-09-13T08:15:00Z"));
+    }
+
+    #[test]
+    fn card_empty_state_is_explicit() {
+        let svg = render_status_card(None);
+        assert_eq!(svg.matches("(none captured yet)").count(), 3);
+        assert!(svg.contains("no snapshot yet"));
+    }
+
+    #[tokio::test]
+    async fn status_card_route_serves_svg() {
+        let app = app();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/status/card.svg")
+                    .body(axum::body::Body::empty())
+                    .unwrap_or_else(|_| panic!("valid request")),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("request succeeds"));
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("image/svg+xml; charset=utf-8")
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap_or_else(|_| panic!("body"));
+        let svg = String::from_utf8_lossy(&body);
+        assert!(svg.contains("<svg"), "expected an SVG body, got {svg}");
+    }
+
+    #[tokio::test]
+    async fn publish_accepts_and_returns_confirmed_and_suspected() {
+        let directory = tempfile::tempdir().unwrap_or_else(|_| panic!("temporary directory"));
+        let app = app_with_config(ServerConfig {
+            auth_token: Some("test-token".into()),
+            status_file: Some(directory.path().join("quarantine-status.json")),
+            ..ServerConfig::default()
+        });
+        let snapshot = json!({
+            "captured_at": "2026-09-13T08:15:00Z",
+            "packages": [{"name": "next", "version": "16.3.4", "age_days": 6, "status": "Block"}],
+            "confirmed": [{"name": "lodash", "version": "4.17.20", "advisory": "GHSA-x", "severity": "high"}],
+            "suspected": [{"name": "odd", "version": "1.0.0", "score": 8, "rules": ["ai-prompt-injection"]}]
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/status/quarantine")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .body(axum::body::Body::from(snapshot.to_string()))
+                    .unwrap_or_else(|_| panic!("valid request")),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("request succeeds"));
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/status")
+                    .body(axum::body::Body::empty())
+                    .unwrap_or_else(|_| panic!("valid request")),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("request succeeds"));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap_or_else(|_| panic!("body"));
+        let status: Value =
+            serde_json::from_slice(&body).unwrap_or_else(|_| panic!("response is JSON"));
+        assert_eq!(status["quarantine"]["confirmed"][0]["advisory"], "GHSA-x");
+        assert_eq!(status["quarantine"]["suspected"][0]["score"], 8);
+    }
+
+    #[tokio::test]
+    async fn publish_rejects_out_of_range_suspected_score() {
+        let directory = tempfile::tempdir().unwrap_or_else(|_| panic!("temporary directory"));
+        let app = app_with_config(ServerConfig {
+            auth_token: Some("test-token".into()),
+            status_file: Some(directory.path().join("quarantine-status.json")),
+            ..ServerConfig::default()
+        });
+        let snapshot = json!({
+            "captured_at": "2026-09-13T08:15:00Z",
+            "packages": [],
+            "suspected": [{"name": "odd", "version": "1.0.0", "score": 11, "rules": []}]
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/status/quarantine")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .body(axum::body::Body::from(snapshot.to_string()))
+                    .unwrap_or_else(|_| panic!("valid request")),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("request succeeds"));
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

@@ -22,6 +22,10 @@ nuget:
   fallback_to_frozen: true
 docker:
   require_digest_pin: true
+quarantine_scanner:        # enforces `scan-package` findings passed via --findings
+  enabled: true
+  review_score: 4          # warn at/above this score
+  block_score: 8           # block/fall back at/above this score
 github_actions:
   require_full_sha_pin: true
   allow_local_actions: true

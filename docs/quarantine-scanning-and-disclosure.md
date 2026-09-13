@@ -29,7 +29,9 @@ reported at all. Scans in the window close that gap.
 - Snapshot CLIs (`snapshot-npm`, `snapshot-pip`, `snapshot-nuget`) and the
   daily machine radar can surface scan findings next to `status`/`reasons`.
 - Dashboard publishing (`PUT /api/v1/status/quarantine`) already sanitizes what
-  leaves the machine; findings must stay name/version-level only.
+  leaves the machine; findings must stay name/version-level only. The server
+  renders the stored snapshot as JSON (`/api/v1/status`) and as the dynamic
+  status card (`/api/v1/status/card.svg`).
 
 ## Experiment: naive heuristics are not enough
 
@@ -92,8 +94,9 @@ Stage 5 — scoring and policy
 
 Stage 6 — findings store and reporting surface
   Persist findings next to decisions (state dir JSON + metadata store API).
-  Snapshot entries gain `content_findings: [...]`; the public dashboard shows
-  only name/version/decision as today.
+  Snapshot entries gain `content_findings: [...]`; the public snapshot and
+  status card publish name/version-level facts only (quarantine holds,
+  confirmed advisories, suspected scan scores/rules).
 
 ## Acting like a CVE
 
@@ -130,7 +133,7 @@ Guardrails before any automated submission:
 5. Rate-limit submissions to avoid burning bridges with a noisy false-positive
    stream; fix rules before resubmitting.
 
-## Implementation status (2026-09-12)
+## Implementation status (2026-09-13)
 
 0. **Wired path** — `supply scan-package <eco> <archive> --name --version
    [--external <cmd>] [--findings-out <jsonl>]` extracts the archive
@@ -172,6 +175,47 @@ Guardrails before any automated submission:
 8. **Submission** — manual gate by design: the CLI emits the checklist;
    automated registry/OpenSSF submission stays out until the false-positive
    rate is measured on real releases.
+9. **GuardDog installed and wired** — `uv tool install guarddog` (3.2.0,
+   Python 3.13); `scan-package --guarddog` runs it under a 180 s timeout and
+   an 8 MiB output cap. `experiments/scan-quarantine.py` scans every version
+   a daily capture holds in the quarantine window, and it verifies the
+   tarball against `dist.integrity` (sha512) before any scanner sees it. The
+   self-hosted radar image copies `scan-quarantine.py` and `policy.yml` and
+   runs the scan each cycle; without GuardDog it falls back to the static
+   rules.
+10. **AI/agent-threat rules** — `application::ai_scanner` adds deterministic,
+    offline rules: `ai-prompt-injection` (LLM role tokens or
+    instruction-override text, with zero-width/bidi normalization),
+    `ai-agent-config` (hostile instructions in `CLAUDE.md`, `.cursorrules`,
+    `.mcp.json`, …), `ai-agent-secrets` (agent state or hardcoded provider
+    keys plus exfiltration capability), `ai-hidden-instructions`,
+    `ai-install-script`, and `slopsquat-name` (name one edit from a popular
+    package). No LLM sits in the scanning loop — an injected payload could
+    steer its own judge. Every extracted file is scored, including test
+    paths; the obfuscation rule only escalates when dynamic evaluation
+    meets an encoded payload.
+11. **Daily enforcement** — `experiments/policy.yml` enables
+    `quarantine_scanner`; findings accumulate in
+    `experiments/data/content-findings.jsonl` and are loaded by
+    `snapshot-npm --findings`, so a block-level finding turns a held version
+    into a permanent `Block`/`Fallback` on later captures. A failed or
+    skipped scan writes a block-level `scan-incomplete` record (fail closed)
+    tagged with the engines that were required; it stays on the retry list
+    until a matching scan succeeds — even after the version leaves the
+    quarantine window — and a static-only run cannot clear a GuardDog-pending
+    hold.
+12. **Public status surface** — `experiments/publish-status.py` builds the
+    snapshot from the day's capture plus `content-scan.json`: quarantine
+    holds, confirmed OSV advisories (parsed from evaluator reasons), and
+    suspected scan findings (score + rules, preferring the structured scan
+    report). The server stores it behind `PUT /api/v1/status/quarantine`
+    (bearer token, size- and shape-validated) and serves
+    `GET /api/v1/status` (JSON) and `GET /api/v1/status/card.svg` (dynamic
+    SVG with the three lists, `Cache-Control: public, max-age=300`). The
+    README embeds the card. Only name/version-level facts are published: no
+    repository paths, ranges, or file contents. Publishing flags are
+    backwards compatible — older snapshots without the new arrays still
+    validate.
 
 ## Original plan
 

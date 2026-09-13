@@ -1,0 +1,7 @@
+# Field-test policy: quarantine content scanning is enabled so findings
+# produced by scan-quarantine.py (GuardDog + static AI/agent rules) block
+# held versions on follow-up captures. Everything else stays at defaults.
+quarantine_scanner:
+  enabled: true
+  review_score: 4
+  block_score: 8

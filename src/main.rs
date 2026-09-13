@@ -420,8 +420,10 @@ fn scan_package(
     }
     if guarddog {
         let command = std::env::var("GUARDDOG_BIN").unwrap_or_else(|_| "guarddog".to_string());
-        external_scanners
-            .push(supply_core::adapters::command_scanner::CommandScanner::guarddog(command));
+        external_scanners.push(
+            supply_core::adapters::command_scanner::CommandScanner::guarddog(command)
+                .with_limits(std::time::Duration::from_secs(180), 8 * 1024 * 1024),
+        );
     }
     for scanner in external_scanners {
         if let Some(external_finding) = scanner.scan_archive(&ecosystem, archive, name, &parsed)? {

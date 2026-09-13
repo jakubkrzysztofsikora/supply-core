@@ -38,6 +38,23 @@ crontab -l | grep supply-core
 
 Log: `experiments/data/cron.log`.
 
+## Content scan (GuardDog + AI/agent rules)
+
+Each daily capture content-scans the versions held by the quarantine window
+(`scan-quarantine.py`): registry-verified (sha512) downloads, GuardDog 3.2,
+and the built-in AI/agent-targeting rules. Per-capture results land in
+`data/<day>/content-scan.json`; findings append to
+`data/content-findings.jsonl` and `run.sh` enforces them through `policy.yml`
+on later captures. Failed scans persist a block-level `scan-incomplete`
+record until a successful scan clears it (fail closed). `guarddog` must be on
+PATH (`~/.local/bin`) or reachable through `GUARDDOG_BIN`; install with
+`uv tool install guarddog`.
+
+`publish-status.py` then builds the public snapshot from the same day:
+quarantine holds, confirmed advisories, and suspected scan findings. The
+official server renders it as JSON (`/api/v1/status`) and as the status card
+(`/api/v1/status/card.svg`).
+
 ## Day-0 baseline observations (2026-08-15)
 
 - `llama.cpp`: 249 action refs — 195 tag-pinned, 18 SHA-pinned, 36 local.

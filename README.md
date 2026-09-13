@@ -10,6 +10,12 @@ No SaaS accounts. No cloud dashboards. No agent daemons. Zero telemetry.
 [![OSV](https://img.shields.io/badge/vulnerability%20source-OSV.dev-blue.svg)](https://osv.dev)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
+Live status — quarantined versions, confirmed CVEs, and scan-suspected packages
+(rendered on demand by the official server at
+`/api/v1/status/card.svg`):
+
+[![supply-core live status](https://supply-core.tail5d39b4.ts.net/api/v1/status/card.svg)](https://supply-core.tail5d39b4.ts.net/api/v1/status)
+
 ---
 
 ## The 10-Second Pitch (Why You Need This)
@@ -77,7 +83,35 @@ cargo run -- scan-docker .
 
 *`snapshot-*` prints a JSON report; `scan-docker` exits `2` when an image is unpinned.*
 
-### 5. Machine-Wide Daily Radar (macOS)
+### 5. Quarantine Content Scanning (0-day and AI-agent threats)
+
+Inspect package bytes **while a version sits in the quarantine window** — before
+any advisory exists. The built-in static scanner always runs; GuardDog adds the
+external malware engine:
+
+```bash
+# Install the external engine once (requires Python >= 3.10)
+uv tool install guarddog        # or: pipx install guarddog
+# If the default Python has no pygit2 wheel yet: uv tool install --python 3.13 guarddog
+
+# Scan one verified archive (static AI/agent rules + GuardDog)
+cargo run -- scan-package npm ./evil.tgz --name evil --version 1.2.3 \
+  --guarddog --findings-out findings.jsonl
+```
+
+The daily capture wires this automatically: every version held by the
+quarantine window is downloaded from the registry, verified against
+`dist.integrity` (sha512), scanned, and its findings appended to
+`experiments/data/content-findings.jsonl`. That file is then passed to
+`snapshot-npm --findings`, so block-level findings turn into `Block`/`Fallback`
+decisions on the next capture:
+
+```bash
+python3 experiments/scan-quarantine.py experiments/data/2026-09-13 \
+  --bin target/release/supply-core    # one capture; the cron wrapper does this daily
+```
+
+### 6. Machine-Wide Daily Radar (macOS)
 Scan **all** git repositories across your machine every morning at 08:30 AM:
 
 ```bash
@@ -89,7 +123,7 @@ cargo build --release --locked && python3 experiments/install_machine_eval.py --
 - Queries OSV.dev with local 24-hour response caching.
 - Zero battery drain: runs while logged in, coalesces sleep events.
 
-### 6. Official Server & Self-Hosting
+### 7. Official Server & Self-Hosting
 Run `supply-core` as an HTTP microservice with remote scanning and binary distribution endpoints:
 
 ```bash
@@ -124,14 +158,15 @@ server over the compose network. Captures land in `radar/data/`. Without the
 - Local health check: `curl http://localhost:4873/health`
 - Pre-built binary download: `curl -sSL https://supply-core.example.com/api/v1/download/supply-core-linux-x86_64 -o supply-core` (falls back to a redirect to GitHub Releases when the artifact cache is empty)
 - Remote pipeline scan: set `SUPPLY_AUTH_TOKEN` on the server and include a matching bearer token in scan requests.
-- Quarantine dashboard: the daily capture publishes only package name, version, age, and decision using the same token. Store its local configuration outside the repository at `~/.config/supply-core/status-publisher.env`:
+- **Status card**: `GET /api/v1/status/card.svg` renders a dynamic SVG with three columns — quarantine-window holds, confirmed CVEs, and packages the content scan suspects. `GET /api/v1/status` returns the same data as JSON. Both are read-only, unauthenticated, and cache for 5 minutes.
+- **Status publishing**: the daily capture publishes the snapshot (package names, versions, ages, decisions, advisory ids, and scan scores/rules) using the same token. It contains no repository paths, version ranges, or file contents. Store the publisher configuration outside the repository at `~/.config/supply-core/status-publisher.env`:
 
   ```bash
   SUPPLY_STATUS_URL=https://supply-core.example.com
   SUPPLY_STATUS_AUTH_TOKEN=the-matching-SUPPLY_AUTH_TOKEN
   ```
 
-  The next successful capture updates the dashboard; its snapshot contains no repository paths, ranges, or advisory details.
+  The next successful capture updates the card; the scan runs before publishing, so the snapshot carries the same day's suspected findings.
 
 **Deploy to Kubernetes:**
 ```bash
@@ -157,6 +192,7 @@ kubectl apply -k deploy/k8s
 | **PyPI Quarantine** | `snapshot-pip` checks exact requirements.txt pins: publish age, sha256, OSV advisories | Catches fresh malicious pip uploads before they reach your build |
 | **NuGet Quarantine** | `snapshot-nuget` checks resolved `packages.lock.json`: publish age, SHA-512 package hash, OSV | Catches fresh NuGet publishes with the same policy engine |
 | **Docker Digest Pinning** | `scan-docker` flags `FROM`/`image:` references that lack an `@sha256:` digest | Mutable tags can be silently replaced under you |
+| **Quarantine Content Scan** | GuardDog plus built-in AI/agent rules over every version held by the quarantine window | Catches malware and prompt-injection payloads that have no CVE yet |
 | **100% Local & Airgapped** | Operates strictly on local files and local caching | Your private code and lockfiles never leave your machine |
 
 ### Supported ecosystems
@@ -190,10 +226,14 @@ hashes come from the PyPI JSON API.
          │                                        ├── Age < 72h? ──► Quarantine + Fallback
          │                                        └── Vulnerable? ──► Block or Warn
          │
-         └───► Daily LaunchAgent (08:30) ──────► Discovers Git repositories under configured roots
-                                                  ├── Maps lockfiles (npm, Yarn, pip, NuGet)
-                                                  ├── Queries OSV batch API (cached 24h)
-                                                  └── Generates runs/<ts>/report.md
+         ├───► Daily LaunchAgent (08:30) ──────► Discovers Git repositories under configured roots
+         │                                        ├── Maps lockfiles (npm, Yarn, pip, NuGet)
+         │                                        ├── Queries OSV batch API (cached 24h)
+         │                                        └── Generates runs/<ts>/report.md
+         │
+         └───► Quarantine content scan (08:45) ─► GuardDog + AI/agent rules over held versions
+                                                  ├── findings.jsonl ──► blocks later captures
+                                                  └── snapshot ──► server card (/api/v1/status/card.svg)
 ```
 
 ---
@@ -214,6 +254,57 @@ Every morning, open `~/.local/share/supply-core/latest.json` or `runs/<timestamp
 - Cached OSV lookups: 1,772 / 1,830 (96.8% cache hit rate)
 - Evaluation runtime: 4.2 seconds
 ```
+
+---
+
+## Quarantine Content Scanning
+
+Time-based quarantine keeps a fresh version out of the build; the content scan
+looks *inside* the bytes while upstream has reported nothing yet. `scan-package`
+runs two engines over a verified archive:
+
+1. **GuardDog 3.2** (`--guarddog`, uses `$GUARDDOG_BIN` or `guarddog` on PATH) —
+   YARA-style heuristics for install hooks, credential access, exfiltration,
+   obfuscation, bundled binaries, and typosquat metadata.
+2. **Built-in static rules** — capability/threat correlation plus an
+   AI/agent-targeting set:
+
+| Rule | Catches |
+|---|---|
+| `ai-prompt-injection` | Role tokens (`<\|im_start\|>`, `[INST]`, …) or instruction-override text aimed at an agent reading the package |
+| `ai-agent-config` | The same payloads inside `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, `SKILL.md`, `.mcp.json` |
+| `ai-agent-secrets` | Agent state (`~/.claude`, `~/.codex`, `.claude.json`) or hardcoded provider keys combined with exfiltration capability |
+| `ai-hidden-instructions` | Zero-width / bidirectional Unicode smuggling around instructions |
+| `ai-install-script` | Lifecycle scripts touching agent state or provider credentials |
+| `slopsquat-name` | Package name one edit away from a popular package (the LLM-hallucination shape) |
+
+Findings score 0–10 and are enforced per policy: `block_score` (default 8)
+blocks or falls back, `review_score` (default 4) warns, and verified npm build
+provenance lowers a score by 3. Every extracted file is scored, including test
+and coverage paths; dynamic-evaluation signals only escalate when an encoded
+payload is present, so ordinary `new Function`/coverage builds stay quiet.
+
+A scan that fails (registry, integrity, GuardDog, timeout) persists a
+block-level `scan-incomplete` finding instead of failing open, so the version
+stays held even if it leaves the quarantine window before a successful scan.
+Failed versions are retried on later captures until a scan with the same
+engines succeeds — a static-only run cannot clear a GuardDog-pending hold —
+and the passing scan clears the record.
+
+The daily capture scans every version held by the quarantine window through
+`experiments/scan-quarantine.py`: it resolves each version on the registry,
+verifies the tarball against `dist.integrity` (sha512) before any scanner sees
+it, appends findings to `experiments/data/content-findings.jsonl`, and the next
+capture loads that file into `snapshot-npm --findings` (enabled by
+`experiments/policy.yml`). Confirmed advisories and suspected scan findings are
+published with the snapshot and rendered on the status card.
+`supply report findings.json --submit` exports OSV records plus the manual
+disclosure checklist — nothing is submitted automatically.
+
+The self-hosted radar container runs the same scan after each capture (the
+image ships `scan-quarantine.py` and `policy.yml`); install GuardDog into a
+derived image or set `GUARDDOG_BIN` to add the external engine — the static
+AI/agent rules run either way.
 
 ---
 
@@ -245,6 +336,11 @@ nuget:
 docker:
   require_digest_pin: true
 
+quarantine_scanner:          # content scan findings, when a --findings file is supplied
+  enabled: true
+  review_score: 4            # warn at/above this score
+  block_score: 8             # block/fall back at/above this score
+
 github_actions:
   require_full_sha_pin: true
 ```
@@ -257,8 +353,8 @@ github_actions:
 # Run all unit and integration tests
 cargo test
 
-# Run Python machine-eval test suite
-python3 -m unittest experiments/test_machine_eval.py
+# Run the Python experiment suite (machine eval + quarantine scan)
+python3 -m unittest discover -s experiments -p 'test_*.py'
 
 # Run real-world registry E2E tests (hits live npmjs.org)
 cargo test -- --ignored

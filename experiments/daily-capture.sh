@@ -14,9 +14,9 @@ LOG="$HERE/data/cron.log"
 DAY="$(date +%Y-%m-%d)"
 mkdir -p "$HERE/data" || exit 1
 
-# Cron-friendly PATH: rustup proxies live in ~/.cargo/bin; keep the system
-# defaults for git/python3.
-export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+# Cron-friendly PATH: rustup proxies live in ~/.cargo/bin; GuardDog lives in
+# ~/.local/bin; keep the system defaults for git/python3.
+export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 
@@ -54,25 +54,41 @@ cd "$ROOT" || exit 1
     exit 1
   fi
 
-  capture_rc=0
-  SUPPLY_BIN="$BIN" "$HERE/run.sh" "$DAY" || capture_rc=$?
-  if [ "$capture_rc" -ne 0 ]; then
-    echo "ERROR: run.sh failed (exit $capture_rc)"
-  elif [ -n "${SUPPLY_STATUS_URL:-}" ] && [ -n "${SUPPLY_STATUS_AUTH_TOKEN:-}" ]; then
-    snapshot="$HERE/data/$DAY/quarantine-status.json"
-    if python3 "$HERE/publish-status.py" "$HERE/data/$DAY" > "$snapshot" \
-      && curl --fail --silent --show-error --request PUT \
-        --header "Authorization: Bearer $SUPPLY_STATUS_AUTH_TOKEN" \
-        --header "Content-Type: application/json" \
-        --data-binary "@$snapshot" \
-        "${SUPPLY_STATUS_URL%/}/api/v1/status/quarantine"; then
-      echo "published quarantine status"
-    else
-      echo "ERROR: failed to publish quarantine status"
+  run_rc=0
+  SUPPLY_BIN="$BIN" "$HERE/run.sh" "$DAY" || run_rc=$?
+  capture_rc=$run_rc
+  if [ "$run_rc" -ne 0 ]; then
+    echo "ERROR: run.sh failed (exit $run_rc)"
+  else
+    # Content-scan the versions this capture holds in the quarantine window
+    # (GuardDog plus the static AI/agent rules). Runs before publishing so the
+    # snapshot can carry today's suspected findings, and runs even if status
+    # publishing fails. Findings append to the shared JSONL that run.sh
+    # enforces through policy.yml on later captures.
+    scan_rc=0
+    python3 "$HERE/scan-quarantine.py" "$HERE/data/$DAY" --bin "$BIN" \
+      --findings "$HERE/data/content-findings.jsonl" || scan_rc=$?
+    if [ "$scan_rc" -ne 0 ]; then
+      echo "ERROR: content scan failed (exit $scan_rc)"
       capture_rc=1
     fi
-  else
-    echo "WARN: quarantine status publisher is not configured"
+
+    if [ -n "${SUPPLY_STATUS_URL:-}" ] && [ -n "${SUPPLY_STATUS_AUTH_TOKEN:-}" ]; then
+      snapshot="$HERE/data/$DAY/quarantine-status.json"
+      if python3 "$HERE/publish-status.py" "$HERE/data/$DAY" > "$snapshot" \
+        && curl --fail --silent --show-error --request PUT \
+          --header "Authorization: Bearer $SUPPLY_STATUS_AUTH_TOKEN" \
+          --header "Content-Type: application/json" \
+          --data-binary "@$snapshot" \
+          "${SUPPLY_STATUS_URL%/}/api/v1/status/quarantine"; then
+        echo "published quarantine status"
+      else
+        echo "ERROR: failed to publish quarantine status"
+        capture_rc=1
+      fi
+    else
+      echo "WARN: quarantine status publisher is not configured"
+    fi
   fi
 
   # Field-test gate: exit non-zero on regressions vs the committed baseline.
