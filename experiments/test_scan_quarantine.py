@@ -3,6 +3,7 @@
 import base64
 import hashlib
 import importlib.util
+import json
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -106,6 +107,64 @@ class IntegrityTest(unittest.TestCase):
         scan_quarantine.verify_integrity(data, f"sha512-{digest}")
         with self.assertRaises(ValueError):
             scan_quarantine.verify_integrity(data + b"x", f"sha512-{digest}")
+
+
+class ArchiveCacheTest(unittest.TestCase):
+    @staticmethod
+    def _integrity(data):
+        digest = base64.b64encode(hashlib.sha512(data).digest()).decode()
+        return f"sha512-{digest}"
+
+    def test_corrupted_cache_entry_is_replaced(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / "pkg.tgz"
+            archive.write_bytes(b"corrupt")
+            fresh = b"fresh bytes"
+            with mock.patch.object(scan_quarantine, "fetch", return_value=fresh) as fetch_mock:
+                scan_quarantine.ensure_archive(
+                    archive, "https://registry.npmjs.org/x.tgz", self._integrity(fresh)
+                )
+                fetch_mock.assert_called_once()
+            self.assertEqual(archive.read_bytes(), fresh)
+
+    def test_valid_cache_entry_is_kept(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / "pkg.tgz"
+            payload = b"payload"
+            archive.write_bytes(payload)
+            with mock.patch.object(scan_quarantine, "fetch") as fetch_mock:
+                result = scan_quarantine.ensure_archive(
+                    archive, "https://registry.npmjs.org/x.tgz", self._integrity(payload)
+                )
+                fetch_mock.assert_not_called()
+            self.assertEqual(result, payload)
+
+    def test_tampered_download_is_rejected_and_not_cached(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / "pkg.tgz"
+            with mock.patch.object(scan_quarantine, "fetch", return_value=b"evil"):
+                with self.assertRaises(ValueError):
+                    scan_quarantine.ensure_archive(
+                        archive, "https://registry.npmjs.org/x.tgz", self._integrity(b"good")
+                    )
+            self.assertFalse(archive.exists())
+
+
+class WriteSummaryTest(unittest.TestCase):
+    def test_full_scan_report_is_preserved_for_publishing(self):
+        import tempfile
+
+        report = {"scanned": [{"package": f"p{index}"} for index in range(250)], "errors": []}
+        with tempfile.TemporaryDirectory() as directory:
+            path = scan_quarantine.write_summary(report, Path(directory))
+            saved = json.loads(path.read_text())
+        self.assertEqual(len(saved["scanned"]), 250)
 
 
 class SummaryTest(unittest.TestCase):

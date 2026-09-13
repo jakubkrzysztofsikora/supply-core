@@ -33,7 +33,6 @@ from pathlib import Path
 
 REGISTRY = "https://registry.npmjs.org"
 MAX_TARBALL_BYTES = 64 * 1024 * 1024
-MAX_SUMMARY_FINDINGS = 200
 
 
 def quarantined_packages(documents):
@@ -325,11 +324,28 @@ def prune_cache(cache, max_age_days=30, now=None):
 
 
 def write_summary(report, day_dir):
-    if len(report["scanned"]) > MAX_SUMMARY_FINDINGS:
-        report["scanned"] = report["scanned"][:MAX_SUMMARY_FINDINGS]
     summary_path = day_dir / "content-scan.json"
     summary_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     return summary_path
+
+
+def ensure_archive(archive, tarball, integrity):
+    """Return verified bytes for archive, refetching a corrupted cache entry.
+
+    A cache entry that no longer matches dist.integrity is deleted before the
+    refetch so a truncated download cannot wedge the retry loop.
+    """
+    if archive.exists():
+        data = archive.read_bytes()
+        try:
+            verify_integrity(data, integrity)
+            return data
+        except ValueError:
+            archive.unlink()
+    data = fetch(tarball)
+    verify_integrity(data, integrity)
+    archive.write_bytes(data)
+    return data
 
 
 def main():
@@ -409,13 +425,7 @@ def main():
                 fetch_json(version_url(name, version)), name, version,
             )
             archive = cache / safe_file_name(name, version)
-            if archive.exists():
-                data = archive.read_bytes()
-                verify_integrity(data, integrity)
-            else:
-                data = fetch(tarball)
-                verify_integrity(data, integrity)
-                archive.write_bytes(data)
+            ensure_archive(archive, tarball, integrity)
             findings = scan_package(
                 binary, archive, name, version, findings_path,
                 guarddog=None if args.no_guarddog else guarddog,
