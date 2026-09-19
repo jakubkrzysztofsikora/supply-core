@@ -5,6 +5,8 @@ PLAN.md
 experiments/data/
 __pycache__/
 *.pyc
+.env
+.env.*
 deploy/k8s/secret.yaml
 
 .claude/
