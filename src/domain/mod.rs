@@ -493,10 +493,11 @@ pub fn classify_pipeline_ref(raw: &str, kind: &PipelineRefKind) -> ActionPinKind
             }
         }
         PipelineRefKind::Repository => {
-            let trimmed = raw
+            let reference = raw.rsplit_once('@').map_or(raw, |(_, reference)| reference);
+            let trimmed = reference
                 .strip_prefix("refs/heads/")
-                .or_else(|| raw.strip_prefix("refs/tags/"))
-                .unwrap_or(raw);
+                .or_else(|| reference.strip_prefix("refs/tags/"))
+                .unwrap_or(reference);
             if trimmed.len() == 40 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
                 ActionPinKind::FullSha
             } else if !trimmed.is_empty() {

@@ -3,6 +3,7 @@ use crate::ports::*;
 use anyhow::Result;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 pub mod ai_scanner;
@@ -563,11 +564,21 @@ impl<'a> AzurePipelinesScanner<'a> {
         let mut refs = vec![];
         let mut findings = vec![];
         let mut finding_locations = vec![];
+        let mut extracted = vec![];
         for (file, body) in self.reader.read(root)? {
-            for (raw, kind, line) in extract_pipeline_references(&body)
-                .map_err(|error| anyhow::anyhow!("invalid pipeline {file}: {error}"))?
-            {
-                let pin_kind = classify_pipeline_ref(&raw, &kind);
+            let file_refs = extract_pipeline_references(&body)
+                .map_err(|error| anyhow::anyhow!("invalid pipeline {file}: {error}"))?;
+            extracted.push((file, file_refs));
+        }
+        let pinned_aliases = sha_pinned_repository_aliases(&extracted);
+        for (file, file_refs) in extracted {
+            for (raw, kind, line) in file_refs {
+                let pin_kind = resolve_repository_alias(
+                    &raw,
+                    &kind,
+                    classify_pipeline_ref(&raw, &kind),
+                    &pinned_aliases,
+                );
                 let reference = PipelineReference {
                     raw: raw.clone(),
                     file: file.clone(),
@@ -701,6 +712,48 @@ impl<'a> AzurePipelinesScanner<'a> {
             references: refs,
             finding_locations,
         })
+    }
+}
+
+type ExtractedPipelineRefs = Vec<(String, Vec<(String, PipelineRefKind, usize)>)>;
+
+fn sha_pinned_repository_aliases(extracted: &ExtractedPipelineRefs) -> HashSet<String> {
+    let mut aliases: HashMap<&str, bool> = HashMap::new();
+    for (raw, kind, _) in extracted.iter().flat_map(|(_, refs)| refs) {
+        if *kind != PipelineRefKind::Repository {
+            continue;
+        }
+        let alias = raw.split_once('@').map_or(raw.as_str(), |(alias, _)| alias);
+        let is_pinned = classify_pipeline_ref(raw, kind) == ActionPinKind::FullSha;
+        aliases
+            .entry(alias)
+            .and_modify(|all_pinned| *all_pinned &= is_pinned)
+            .or_insert(is_pinned);
+    }
+    aliases
+        .into_iter()
+        .filter(|(_, all_pinned)| *all_pinned)
+        .map(|(alias, _)| alias.to_string())
+        .collect()
+}
+
+fn resolve_repository_alias(
+    raw: &str,
+    kind: &PipelineRefKind,
+    pin_kind: ActionPinKind,
+    pinned_aliases: &HashSet<String>,
+) -> ActionPinKind {
+    if pin_kind != ActionPinKind::TagOrBranch {
+        return pin_kind;
+    }
+    let alias = match kind {
+        PipelineRefKind::Template => raw.rsplit_once('@').map(|(_, alias)| alias),
+        PipelineRefKind::Checkout if !raw.contains('@') && !raw.contains("://") => Some(raw),
+        _ => None,
+    };
+    match alias {
+        Some(alias) if pinned_aliases.contains(alias) => ActionPinKind::FullSha,
+        _ => pin_kind,
     }
 }
 
@@ -1951,6 +2004,93 @@ steps:
         .scan(Path::new("."))?;
         assert!(report.is_blocking());
         assert_eq!(report.findings.len(), 2);
+        Ok(())
+    }
+
+    fn scan_azure(files: Vec<(&str, String)>) -> Result<PipelineScanReport> {
+        let policy = Policy::default();
+        let reader = R(files
+            .into_iter()
+            .map(|(file, body)| (file.to_string(), body))
+            .collect());
+        AzurePipelinesScanner {
+            policy: &policy,
+            reader: &reader,
+        }
+        .scan(Path::new("."))
+    }
+
+    fn shared_repository_resource(alias: &str, reference: &str) -> String {
+        format!(
+            "resources:\n  repositories:\n    - repository: {alias}\n      type: git\n      name: Circit/circit-app\n      ref: {reference}\n"
+        )
+    }
+
+    #[test]
+    fn azure_scanner_allows_sha_pinned_repository_resource() -> Result<()> {
+        let body = shared_repository_resource("circitapp", &"a".repeat(40));
+        let report = scan_azure(vec![("ci.yml", body)])?;
+        assert!(!report.is_blocking(), "{:?}", report.findings);
+        Ok(())
+    }
+
+    #[test]
+    fn azure_scanner_allows_templates_and_checkouts_of_sha_pinned_alias() -> Result<()> {
+        let body = format!(
+            "{}steps:\n  - checkout: circitapp\n  - template: pipelines/templates/gitleaks-scan.yml@circitapp\n",
+            shared_repository_resource("circitapp", &"a".repeat(40))
+        );
+        let report = scan_azure(vec![("ci.yml", body)])?;
+        assert!(!report.is_blocking(), "{:?}", report.findings);
+        Ok(())
+    }
+
+    #[test]
+    fn azure_scanner_resolves_alias_declared_in_root_pipeline_for_nested_template() -> Result<()> {
+        let root = format!(
+            "{}stages:\n  - template: pipelines/stages/ci.yml\n",
+            shared_repository_resource("circitapp", &"b".repeat(40))
+        );
+        let nested = "jobs:\n  - job: Gates\n    steps:\n      - template: pipelines/templates/gitleaks-scan.yml@circitapp\n".to_string();
+        let report = scan_azure(vec![("ci.yml", root), ("pipelines/stages/ci.yml", nested)])?;
+        assert!(!report.is_blocking(), "{:?}", report.findings);
+        Ok(())
+    }
+
+    #[test]
+    fn azure_scanner_blocks_template_when_any_alias_declaration_is_unpinned() -> Result<()> {
+        let pinned = format!(
+            "{}steps:\n  - template: a.yml@circitapp\n",
+            shared_repository_resource("circitapp", &"c".repeat(40))
+        );
+        let unpinned = format!(
+            "{}steps:\n  - checkout: circitapp\n",
+            shared_repository_resource("circitapp", "refs/heads/develop")
+        );
+        let report = scan_azure(vec![("a.yml", pinned), ("b.yml", unpinned)])?;
+        let blocked: Vec<_> = report
+            .finding_locations
+            .iter()
+            .map(|r| (r.file.as_str(), r.kind.clone()))
+            .collect();
+        assert_eq!(
+            blocked,
+            vec![
+                ("a.yml", PipelineRefKind::Template),
+                ("b.yml", PipelineRefKind::Repository),
+                ("b.yml", PipelineRefKind::Checkout),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn azure_scanner_blocks_template_of_undeclared_alias() -> Result<()> {
+        let report = scan_azure(vec![(
+            "ci.yml",
+            "steps:\n  - template: a.yml@circitapp\n".to_string(),
+        )])?;
+        assert!(report.is_blocking());
         Ok(())
     }
 }
