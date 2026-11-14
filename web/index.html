@@ -164,6 +164,24 @@
           </table>
         </div>
       </section>
+      <section class="section card" aria-labelledby="incomplete-heading">
+        <div class="section-head">
+          <div>
+            <h2 id="incomplete-heading">Incomplete scans</h2>
+            <p>Packages with incomplete scans have no score available.</p>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Package</th><th>Version</th><th>Scan status</th></tr>
+            </thead>
+            <tbody id="incomplete-list">
+              <tr><td colspan="3" class="empty">Loading incomplete scans…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
       <footer>Supply Core <span id="footer-version"></span> · Public diagnostics only · Updated <span id="updated-at">—</span></footer>
     </main>
   </div>
@@ -188,7 +206,6 @@
         cell.textContent = "No packages are currently held in quarantine.";
         row.appendChild(cell);
         list.appendChild(row);
-        return;
       }
       data.quarantine.packages.forEach((pkg) => {
         const row = document.createElement("tr");
@@ -205,6 +222,28 @@
         row.appendChild(status);
         list.appendChild(row);
       });
+      const incompleteList = document.getElementById("incomplete-list");
+      incompleteList.replaceChildren();
+      const incomplete = data.quarantine.scan_incomplete || [];
+      if (!incomplete.length) {
+        const row = document.createElement("tr");
+        const cell = document.createElement("td");
+        cell.colSpan = 3;
+        cell.className = "empty";
+        cell.textContent = "No incomplete scans were reported.";
+        row.appendChild(cell);
+        incompleteList.appendChild(row);
+      } else {
+        incomplete.forEach((finding) => {
+          const row = document.createElement("tr");
+          [finding.name, finding.version, "Scan incomplete"].forEach((value) => {
+            const cell = document.createElement("td");
+            cell.textContent = value;
+            row.appendChild(cell);
+          });
+          incompleteList.appendChild(row);
+        });
+      }
     };
     fetch("/api/v1/status", { headers: { Accept: "application/json" } })
       .then((response) => response.ok ? response.json() : Promise.reject(new Error("status unavailable")))

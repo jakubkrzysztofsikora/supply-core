@@ -131,6 +131,14 @@ struct SuspectedFinding {
     #[serde(default)]
     rules: Vec<String>,
 }
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct IncompleteFinding {
+    name: String,
+    version: String,
+    verdict: String,
+}
+
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 struct QuarantineSnapshot {
@@ -140,6 +148,8 @@ struct QuarantineSnapshot {
     confirmed: Vec<ConfirmedFinding>,
     #[serde(default)]
     suspected: Vec<SuspectedFinding>,
+    #[serde(default)]
+    scan_incomplete: Vec<IncompleteFinding>,
 }
 
 pub fn app() -> Router {
@@ -214,7 +224,8 @@ async fn public_status(State(state): State<Arc<ServerConfig>>) -> Json<Value> {
             "captured_at": snapshot.as_ref().map(|snapshot| &snapshot.captured_at),
             "packages": snapshot.as_ref().map(|snapshot| snapshot.packages.clone()).unwrap_or_default(),
             "confirmed": snapshot.as_ref().map(|snapshot| snapshot.confirmed.clone()).unwrap_or_default(),
-            "suspected": snapshot.as_ref().map(|snapshot| snapshot.suspected.clone()).unwrap_or_default()
+            "suspected": snapshot.as_ref().map(|snapshot| snapshot.suspected.clone()).unwrap_or_default(),
+            "scan_incomplete": snapshot.as_ref().map(|snapshot| snapshot.scan_incomplete.clone()).unwrap_or_default()
         }
     }))
 }
@@ -244,6 +255,7 @@ fn render_status_card(snapshot: Option<&QuarantineSnapshot>) -> String {
     let empty_packages: Vec<QuarantinedPackage> = Vec::new();
     let empty_confirmed: Vec<ConfirmedFinding> = Vec::new();
     let empty_suspected: Vec<SuspectedFinding> = Vec::new();
+    let empty_incomplete: Vec<IncompleteFinding> = Vec::new();
     let packages = snapshot
         .map(|snapshot| &snapshot.packages)
         .unwrap_or(&empty_packages);
@@ -253,6 +265,9 @@ fn render_status_card(snapshot: Option<&QuarantineSnapshot>) -> String {
     let suspected = snapshot
         .map(|snapshot| &snapshot.suspected)
         .unwrap_or(&empty_suspected);
+    let scan_incomplete = snapshot
+        .map(|snapshot| &snapshot.scan_incomplete)
+        .unwrap_or(&empty_incomplete);
     let captured_at = snapshot
         .map(|snapshot| snapshot.captured_at.as_str())
         .unwrap_or("no snapshot yet");
@@ -286,8 +301,12 @@ fn render_status_card(snapshot: Option<&QuarantineSnapshot>) -> String {
             finding.name, finding.version, finding.score, suffix
         )
     });
+    let (incomplete_lines, incomplete_hidden) =
+        card_section(scan_incomplete, |finding| {
+            format!("{}@{} · scan incomplete", finding.name, finding.version)
+        });
 
-    let sections: [(&str, &str, &Vec<String>, usize, usize); 3] = [
+    let sections: [(&str, &str, &Vec<String>, usize, usize); 4] = [
         (
             "#58a6ff",
             "QUARANTINED",
@@ -308,6 +327,13 @@ fn render_status_card(snapshot: Option<&QuarantineSnapshot>) -> String {
             &suspected_lines,
             suspected_hidden,
             suspected.len(),
+        ),
+        (
+            "#bc8cff",
+            "SCAN INCOMPLETE",
+            &incomplete_lines,
+            incomplete_hidden,
+            scan_incomplete.len(),
         ),
     ];
     let rows = sections
@@ -333,7 +359,7 @@ fn render_status_card(snapshot: Option<&QuarantineSnapshot>) -> String {
     ));
 
     for (index, (color, title, lines, hidden, total)) in sections.iter().enumerate() {
-        let x = 24 + index * 292;
+        let x = 24 + index * 219;
         svg.push_str(&format!(
             "<text x=\"{x}\" y=\"78\" fill=\"{color}\" font-family=\"{CARD_FONT}\" font-size=\"13\" font-weight=\"700\">{title} ({total})</text>"
         ));
@@ -419,7 +445,15 @@ fn validate_quarantine_snapshot(
                 && finding.rules.len() <= 16
                 && finding.rules.iter().all(|rule| rule.len() <= 120)
         });
-    if valid_time && valid_packages && valid_confirmed && valid_suspected {
+    let valid_incomplete = snapshot.scan_incomplete.len() <= 1_000
+        && snapshot.scan_incomplete.iter().all(|finding| {
+            !finding.name.trim().is_empty()
+                && finding.name.len() <= 256
+                && !finding.version.trim().is_empty()
+                && finding.version.len() <= 256
+                && finding.verdict == "scan_incomplete"
+        });
+    if valid_time && valid_packages && valid_confirmed && valid_suspected && valid_incomplete {
         Ok(())
     } else {
         Err((
@@ -800,6 +834,7 @@ mod tests {
             serde_json::from_slice(&body).unwrap_or_else(|_| panic!("response is JSON"));
         assert_eq!(status["quarantine"]["captured_at"], "2026-09-08T08:15:00Z");
         assert_eq!(status["quarantine"]["packages"], snapshot["packages"]);
+        assert_eq!(status["quarantine"]["scan_incomplete"], json!([]));
     }
 
     #[test]
@@ -824,12 +859,19 @@ mod tests {
                 score: 8,
                 rules: vec!["ai-prompt-injection".into()],
             }],
+            scan_incomplete: vec![IncompleteFinding {
+                name: "unscored<&>".into(),
+                version: "2.0.0".into(),
+                verdict: "scan_incomplete".into(),
+            }],
         };
         let svg = render_status_card(Some(&snapshot));
         assert!(svg.starts_with("<svg"), "card must be an SVG document");
         assert!(svg.contains("QUARANTINED (1)"));
         assert!(svg.contains("CONFIRMED CVE (1)"));
         assert!(svg.contains("SUSPECTED (SCAN) (1)"));
+        assert!(svg.contains("SCAN INCOMPLETE (1)"));
+        assert!(svg.contains("unscored&lt;&amp;&gt;@2.0.0 · scan incomplete"));
         assert!(svg.contains("react&lt;&amp;&gt;@19.3.0"), "{svg}");
         assert!(svg.contains("high GHSA-35jh"));
         assert!(svg.contains("ai-prompt-injection"));
@@ -839,7 +881,7 @@ mod tests {
     #[test]
     fn card_empty_state_is_explicit() {
         let svg = render_status_card(None);
-        assert_eq!(svg.matches("(none captured yet)").count(), 3);
+        assert_eq!(svg.matches("(none captured yet)").count(), 4);
         assert!(svg.contains("no snapshot yet"));
     }
 
@@ -871,7 +913,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publish_accepts_and_returns_confirmed_and_suspected() {
+    async fn publish_accepts_and_returns_confirmed_suspected_and_incomplete() {
         let directory = tempfile::tempdir().unwrap_or_else(|_| panic!("temporary directory"));
         let app = app_with_config(ServerConfig {
             auth_token: Some("test-token".into()),
@@ -882,7 +924,8 @@ mod tests {
             "captured_at": "2026-09-13T08:15:00Z",
             "packages": [{"name": "next", "version": "16.3.4", "age_days": 6, "status": "Block"}],
             "confirmed": [{"name": "lodash", "version": "4.17.20", "advisory": "GHSA-x", "severity": "high"}],
-            "suspected": [{"name": "odd", "version": "1.0.0", "score": 8, "rules": ["ai-prompt-injection"]}]
+            "suspected": [{"name": "odd", "version": "1.0.0", "score": 8, "rules": ["ai-prompt-injection"]}],
+            "scan_incomplete": [{"name": "missing-score", "version": "1.0.0", "verdict": "scan_incomplete"}]
         });
         let response = app
             .clone()
@@ -915,6 +958,11 @@ mod tests {
             serde_json::from_slice(&body).unwrap_or_else(|_| panic!("response is JSON"));
         assert_eq!(status["quarantine"]["confirmed"][0]["advisory"], "GHSA-x");
         assert_eq!(status["quarantine"]["suspected"][0]["score"], 8);
+        assert_eq!(
+            status["quarantine"]["scan_incomplete"],
+            json!([{"name": "missing-score", "version": "1.0.0", "verdict": "scan_incomplete"}])
+        );
+        assert!(status["quarantine"]["scan_incomplete"][0].get("score").is_none());
     }
 
     #[tokio::test]
@@ -943,6 +991,40 @@ mod tests {
             .await
             .unwrap_or_else(|_| panic!("request succeeds"));
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn incomplete_findings_require_fixed_verdict_and_bounded_names() {
+        let mut snapshot: QuarantineSnapshot = serde_json::from_value(json!({
+            "captured_at": "2026-09-13T08:15:00Z",
+            "packages": [],
+            "scan_incomplete": [{"name": "pkg", "version": "1.0", "verdict": "scan_incomplete"}]
+        }))
+        .unwrap_or_else(|_| panic!("valid incomplete finding"));
+        assert!(validate_quarantine_snapshot(&snapshot).is_ok());
+
+        snapshot.scan_incomplete[0].verdict = "suspected".into();
+        assert!(validate_quarantine_snapshot(&snapshot).is_err());
+
+        snapshot.scan_incomplete[0].verdict = "scan_incomplete".into();
+        snapshot.scan_incomplete[0].name = "x".repeat(257);
+        assert!(validate_quarantine_snapshot(&snapshot).is_err());
+
+        snapshot.scan_incomplete = vec![
+            IncompleteFinding {
+                name: "pkg".into(),
+                version: "1.0".into(),
+                verdict: "scan_incomplete".into(),
+            };
+            1_001
+        ];
+        assert!(validate_quarantine_snapshot(&snapshot).is_err());
+        assert!(
+            serde_json::from_value::<IncompleteFinding>(
+                json!({"name": "pkg", "version": "1.0", "verdict": "scan_incomplete", "score": 0})
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]
