@@ -18,12 +18,16 @@ trust model.
    supported algorithm and requires every locked digest for that algorithm to
    match registry `dist.integrity`; historical SHA-1 pins use `dist.shasum`.
    A missing matching algorithm fails closed. Full configured npm registry URL
-   paths remain separate source identities, including feeds on the same host.
-   PyPI `digests.sha256` and the NuGet registration `packageHash` identify
+   paths and NuGet feed URLs remain separate source identities, including feeds
+   on the same host; report `source` strips credentials, queries, and fragments
+   only. PyPI `digests.sha256` and the NuGet registration `packageHash` identify
    published archive bytes. NuGet `packages.lock.json contentHash` excludes the
    `.signature.p7s` entry. `scan-packages` recomputes that signature-independent
    hash from restored package bytes, then checks archive SHA-512 against both
-   the cache sidecar and each full NuGet feed identity's registry `packageHash`.
+   the cache sidecar and each full NuGet feed identity's registry `packageHash`;
+   when a feed's `catalogEntry` is unfetchable (Azure Artifacts commitLog URLs
+   404 under basic auth), assessment continues from the same authenticated
+   registration leaf, and packages without registry archive metadata fail closed.
    `snapshot-nuget` has no restored archive and does not verify lock
    `contentHash`. A registry that lies consistently (matching bytes + matching
    hash) is out of scope until signed provenance/attestation checks exist.
