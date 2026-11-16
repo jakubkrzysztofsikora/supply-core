@@ -130,18 +130,30 @@ fn release_from_source_with_client(
     let leaf_value = get(&leaf)?;
     let catalog = match leaf_value.get("catalogEntry") {
         Some(serde_json::Value::String(url)) => {
-            get(&reqwest::Url::parse(url).context("invalid NuGet catalog URL")?)?
+            let catalog_url = reqwest::Url::parse(url).context("invalid NuGet catalog URL")?;
+            match get(&catalog_url) {
+                Ok(entry) => entry,
+                Err(_) if leaf_value.get("published").is_some() => serde_json::Value::Null,
+                Err(error) => return Err(error),
+            }
         }
         Some(entry) => entry.clone(),
         None => serde_json::Value::Null,
     };
-    Ok(serde_json::json!({
+    Ok(release_metadata(&leaf_value, &catalog))
+}
+
+fn release_metadata(
+    leaf_value: &serde_json::Value,
+    catalog: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
         "published": leaf_value.get("published").or_else(|| catalog.get("published")),
         "listed": leaf_value.get("listed"),
         "packageHash": catalog.get("packageHash"),
         "packageHashAlgorithm": catalog.get("packageHashAlgorithm"),
         "packageContent": leaf_value.get("packageContent")
-    }))
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -318,6 +330,37 @@ pub fn package_version_from_nuget(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn leaf_publication_survives_unreachable_catalog_entry() {
+        let leaf = json!({
+            "published": "2024-01-01T00:00:00Z",
+            "listed": true,
+            "packageContent": "https://feed.test/pkg/1.0.0/nupkg"
+        });
+        let metadata = release_metadata(&leaf, &serde_json::Value::Null);
+        assert_eq!(metadata["published"], "2024-01-01T00:00:00Z");
+        assert_eq!(metadata["listed"], true);
+        assert_eq!(
+            metadata["packageContent"],
+            "https://feed.test/pkg/1.0.0/nupkg"
+        );
+        assert!(metadata["packageHash"].is_null());
+    }
+
+    #[test]
+    fn catalog_values_override_missing_leaf_fields() {
+        let leaf = json!({ "packageContent": "https://feed.test/pkg/1.0.0/nupkg" });
+        let catalog = json!({
+            "published": "2023-03-08T07:42:54.647Z",
+            "packageHash": "HASH",
+            "packageHashAlgorithm": "SHA512"
+        });
+        let metadata = release_metadata(&leaf, &catalog);
+        assert_eq!(metadata["published"], "2023-03-08T07:42:54.647Z");
+        assert_eq!(metadata["packageHash"], "HASH");
+        assert_eq!(metadata["packageHashAlgorithm"], "SHA512");
+    }
 
     #[test]
     fn semver2_registration_resource_beats_older_resource_order() {
