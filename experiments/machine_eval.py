@@ -21,7 +21,7 @@ INPUT_NAMES = {'package.json', 'package-lock.json', 'npm-shrinkwrap.json',
                'Cargo.toml', 'Cargo.lock', 'pyproject.toml', 'poetry.lock',
                'uv.lock', 'requirements.txt', 'go.mod', 'go.sum',
                'Gemfile', 'Gemfile.lock', 'composer.json', 'composer.lock',
-               'packages.lock.json'}
+               'packages.lock.json', '*.csproj'}
 PRUNE = {'.git', 'node_modules', 'target', '.venv', 'venv', '__pycache__',
          '.next', 'dist', 'build', 'Library', '.Trash', '.cache', '.npm',
          '.cargo', '.rustup', '.codex', '.claude', '.local', '.ssh', '.orbstack',
@@ -284,15 +284,16 @@ def inspect_repo(root, binary):
         result['dirty'] = bool(command(['git', '-C', str(root), 'status', '--porcelain',
                                         '--untracked-files=no']))
         paths = command(['git', '-C', str(root), 'ls-files', '-z']).split('\0')
+        tracked_paths = {relative for relative in paths if relative}
         packages, covered_manifests = set(), set()
         for relative in paths:
             path = root / relative
-            if relative and path.name in INPUT_NAMES:
+            if relative and (path.name in INPUT_NAMES or path.name.endswith('.csproj')):
                 result['input_inventory'].append({'path': relative, 'kind': path.name,
                     'excluded': any(part in PRUNE for part in Path(relative).parts)})
             if not relative or any(part in PRUNE for part in Path(relative).parts):
                 continue
-            relevant = (path.name in {'package.json', 'package-lock.json', 'npm-shrinkwrap.json',
+            relevant = (path.name.endswith('.csproj') or path.name in {'package.json', 'package-lock.json', 'npm-shrinkwrap.json',
                                      'yarn.lock', 'pnpm-lock.yaml', 'bun.lock', 'bun.lockb',
                                      'requirements.txt', 'packages.lock.json'})
             if not relevant:
@@ -305,8 +306,11 @@ def inspect_repo(root, binary):
                     result['gaps'].append(f'{relative}: exceeds 32 MiB input limit')
                     continue
                 raw = path.read_bytes()
+            except FileNotFoundError:
+                result['gaps'].append(f'{relative}: tracked input missing from working tree')
+                continue
             except OSError as e:
-                result['gaps'].append(f'{relative}: {e}')
+                result['errors'].append(f'{relative}: unreadable input: {e}')
                 continue
             result['input_hashes'][relative] = hashlib.sha256(raw).hexdigest()
             if path.name == 'package.json':
@@ -349,35 +353,80 @@ def inspect_repo(root, binary):
                     result['gaps'].extend(f'{relative}: {g}' for g in gaps)
                 except (ValueError, TypeError) as e:
                     result['errors'].append(f'{relative}: {e}')
+            elif path.name.endswith('.csproj'):
+                lockfile = (Path(relative).parent / 'packages.lock.json').as_posix()
+                if lockfile not in tracked_paths:
+                    result['gaps'].append(f'{relative}: no tracked packages.lock.json')
             elif path.name in {'pnpm-lock.yaml', 'bun.lock', 'bun.lockb'}:
                 result['gaps'].append(f'{relative}: unsupported lockfile format')
+        for manifest in sorted(covered_manifests):
+            if manifest not in tracked_paths:
+                result['gaps'].append(f'{manifest}: manifest expected by lockfile is not tracked')
         for manifest in result['manifests']:
             if manifest not in covered_manifests:
                 result['gaps'].append(f'{manifest}: not mapped to a supported lockfile/workspace')
         result['packages'] = [list(p) for p in sorted(packages)]
         if (root / '.github').is_symlink() or (root / '.github/workflows').is_symlink():
-            raise ValueError('workflow directory symlink excluded')
+            result['errors'].append('workflow directory symlink excluded')
         workflow_bytes = 0
-        for path in (root / '.github/workflows').rglob('*'):
-            if path.is_symlink() or not path.is_file() or path.suffix not in ('.yml', '.yaml'):
+        workflow_paths = []
+        workflow_root = root / '.github/workflows'
+        tracked_workflow_paths = {
+            relative for relative in tracked_paths
+            if relative.startswith('.github/workflows/')
+            and Path(relative).suffix in ('.yml', '.yaml')
+        }
+        for relative in sorted(tracked_workflow_paths):
+            path = root / relative
+            if not path.is_file() and not path.is_symlink():
+                result['gaps'].append(f'{relative}: tracked workflow missing from working tree')
+        try:
+            workflow_paths = list(workflow_root.rglob('*')) if workflow_root.exists() else []
+        except OSError as e:
+            result['errors'].append(f'workflow discovery failed: {e}')
+        for path in workflow_paths:
+            if path.is_symlink():
+                result['gaps'].append(f'{path.relative_to(root)}: workflow symlink excluded')
                 continue
-            size = path.stat().st_size
-            workflow_bytes += size
-            if size > 32 * 1024 * 1024 or workflow_bytes > 64 * 1024 * 1024:
-                raise ValueError('workflow inputs exceed evaluation size limit')
-            result['input_hashes'][str(path.relative_to(root))] = hashlib.sha256(path.read_bytes()).hexdigest()
-        scan = subprocess.run([str(binary), 'scan-actions', str(root), '--json'],
-                              capture_output=True, text=True, timeout=60)
-        if scan.returncode not in (0, 2):
-            result['errors'].append('workflow scan: ' + scan.stderr.strip()[:2000])
-        else:
-            result['actions'] = json.loads(scan.stdout)
-        if not result['manifests'] and not result.get('actions', {}).get('references'):
-            result['gaps'].append('no supported package manifests or Action references found')
+            if not path.is_file() or path.suffix not in ('.yml', '.yaml'):
+                continue
+            try:
+                size = path.stat().st_size
+                workflow_bytes += size
+                if size > 32 * 1024 * 1024 or workflow_bytes > 64 * 1024 * 1024:
+                    raise ValueError('workflow inputs exceed evaluation size limit')
+                result['input_hashes'][str(path.relative_to(root))] = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError as e:
+                result['errors'].append(f'workflow input unreadable ({path.relative_to(root)}): {e}')
+        workflow_scan_succeeded = False
+        try:
+            scan = subprocess.run([str(binary), 'scan-actions', str(root), '--json'],
+                                  capture_output=True, text=True, timeout=60)
+            if scan.returncode not in (0, 2):
+                result['errors'].append(f'workflow scanner failed (exit {scan.returncode}): {scan.stderr.strip()[:2000]}')
+            else:
+                try:
+                    actions = json.loads(scan.stdout)
+                    if not isinstance(actions, dict) or not isinstance(actions.get('references'), list) or not isinstance(actions.get('findings'), list):
+                        raise ValueError('missing or invalid references/findings arrays')
+                    result['actions'] = actions
+                    workflow_scan_succeeded = True
+                except (ValueError, TypeError) as e:
+                    result['errors'].append(f'workflow JSON invalid: {e}')
+        except (OSError, subprocess.SubprocessError) as e:
+            result['errors'].append(f'workflow scanner execution failed: {e}')
+        has_unassessed_package_inputs = (
+            any(not item['excluded'] for item in result['input_inventory'])
+            and not result['manifests'] and not result['lockfiles'])
+        has_workflow_inputs = bool(tracked_workflow_paths) or any(
+            not path.is_symlink() and path.is_file() and path.suffix in ('.yml', '.yaml')
+            for path in workflow_paths)
+        if has_unassessed_package_inputs or (has_workflow_inputs and not workflow_scan_succeeded):
+            result['gaps'].append('supported package/workflow inputs were not successfully assessed')
         if result['commit'] is not None and result['commit'] != command(['git', '-C', str(root), 'rev-parse', 'HEAD']):
             result['errors'].append('HEAD changed during evaluation')
     except (OSError, ValueError, subprocess.SubprocessError) as e:
-        result['gaps'].append(f'repository could not be read: {e}')
+        result['errors'].append(f'repository evaluation failed: {e}')
     result['duration_seconds'] = round(time.monotonic() - started, 2)
     return result
 
@@ -492,12 +541,16 @@ def run(config, inventory_only=False):
             write_json(run_dir / 'repos' / f'{key}.json', report)
         baseline_path = state / 'baseline.json'
         previous = json.loads(baseline_path.read_text()) if baseline_path.exists() else None
+        previous_complete = (previous is not None and previous.get('complete', not (
+            previous.get('errors') or previous.get('gaps') or previous.get('discovery_warnings')
+            or previous.get('repository_count', 0) == 0)))
         identities = {json.dumps(f, sort_keys=True) for f in findings}
-        baseline_ids = {json.dumps(f, sort_keys=True) for f in previous['findings']} if previous else set()
-        comparable = (previous is not None and previous['binary_sha256'] == binary_hash
+        baseline_ids = {json.dumps(f, sort_keys=True) for f in previous.get('findings', [])} if previous_complete else set()
+        current_gaps = [{'repo': r['path'], 'details': r['gaps']} for r in reports if r['gaps']]
+        complete = bool(reports) and not errors and not warnings and not current_gaps
+        comparable = (complete and previous_complete and previous['binary_sha256'] == binary_hash
                       and previous.get('runner_sha256') == runner_hash
-                      and previous['inventory']['roots'] == config['roots']
-                      and not previous['errors'] and not errors)
+                      and previous['inventory']['roots'] == config['roots'])
         summary = {'started_at': started, 'finished_at': datetime.now(timezone.utc).isoformat(),
             'run_directory': str(run_dir), 'binary_sha256': binary_hash,
             'runner_sha256': runner_hash, 'inventory': inventory,
@@ -513,7 +566,7 @@ def run(config, inventory_only=False):
                                'errors': len(r['errors']), 'gaps': len(r['gaps'])} for r in reports],
             'osv_evaluated_versions': len(osv), 'findings': findings,
             'errors': errors, 'discovery_warnings': warnings,
-            'gaps': [{'repo': r['path'], 'details': r['gaps']} for r in reports if r['gaps']],
+            'gaps': current_gaps, 'complete': complete,
             'new_findings': [json.loads(f) for f in sorted(identities - baseline_ids)] if comparable else [],
             'baseline_comparable': comparable,
             'repositories_removed_since_baseline': sorted(set(previous['inventory']['repositories']) - set(inventory['repositories'])) if previous else [],
@@ -523,29 +576,36 @@ def run(config, inventory_only=False):
                 'No quarantine-age, upstream update, or artifact-integrity evaluation in this run',
                 'Other package ecosystems (RubyGems, Cargo, Maven, Go) and untracked inputs are not evaluated']}
         write_json(run_dir / 'summary.json', summary)
-        lines = ['# Machine evaluation', '', f'Repositories: {len(reports)}',
+        heading = '# Machine evaluation' if complete else '# INCOMPLETE machine evaluation'
+        lines = [heading, '', f'Repositories: {len(reports)}',
             f'Unique npm: {summary["unique_npm_versions"]}; pip: {summary["unique_pip_versions"]}; '
             f'nuget: {summary["unique_nuget_versions"]}; OSV evaluated: {len(osv)}',
-            f'Finding records: {len(findings)}; errors: {len(errors)}; repositories with gaps: {len(summary["gaps"])}',
+            f'Finding records: {len(findings)}; errors: {len(errors)}; repositories with gaps: {len(current_gaps)}',
             '', '## Tracked input inventory', '',
             json.dumps(dict(input_counts), sort_keys=True),
             'Per-repository paths and excluded inputs: input-inventory.json',
-            '', '## Findings', '']
+            '', '## Findings (observational; findings do not fail a complete scan)', '']
         lines.extend('- ' + json.dumps(f, ensure_ascii=True) for f in findings)
         lines.extend(['', '## Errors', ''] + ['- ' + e for e in errors])
         lines.extend(['', '## Discovery warnings', ''] + ['- ' + w for w in warnings])
-        lines.extend(['', '## Coverage gaps', ''] + ['- ' + json.dumps(g) for g in summary['gaps']])
+        lines.extend(['', '## Coverage gaps', ''] + ['- ' + json.dumps(g) for g in current_gaps])
         (run_dir / 'report.md').write_text('\n'.join(lines) + '\n')
-        # Preserve failed bootstrap baselines from older versions as evidence.
-        if previous and previous['errors'] and not errors and reports:
+        if previous is not None and not previous_complete and complete:
             archived = baseline_path.with_name('baseline-incomplete-' + run_dir.name + '.json')
             baseline_path.replace(archived)
             previous = None
-        if previous is None and not errors and reports:
+        if previous is None and complete:
             write_json(baseline_path, summary)
         write_json(state / 'latest.json', summary)
         print(f'Report: {run_dir / "report.md"}', flush=True)
-        return 2 if errors else 0
+        if not complete:
+            print('INCOMPLETE: evaluation has errors, coverage gaps, discovery warnings, or no repositories')
+            return 2
+        if findings:
+            print(f'OBSERVATIONAL FINDINGS: {len(findings)}; scan complete, exit 0')
+        else:
+            print('COMPLETE: no findings; observational scan only')
+        return 0
 
 
 def main():

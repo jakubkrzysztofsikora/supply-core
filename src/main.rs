@@ -125,6 +125,20 @@ enum Command {
         #[arg(long)]
         findings: Option<PathBuf>,
     },
+    ScanPackages {
+        #[arg(long = "npm-lock")]
+        npm_locks: Vec<PathBuf>,
+        #[arg(long = "nuget-lock")]
+        nuget_locks: Vec<PathBuf>,
+        #[arg(long)]
+        nuget_packages: Option<PathBuf>,
+        #[arg(long, required = true)]
+        policy: PathBuf,
+        #[arg(long)]
+        osv_cache: Option<PathBuf>,
+        #[arg(long, required = true)]
+        json: bool,
+    },
     /// Record content findings for a package archive so later evaluations
     /// can block it.
     ScanPackage {
@@ -293,6 +307,48 @@ async fn main() -> Result<()> {
             })
             .await
             .map_err(|e| anyhow::anyhow!("snapshot task failed: {e}"))??;
+        }
+        Command::ScanPackages {
+            npm_locks,
+            nuget_locks,
+            nuget_packages,
+            policy,
+            osv_cache,
+            json: _,
+        } => {
+            let mut policy = load_policy(Some(&policy))?;
+            policy.npm.fallback_to_frozen = false;
+            policy.nuget.fallback_to_frozen = false;
+            let (report, status) = tokio::task::spawn_blocking(move || {
+                supply_core::application::packages::scan(
+                    &npm_locks,
+                    &nuget_locks,
+                    nuget_packages.as_deref(),
+                    &policy,
+                    osv_cache.as_deref(),
+                )
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("package scan task failed: {error}"))??;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            eprintln!(
+                "scan-packages: inputs={} packages={} errors={} flagged={} complete={}",
+                report.inputs.len(),
+                report.packages.len(),
+                report.errors.len(),
+                report
+                    .packages
+                    .iter()
+                    .filter(|package| {
+                        (package.status != "allow" && package.status != "not-applicable")
+                            || !package.warnings.is_empty()
+                    })
+                    .count(),
+                report.complete
+            );
+            if status != 0 {
+                std::process::exit(status);
+            }
         }
         Command::ScanDocker { root, policy, json } => {
             let p = load_policy(policy.as_deref())?;
@@ -700,15 +756,13 @@ fn snapshot_nuget(
                 continue;
             }
         };
-        let pv =
-            match package_version_from_nuget(&payload, name, &version, pin.content_hash.as_deref())
-            {
-                Ok(pv) => pv,
-                Err(error) => {
-                    errors.push(serde_json::json!({ "package": name, "error": error.to_string() }));
-                    continue;
-                }
-            };
+        let pv = match package_version_from_nuget(&payload, name, &version, None, None) {
+            Ok(pv) => pv,
+            Err(error) => {
+                errors.push(serde_json::json!({ "package": name, "error": error.to_string() }));
+                continue;
+            }
+        };
         let age_days = pv
             .published_at
             .map(|t| now.signed_duration_since(t).num_days())

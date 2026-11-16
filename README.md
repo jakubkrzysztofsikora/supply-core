@@ -74,7 +74,7 @@ cargo run -- snapshot-npm .
 # pip: exact requirements.txt pins -> PyPI age, sha256, --hash validation
 cargo run -- snapshot-pip .
 
-# NuGet: packages.lock.json -> nuget.org age, contentHash verification
+# NuGet: registry metadata age and OSV snapshot
 cargo run -- snapshot-nuget .
 
 # Docker: flag FROM/image references without a sha256 digest
@@ -82,6 +82,35 @@ cargo run -- scan-docker .
 ```
 
 *`snapshot-*` prints a JSON report; `scan-docker` exits `2` when an image is unpinned.*
+
+For CI, scan committed lockfiles without snapshotting to current registry state:
+
+```bash
+cargo run -- scan-packages \
+  --npm-lock package-lock.json \
+  --npm-lock Circit.Frontend/package-lock.json \
+  --nuget-lock Src/App/packages.lock.json \
+  --nuget-packages "$NUGET_PACKAGES" \
+  --policy pipelines/supply-core.yml \
+  --json
+```
+
+Repeat each lock option for every lockfile in the restore graph. The scanner
+checks exact registry metadata, requires every npm SRI digest for the strongest
+algorithm present in the lock to match registry metadata (including historical
+SHA-1 locks through `dist.shasum`), and fails closed when registry metadata lacks
+the locked algorithm. Full npm registry URL paths keep same-host feeds
+independently assessed. It recomputes NuGet's signature-excluded `contentHash`,
+checks archive SHA-512 against the cache sidecar and registry package hash, and
+keeps same-host NuGet feeds independently assessed. It also checks publication
+age and OSV advisories. The JSON `source` retains validated feed paths and
+rejects URL credentials, queries, and fragments; keep scan artifacts within the
+CI access boundary because feed paths can identify private organization and
+project names. Exit `0` means complete with no policy findings, `2` means policy
+findings, and `1` means incomplete input or assessment. A scan
+with no registry packages across all inputs is incomplete, even when local
+links or empty locks are recorded as not-applicable. This gate verifies package
+archive bytes, not the extracted package tree or package malware.
 
 ### 5. Quarantine Content Scanning (0-day and AI-agent threats)
 
@@ -190,10 +219,10 @@ kubectl apply -k deploy/k8s
 | **OSV.dev Integration** | Real-time vulnerability batch query with CVSS & severity | Immediate awareness of newly disclosed CVEs |
 | **Passive Machine Scan** | Fast traversal of your repositories, worktree deduplication; npm, pip and NuGet advisories | Total situational awareness of local attack surface |
 | **PyPI Quarantine** | `snapshot-pip` checks exact requirements.txt pins: publish age, sha256, OSV advisories | Catches fresh malicious pip uploads before they reach your build |
-| **NuGet Quarantine** | `snapshot-nuget` checks resolved `packages.lock.json`: publish age, SHA-512 package hash, OSV | Catches fresh NuGet publishes with the same policy engine |
+| **NuGet Quarantine** | `scan-packages` verifies restored archives against `packages.lock.json` and registry hashes; `snapshot-nuget` checks registry publication age and OSV | Catches fresh NuGet publishes with the same policy engine |
 | **Docker Digest Pinning** | `scan-docker` flags `FROM`/`image:` references that lack an `@sha256:` digest | Mutable tags can be silently replaced under you |
 | **Quarantine Content Scan** | GuardDog plus built-in AI/agent rules over every version held by the quarantine window | Catches malware and prompt-injection payloads that have no CVE yet |
-| **100% Local & Airgapped** | Operates strictly on local files and local caching | Your private code and lockfiles never leave your machine |
+| **Local Analysis** | Package coordinates and versions go to registry/OSV metadata APIs; private code and lockfiles stay local | Your private code and lockfiles never leave your machine |
 
 ### Supported ecosystems
 
@@ -201,7 +230,7 @@ kubectl apply -k deploy/k8s
 |---|---|---|---|
 | npm | `package.json` deps | age quarantine, integrity, OSV, frozen fallback | `snapshot-npm` |
 | PyPI (pip) | `requirements.txt` exact pins (`==`, `===`) | age quarantine, sha256 integrity, `--hash` validation, OSV | `snapshot-pip` |
-| NuGet | `packages.lock.json` | age quarantine, lockfile `contentHash` verified against the SHA-512 package hash, OSV | `snapshot-nuget` |
+| NuGet | `packages.lock.json` plus restored package cache | age quarantine, signature-excluded `contentHash`, archive SHA-512 vs cache and registry, OSV | `scan-packages` |
 | Docker images | `Dockerfile*`, `docker-compose*.yml`, `compose.yml` | static `@sha256:<64-hex>` digest pinning | `scan-docker` |
 | GitHub Actions | `.github/workflows/*` | full-SHA pinning, `docker://` digest rule | `scan-actions` |
 | Azure Pipelines | `azure-pipelines*.yml` | task pinning rules | `scan-pipelines` |

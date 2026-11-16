@@ -64,6 +64,32 @@ git@*:
             self.assertTrue(any('no resolutions' in error for error in result['errors']))
             self.assertTrue(any('not mapped' in gap for gap in result['gaps']))
 
+    def test_excluded_package_inputs_do_not_create_assessment_gap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            vendor = root / 'vendor'
+            vendor.mkdir()
+            (vendor / 'package.json').write_text('{}')
+            (vendor / 'package-lock.json').write_text('{}')
+
+            def git(args, timeout=30):
+                if 'ls-files' in args:
+                    return 'vendor/package.json\0vendor/package-lock.json'
+                if 'status' in args:
+                    return ''
+                return 'abc'
+
+            with patch.object(evaluation, 'command', side_effect=git), patch.object(
+                    evaluation.subprocess, 'run', return_value=SimpleNamespace(
+                        returncode=0, stdout='{"references":[],"findings":[]}')):
+                result = evaluation.inspect_repo(root, Path('/unused'))
+
+            self.assertEqual(result['packages'], [])
+            self.assertEqual(len(result['input_inventory']), 2)
+            self.assertTrue(all(item['excluded'] for item in result['input_inventory']))
+            self.assertFalse(result['gaps'])
+            self.assertFalse(result['errors'])
+
     def test_missing_input_and_head_do_not_abort_remaining_inspection(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -107,6 +133,171 @@ git@*:
             self.assertTrue(any('apps/other/package.json' in gap for gap in result['gaps']))
             self.assertFalse(result['errors'])
 
+    def test_untracked_nuget_lock_does_not_cover_tracked_project(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / 'Project.csproj').write_text('<Project />')
+            (root / 'packages.lock.json').write_text('{"dependencies": {}}')
+
+            def git(args, timeout=30):
+                if 'ls-files' in args:
+                    return 'Project.csproj'
+                if 'status' in args:
+                    return ''
+                return 'abc'
+
+            with patch.object(evaluation, 'command', side_effect=git), patch.object(
+                    evaluation.subprocess, 'run', return_value=SimpleNamespace(
+                        returncode=0, stdout='{"references":[],"findings":[]}')):
+                result = evaluation.inspect_repo(root, Path('/unused'))
+
+            self.assertTrue(any(
+                'Project.csproj' in gap and 'tracked packages.lock.json' in gap
+                for gap in result['gaps']
+            ))
+
+    def test_tracked_workflow_missing_from_worktree_is_a_coverage_gap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / 'package.json').write_text('{}')
+            (root / 'package-lock.json').write_text(json.dumps({
+                'lockfileVersion': 3,
+                'packages': {'': {}, 'node_modules/a': {'version': '1.2.3'}},
+            }))
+            (root / '.github/workflows').mkdir(parents=True)
+
+            def git(args, timeout=30):
+                if 'ls-files' in args:
+                    return 'package.json\0package-lock.json\0.github/workflows/deploy.yml'
+                if 'status' in args:
+                    return ''
+                return 'abc'
+
+            with patch.object(evaluation, 'command', side_effect=git), patch.object(
+                    evaluation.subprocess, 'run', return_value=SimpleNamespace(
+                        returncode=0, stdout='{"references":[],"findings":[]}')):
+                result = evaluation.inspect_repo(root, Path('/unused'))
+
+            self.assertTrue(any(
+                '.github/workflows/deploy.yml' in gap and 'missing from working tree' in gap
+                for gap in result['gaps']
+            ))
+
+    def test_workflow_without_action_references_is_still_assessed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            workflows = root / '.github/workflows'
+            workflows.mkdir(parents=True)
+            (workflows / 'ci.yml').write_text(
+                'name: ci\non: push\njobs:\n  test:\n    steps:\n      - run: echo ok\n'
+            )
+
+            def git(args, timeout=30):
+                if 'ls-files' in args:
+                    return '.github/workflows/ci.yml'
+                if 'status' in args:
+                    return ''
+                return 'abc'
+
+            actions = {'references': [], 'findings': []}
+            with patch.object(evaluation, 'command', side_effect=git), patch.object(
+                    evaluation.subprocess, 'run', return_value=SimpleNamespace(
+                        returncode=0, stdout=json.dumps(actions))):
+                result = evaluation.inspect_repo(root, Path('/unused'))
+
+            self.assertEqual(result['actions'], actions)
+            self.assertFalse(result['errors'])
+            self.assertFalse(result['gaps'])
+
+    def test_workflow_symlink_is_a_coverage_gap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            workflows = root / '.github/workflows'
+            workflows.mkdir(parents=True)
+            regular = workflows / 'ci.yml'
+            regular.write_text('name: ci')
+            (workflows / 'linked.yml').symlink_to(regular)
+
+            def git(args, timeout=30):
+                if 'ls-files' in args:
+                    return '.github/workflows/ci.yml\0.github/workflows/linked.yml'
+                if 'status' in args:
+                    return ''
+                return 'abc'
+
+            actions = json.dumps({
+                'references': [{'file': 'ci.yml', 'line': 1, 'raw': 'actions/checkout@abc',
+                                'pin_kind': 'FullSha'}],
+                'findings': [],
+            })
+            with patch.object(evaluation, 'command', side_effect=git), patch.object(
+                    evaluation.subprocess, 'run', return_value=SimpleNamespace(
+                        returncode=0, stdout=actions)):
+                result = evaluation.inspect_repo(root, Path('/unused'))
+
+            self.assertTrue(any('linked.yml' in gap for gap in result['gaps']))
+
+    def test_old_incomplete_baseline_is_not_comparable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / 'binary'
+            binary.write_bytes(b'fixture')
+            state = root / 'state'
+            state.mkdir()
+            evaluation.write_json(state / 'baseline.json', {
+                'errors': [], 'gaps': [{'repo': 'old', 'details': ['missing lock']}],
+                'discovery_warnings': [], 'repository_count': 1, 'findings': [{'old': True}],
+                'binary_sha256': 'same', 'runner_sha256': 'same',
+                'inventory': {'roots': [str(root)], 'repositories': []}, 'run_directory': 'old'})
+            report = {'path': str(root), 'packages': [], 'errors': [], 'gaps': [],
+                      'duration_seconds': 0, 'actions': {'references': [], 'findings': []}}
+            config = {'state': str(state), 'roots': [str(root)], 'binary': str(binary)}
+            with patch.object(evaluation, 'discover', return_value=([root], [], [], [])), patch.object(
+                    evaluation, 'inspect_repo', return_value=report), patch.object(
+                    evaluation, 'query_osv', return_value=({}, [])):
+                self.assertEqual(evaluation.run(config), 0)
+            summary = json.loads((state / 'latest.json').read_text())
+            self.assertTrue(summary['complete'])
+            self.assertFalse(summary['baseline_comparable'])
+            self.assertEqual(summary['new_findings'], [])
+
+    def test_complete_advisory_scan_is_observational(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / 'binary'
+            binary.write_bytes(b'fixture')
+            report = {'path': str(root), 'packages': [['npm', 'a', '1.0.0']], 'errors': [],
+                      'gaps': [], 'duration_seconds': 0,
+                      'actions': {'references': [], 'findings': []}}
+            config = {'state': str(root / 'state'), 'roots': [str(root)], 'binary': str(binary)}
+            with patch.object(evaluation, 'discover', return_value=([root], [], [], [])), patch.object(
+                    evaluation, 'inspect_repo', return_value=report), patch.object(
+                    evaluation, 'query_osv', return_value=({'["npm","a","1.0.0"]': ['GHSA-test']}, [])):
+                self.assertEqual(evaluation.run(config), 0)
+            latest = json.loads((root / 'state/latest.json').read_text())
+            self.assertTrue(latest['complete'])
+            self.assertEqual(len(latest['findings']), 1)
+            markdown = Path(latest['run_directory']) / 'report.md'
+            self.assertIn('observational', markdown.read_text())
+            self.assertIn('\n## Tracked input inventory\n', markdown.read_text())
+
+    def test_malformed_workflow_json_and_scanner_failure_are_errors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / '.github/workflows').mkdir(parents=True)
+            (root / '.github/workflows/ci.yml').write_text('name: ci')
+            def git(args, timeout=30):
+                if 'ls-files' in args:
+                    return '.github/workflows/ci.yml'
+                return 'abc'
+            for code, output, expected in ((0, '{', 'workflow JSON invalid'),
+                                           (3, '', 'workflow scanner failed')):
+                with patch.object(evaluation, 'command', side_effect=git), patch.object(
+                        evaluation.subprocess, 'run', return_value=SimpleNamespace(
+                            returncode=code, stdout=output, stderr='scanner broke')):
+                    result = evaluation.inspect_repo(root, Path('/unused'))
+                self.assertTrue(any(expected in error for error in result['errors']))
+                self.assertFalse(any('could not be read' in gap for gap in result['gaps']))
     def test_failed_baseline_is_never_comparable_to_recovery(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -23,6 +23,11 @@ cp candidates.example.txt candidates.txt   # then point entries at your checkout
 python3 report.py           # baseline vs latest diff
 ```
 
+`run.sh` and `report.py` share npm snapshot validation. Every dependency needs a
+package name, resolved version, and recognized status; malformed snapshots make
+capture incomplete.
+
+
 ## Daily auto-capture (GitHub-backed)
 
 The cron wrapper pulls latest from the repo before each run, so editing

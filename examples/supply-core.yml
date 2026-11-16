@@ -12,14 +12,14 @@ vulnerabilities:
     - Critical
 npm:
   require_integrity: true
-  fallback_to_frozen: true
+  fallback_to_frozen: false
   deny_packages: []
 pip:
   require_integrity: true
   fallback_to_frozen: true
 nuget:
   require_integrity: true
-  fallback_to_frozen: true
+  fallback_to_frozen: false
 docker:
   require_digest_pin: true
 quarantine_scanner:        # enforces `scan-package` findings passed via --findings

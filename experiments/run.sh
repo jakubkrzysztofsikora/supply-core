@@ -18,8 +18,8 @@ attempted=0
 
 while IFS=$'\t' read -r name root tracks; do
   case "$name" in ''|'#'*) continue;; esac
-  [ -d "$root" ] || { echo "SKIP $name (missing: $root)"; continue; }
   attempted=$((attempted + 1))
+  [ -d "$root" ] || { echo "INCOMPLETE $name (missing candidate: $root)"; failed=1; continue; }
   case "$tracks" in
     *npm*)
       out="$DIR/$name.npm.json"
@@ -28,18 +28,20 @@ while IFS=$'\t' read -r name root tracks; do
       if [ -f "$FINDINGS" ]; then extra+=(--findings "$FINDINGS"); fi
       start=$(python3 -c 'import time; print(time.time())')
       if "$BIN" snapshot-npm "$root" --osv --osv-cache "$OSV_CACHE" ${extra[@]+"${extra[@]}"} > "$out" 2>"$DIR/$name.npm.err"; then
-        if ! python3 - "$out" <<'PY'
+      if ! python3 - "$out" "$HERE" <<'PY'
 import json, sys
-doc = json.load(open(sys.argv[1]))
-if not isinstance(doc.get("dependencies"), list) or doc.get("errors") != []:
-    print(f"Incomplete npm snapshot: {doc.get('errors', 'missing errors field')}", file=sys.stderr)
-    sys.exit(1)
+sys.path.insert(0, sys.argv[2])
+from capture_validation import validate_npm_capture
+with open(sys.argv[1], encoding="utf-8") as report_file:
+    doc = json.load(report_file)
+dependencies = validate_npm_capture(doc)
+print(f"CAPTURED npm packages={len(dependencies)} flagged={sum(d['status'] != 'Allow' for d in dependencies)}")
 PY
         then
           failed=1
           echo "FAIL $name npm snapshot is incomplete"
         else
-          echo "OK   $name npm"
+          :
         fi
       else
         failed=1
@@ -57,7 +59,18 @@ PY
       rc=0
       "$BIN" scan-actions "$root" --json > "$out" 2>"$DIR/$name.actions.err" || rc=$?
       if [ "$rc" -eq 0 ] || [ "$rc" -eq 2 ]; then
-        echo "OK   $name actions"
+        if ! python3 - "$out" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+if not isinstance(doc, dict) or not isinstance(doc.get("references"), list) or not isinstance(doc.get("findings"), list):
+    print("Incomplete actions snapshot: missing or invalid references/findings arrays", file=sys.stderr)
+    sys.exit(1)
+print(f"CAPTURED actions references={len(doc['references'])} findings={len(doc['findings'])}")
+PY
+        then
+          failed=1
+          echo "INCOMPLETE $name actions snapshot"
+        fi
       else
         failed=1
         echo "FAIL $name scan-actions (see $name.actions.err)"
