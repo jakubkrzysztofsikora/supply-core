@@ -9,7 +9,7 @@ use crate::{
 use anyhow::Result;
 use axum::{
     extract::{Path as AxumPath, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, Method, StatusCode},
     response::{IntoResponse, Redirect, Response},
     routing::{get, post, put},
     Json, Router,
@@ -20,6 +20,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+use tower_http::cors::{Any, CorsLayer};
 
 const PUBLIC_STATUS_PAGE: &str = include_str!("../../../web/index.html");
 
@@ -192,20 +193,27 @@ pub fn app() -> Router {
 
 pub fn app_with_config(config: ServerConfig) -> Router {
     let state = Arc::new(config);
+    let public_cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET]);
 
-    Router::new()
+    let public = Router::new()
         .route("/health", get(health_check))
-        .route("/", get(status_page))
         .route("/api/v1/health", get(detailed_health))
         .route("/api/v1/status", get(public_status))
-        .route("/api/v1/status/quarantine", put(publish_quarantine_status))
         .route("/api/v1/status/card.svg", get(status_card))
         .route("/api/v1/version", get(version_info))
+        .layer(public_cors);
+
+    Router::new()
+        .route("/", get(status_page))
+        .route("/api/v1/status/quarantine", put(publish_quarantine_status))
         .route("/api/v1/download/:artifact", get(download_artifact))
         .route("/api/v1/scan/pipelines", post(scan_azure_pipelines))
         .route("/api/v1/scan/azure-pipelines", post(scan_azure_pipelines))
         .route("/api/v1/scan/actions", post(scan_github_actions))
         .route("/api/v1/scan/github-actions", post(scan_github_actions))
+        .merge(public)
         .with_state(state)
 }
 
@@ -717,8 +725,7 @@ async fn version_info(State(state): State<Arc<ServerConfig>>) -> Json<Value> {
         "download_base": "/api/v1/download",
         "artifacts": [
             "supply-core-linux-x86_64",
-            "supply-core-macos-arm64",
-            "supply-core-macos-x86_64"
+            "supply-core-darwin-arm64"
         ]
     }))
 }
@@ -1155,6 +1162,54 @@ mod tests {
             .unwrap_or_else(|_| panic!("body"));
         let svg = String::from_utf8_lossy(&body);
         assert!(svg.contains("<svg"), "expected an SVG body, got {svg}");
+    }
+
+    #[tokio::test]
+    async fn public_reads_allow_any_origin_but_writes_do_not() {
+        let directory = tempfile::tempdir().unwrap_or_else(|_| panic!("temporary directory"));
+        let send = |request: Request<axum::body::Body>| {
+            app_with_config(ServerConfig {
+                status_file: Some(directory.path().join("status.json")),
+                auth_token: Some("token".into()),
+                ..ServerConfig::default()
+            })
+            .oneshot(request)
+        };
+        let allow_origin = |response: &Response| {
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+
+        for uri in ["/api/v1/status", "/api/v1/health", "/api/v1/version"] {
+            let response = send(
+                Request::builder()
+                    .uri(uri)
+                    .header(header::ORIGIN, "https://supply-core.jakub.team")
+                    .body(axum::body::Body::empty())
+                    .unwrap_or_else(|_| panic!("valid request")),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("request succeeds"));
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            assert_eq!(allow_origin(&response).as_deref(), Some("*"), "{uri}");
+        }
+
+        let preflight = send(
+            Request::builder()
+                .method(Method::OPTIONS)
+                .uri("/api/v1/status/quarantine")
+                .header(header::ORIGIN, "https://evil.example")
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "PUT")
+                .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "authorization")
+                .body(axum::body::Body::empty())
+                .unwrap_or_else(|_| panic!("valid request")),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("request succeeds"));
+        assert_eq!(allow_origin(&preflight), None);
     }
 
     #[tokio::test]

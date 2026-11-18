@@ -1,6 +1,6 @@
 [package]
 name = "supply-core"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 
 [dependencies]
@@ -30,7 +30,7 @@ rusqlite = { version = "0.42", features = ["bundled"] }
 serde_json_canonicalizer = "0.4"
 tokio = { version = "1", features = ["full"] }
 toml = "0.8"
-tower-http = { version = "0.6", features = ["trace"] }
+tower-http = { version = "0.6", features = ["trace", "cors"] }
 urlencoding = "2"
 walkdir = "2"
 zstd = "=0.13.3"
