@@ -155,7 +155,8 @@ impl<'a> PackageEvaluator<'a> {
             self.vulns
                 .query_version(ecosystem.clone(), name, query_version_text)?
         } else {
-            self.vulns.query(ecosystem.clone(), name, &version.version)?
+            self.vulns
+                .query(ecosystem.clone(), name, &version.version)?
         };
         if let Some(reason) = self.vulnerability_reason(&findings) {
             return self.fallback_or_block(version, requested, version_text, reason);
