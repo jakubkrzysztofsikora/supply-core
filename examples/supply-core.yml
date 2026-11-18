@@ -5,9 +5,10 @@ server:
 quarantine:
   enabled: true
   minimum_age_days: 7
-  cve_keeps_quarantined: true  # Overrides block_severities: any known advisory, any severity, blocks the version forever
+  cve_keeps_quarantined: true  # Also blocks non-OSV findings at every severity
+# OSV advisories always block, regardless of severity or this setting.
 vulnerabilities:
-  block_severities:           # Applies only when cve_keeps_quarantined is false
+  block_severities:           # Applies to non-OSV findings when the setting is false
     - High
     - Critical
 npm:

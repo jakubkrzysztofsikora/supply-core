@@ -73,7 +73,7 @@ class SuspectedTest(unittest.TestCase):
         scan_report = {
             "scanned": [
                 {"package": "zod", "version": "4.6.4", "findings": 1, "score": 1,
-                 "rules": ["obfuscation", "provenance-attested"]},
+                 "rules": ["obfuscation"]},
                 {"package": "clean", "version": "9.9.9", "findings": 0, "score": 0, "rules": []},
                 {"package": "evil", "version": "1.0.0", "findings": 1, "score": 9,
                  "rules": ["ai-install-script", "extra", "r3", "r4", "r5", "r6", "r7", "r8", "r9"]},
@@ -84,8 +84,43 @@ class SuspectedTest(unittest.TestCase):
         self.assertEqual(rows[0]["score"], 9)
         self.assertEqual(len(rows[0]["rules"]), publish_status.MAX_RULES)
         self.assertEqual(rows[1], {"name": "zod", "version": "4.6.4", "score": 1,
-                                   "rules": ["obfuscation", "provenance-attested"]})
+                                   "rules": ["obfuscation"]})
 
+
+    def test_partial_block_remains_visible_with_incomplete_status(self):
+        scan_report = {
+            "scanned": [
+                {
+                    "package": "evil",
+                    "version": "1.0.0",
+                    "findings": 1,
+                    "score": 8,
+                    "rules": ["install-script-pipe"],
+                    "decision": "block",
+                    "coverage": "partial",
+                }
+            ],
+            "errors": [
+                {"package": "evil", "version": "1.0.0", "error": "missing scanner"}
+            ],
+        }
+        self.assertEqual(
+            publish_status.suspected_findings([], scan_report),
+            [
+                {
+                    "name": "evil",
+                    "version": "1.0.0",
+                    "score": 8,
+                    "rules": ["install-script-pipe"],
+                    "decision": "block",
+                    "coverage": "partial",
+                }
+            ],
+        )
+        self.assertEqual(
+            publish_status.scan_incomplete_findings([], scan_report),
+            [{"name": "evil", "version": "1.0.0", "verdict": "scan_incomplete"}],
+        )
     def test_warnings_are_fallback_when_no_scan_report(self):
         dependencies = [
             dependency("zod", "4.6.4", warnings=["content scan review (score 4): x [obfuscation]"]),
@@ -122,9 +157,13 @@ class SnapshotTest(unittest.TestCase):
                 ],
             }))
             (capture / "content-scan.json").write_text(json.dumps({
+                "captured_at": "2026-09-13T06:45:00Z",
+                "candidates": 1,
+                "errors": [],
                 "scanned": [
-                    {"package": "evil", "version": "1.0.0", "findings": 1, "score": 9,
-                     "rules": ["ai-install-script"]},
+                    {"package": "evil", "version": "1.0.0", "decision": "block",
+                     "coverage": "partial", "findings": 1, "score": 9,
+                     "rules": ["ai-install-script"], "sources": ["static-heuristics"]},
                 ]
             }))
             snapshot = publish_status.build_snapshot(capture)
@@ -134,6 +173,149 @@ class SnapshotTest(unittest.TestCase):
             self.assertEqual(snapshot["suspected"][0]["name"], "evil")
             self.assertEqual(snapshot["suspected"][0]["score"], 9)
 
+    def test_failed_scan_is_published_as_incomplete_without_a_score(self):
+        with tempfile.TemporaryDirectory() as directory:
+            capture = Path(directory)
+            dependency_data = dependency(
+                "odd", "1.0.0", ["quarantine content scan incomplete (timeout)"]
+            )
+            (capture / "odd.npm.json").write_text(json.dumps({
+                "captured_at": "2026-11-14T00:00:00Z",
+                "dependencies": [dependency_data],
+            }))
+            (capture / "content-scan.json").write_text(json.dumps({
+                "captured_at": "2026-11-14T00:00:00Z",
+                "candidates": 1,
+                "scanned": [],
+                "errors": [{"package": "odd", "version": "1.0.0", "error": "timeout"}],
+            }))
+            snapshot = publish_status.build_snapshot(capture)
+
+        self.assertEqual(snapshot["suspected"], [])
+        self.assertEqual(
+            snapshot["scan_incomplete"],
+            [{"name": "odd", "version": "1.0.0", "verdict": "scan_incomplete"}],
+        )
+        self.assertNotIn("score", snapshot["scan_incomplete"][0])
+
+
+    def test_scan_summary_keeps_exact_scores_and_drops_private_tool_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            capture = Path(directory)
+            (capture / "scan.npm.json").write_text(json.dumps({
+                "captured_at": "2026-11-15T08:00:00Z",
+                "dependencies": [],
+            }))
+            (capture / "content-scan.json").write_text(
+                '{"captured_at":"2026-11-15T08:30:00+00:00","candidates":2,'
+                '"scanned":['
+                '{"package":"@scope/evil","version":"1.0.0","decision":"block",'
+                '"coverage":"partial","findings":2,'
+                '"score":8.1234567890123456789012345678,'
+                '"rules":["install-script-pipe"],"sources":["static-heuristics"],'
+                '"location":"/Users/private/source.tar"},'
+                '{"package":"clean","version":"2.0.0","decision":"pass",'
+                '"coverage":"complete","findings":0,"score":0,'
+                '"rules":[],"sources":[]}],'
+                '"blocked":[{"package":"@scope/evil","version":"1.0.0"}],'
+                '"errors":[{"package":"failed","version":"1.0.0",'
+                '"error":"scanner output at /Users/private/secret.log"}]}'
+            )
+
+            snapshot = publish_status.build_snapshot(capture)
+
+        self.assertEqual(
+            snapshot["scan"],
+            {
+                "captured_at": "2026-11-15T08:30:00+00:00",
+                "candidate_count": 2,
+                "scanned": [
+                    {
+                        "name": "@scope/evil",
+                        "version": "1.0.0",
+                        "decision": "block",
+                        "coverage": "partial",
+                        "findings": 2,
+                        "score": "8.1234567890123456789012345678",
+                        "rules": ["install-script-pipe"],
+                        "sources": ["static-heuristics"],
+                    },
+                    {
+                        "name": "clean",
+                        "version": "2.0.0",
+                        "decision": "pass",
+                        "coverage": "complete",
+                        "findings": 0,
+                        "score": "0",
+                        "rules": [],
+                        "sources": [],
+                    },
+                ],
+                "error_count": 1,
+            },
+        )
+        serialized = json.dumps(snapshot)
+        self.assertNotIn("/Users/private", serialized)
+        self.assertNotIn("scanner output", serialized)
+        self.assertNotIn('"blocked"', serialized)
+
+    def test_legacy_capture_without_scan_report_has_no_scan_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            capture = Path(directory)
+            (capture / "legacy.npm.json").write_text(json.dumps({
+                "captured_at": "2026-11-15T08:00:00Z",
+                "dependencies": [],
+            }))
+
+            snapshot = publish_status.build_snapshot(capture)
+
+        self.assertNotIn("scan", snapshot)
+
+    def test_malformed_scan_report_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            capture = Path(directory)
+            (capture / "legacy.npm.json").write_text(json.dumps({
+                "captured_at": "2026-11-15T08:00:00Z",
+                "dependencies": [],
+            }))
+            (capture / "content-scan.json").write_text('{"scanned":"invalid"}')
+
+            with self.assertRaises(SystemExit):
+                publish_status.build_snapshot(capture)
+
+    def test_oversized_scan_report_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            capture = Path(directory)
+            (capture / "legacy.npm.json").write_text(json.dumps({
+                "captured_at": "2026-11-15T08:00:00Z",
+                "dependencies": [],
+            }))
+            (capture / "content-scan.json").write_text(
+                " " * (publish_status.MAX_SCAN_REPORT_BYTES + 1)
+            )
+
+            with self.assertRaises(SystemExit):
+                publish_status.build_snapshot(capture)
+
+    def test_incomplete_results_are_bounded_and_omissions_reported(self):
+        dependencies = [
+            dependency(
+                f"pkg-{index}",
+                "1.0.0",
+                ["quarantine content scan incomplete (timeout)"],
+            )
+            for index in range(1001)
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            capture = Path(directory)
+            (capture / "large.npm.json").write_text(json.dumps({
+                "captured_at": "2026-11-14T00:00:00Z",
+                "dependencies": dependencies,
+            }))
+            snapshot = publish_status.build_snapshot(capture)
+
+        self.assertEqual(len(snapshot["scan_incomplete"]), 1000)
+        self.assertEqual(snapshot["scan_incomplete_truncated"], 1)
     def test_missing_snapshots_fail(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaises(SystemExit):

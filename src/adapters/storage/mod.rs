@@ -2,14 +2,18 @@ use crate::{
     domain::*,
     ports::{ArtifactStore, MetadataStore},
 };
-use anyhow::Result;
-use semver::{Version, VersionReq};
+use anyhow::{ensure, Result};
+use node_semver::Range;
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use sha2::{Digest, Sha256};
 use std::{
-    fs,
-    io::Write,
+    fs::{self, File, OpenOptions},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::Mutex,
+    time::Duration,
 };
+pub mod ledger;
 
 /// The store directory must be writable only by trusted local processes.
 /// Canonical-path checks do not protect against concurrent filesystem changes.
@@ -52,66 +56,390 @@ fn ensure_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 impl FsArtifactStore {
-    fn confined_file(&self, path: &Path) -> Result<PathBuf> {
-        let artifacts_root = self.root.canonicalize()?.join("artifacts");
-        if !fs::symlink_metadata(&artifacts_root)?.file_type().is_dir() {
-            anyhow::bail!("artifact directory is not a plain directory");
-        }
-        let canonical = path.canonicalize()?;
-        if !canonical.starts_with(&artifacts_root) {
-            anyhow::bail!("artifact path escapes store root: {}", canonical.display());
-        }
-        if !fs::metadata(&canonical)?.is_file() {
-            anyhow::bail!(
-                "artifact path is not a regular file: {}",
-                canonical.display()
+    fn root_directory(&self) -> Result<PathBuf> {
+        fs::create_dir_all(&self.root)?;
+        Ok(self.root.canonicalize()?)
+    }
+
+    fn artifacts_directory(&self) -> Result<PathBuf> {
+        let path = self.root_directory()?.join("artifacts");
+        ensure_directory(&path)?;
+        Ok(path)
+    }
+
+    fn objects_directory(&self) -> Result<PathBuf> {
+        let path = self.artifacts_directory()?.join("sha256");
+        ensure_directory(&path)?;
+        Ok(path)
+    }
+
+    fn object_path(&self, digest: &str) -> Result<PathBuf> {
+        ensure!(is_sha256(digest), "invalid SHA-256 digest");
+        Ok(self.objects_directory()?.join(digest))
+    }
+
+    fn index_connection(&self) -> Result<Connection> {
+        let path = self.root_directory()?.join("artifact-index.sqlite");
+        if let Ok(metadata) = fs::symlink_metadata(&path) {
+            ensure!(
+                metadata.file_type().is_file(),
+                "artifact index is not a regular file"
             );
         }
+        let connection = Connection::open(path)?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        connection.pragma_update(None, "journal_mode", "WAL")?;
+        connection.execute_batch(
+            "PRAGMA synchronous=FULL;
+             CREATE TABLE IF NOT EXISTS artifact_mappings (
+                 source TEXT NOT NULL,
+                 ecosystem TEXT NOT NULL,
+                 name TEXT NOT NULL,
+                 version TEXT NOT NULL,
+                 filename TEXT NOT NULL,
+                 sha256 TEXT NOT NULL,
+                 PRIMARY KEY (source, ecosystem, name, version, filename)
+             ) WITHOUT ROWID;",
+        )?;
+        Ok(connection)
+    }
+
+    fn legacy_path(&self, key: &ArtifactKey) -> Result<PathBuf> {
+        let safe = sanitize_package_name(&key.name)?;
+        let version = key.version.to_string();
+        ensure!(
+            !version.is_empty()
+                && version != "."
+                && version != ".."
+                && !version.contains('/')
+                && !version.contains('\\'),
+            "legacy artifact version is not a path component"
+        );
+        Ok(self
+            .artifacts_directory()?
+            .join(safe)
+            .join(format!("{version}.tgz")))
+    }
+
+    fn confined_file(&self, path: &Path) -> Result<PathBuf> {
+        let artifacts_root = self.artifacts_directory()?.canonicalize()?;
+        let metadata = fs::symlink_metadata(path)?;
+        ensure!(
+            metadata.file_type().is_file(),
+            "legacy artifact is not a regular file"
+        );
+        let canonical = path.canonicalize()?;
+        ensure!(
+            canonical.starts_with(&artifacts_root),
+            "legacy artifact escapes store root: {}",
+            canonical.display()
+        );
         Ok(canonical)
     }
-}
-impl ArtifactStore for FsArtifactStore {
-    fn put(&self, name: &str, version: &Version, bytes: &[u8]) -> Result<String> {
-        let safe = sanitize_package_name(name)?;
-        fs::create_dir_all(&self.root)?;
-        let artifacts_root = self.root.canonicalize()?.join("artifacts");
-        ensure_directory(&artifacts_root)?;
-        let dir = artifacts_root.join(safe);
-        ensure_directory(&dir)?;
-        let p = dir.join(format!("{version}.tgz"));
-        let mut file = match fs::OpenOptions::new().write(true).create_new(true).open(&p) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                anyhow::bail!("artifact already exists: {}", p.display())
+
+    fn digest_for(&self, key: &ArtifactKey) -> Result<Option<String>> {
+        key.validate()?;
+        let connection = self.index_connection()?;
+        let digest = connection
+            .query_row(
+                "SELECT sha256 FROM artifact_mappings
+                 WHERE source = ?1 AND ecosystem = ?2 AND name = ?3
+                   AND version = ?4 AND filename = ?5",
+                params![
+                    key.source,
+                    ecosystem_key(&key.ecosystem),
+                    key.name,
+                    key.version.canonical(),
+                    key.filename
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(digest) = &digest {
+            ensure!(
+                is_sha256(digest),
+                "artifact index contains an invalid digest"
+            );
+        }
+        Ok(digest)
+    }
+
+    fn store_reader(
+        &self,
+        reader: &mut dyn Read,
+        max_bytes: u64,
+        expected_digest: Option<&str>,
+    ) -> Result<crate::ports::StoredArtifact> {
+        if let Some(expected_digest) = expected_digest {
+            ensure!(is_sha256(expected_digest), "invalid SHA-256 digest");
+        }
+        let (temporary, digest) = self.stage_reader(reader, max_bytes)?;
+        if let Some(expected_digest) = expected_digest {
+            ensure!(
+                digest == expected_digest,
+                "artifact bytes do not match the expected digest"
+            );
+        }
+        self.publish_object(&temporary.0, &digest)?;
+        let path = self.object_path(&digest)?.canonicalize()?;
+        let file = self
+            .open_verified_object(&digest)?
+            .ok_or_else(|| anyhow::anyhow!("published artifact object is missing"))?;
+        Ok(crate::ports::StoredArtifact {
+            sha256: digest,
+            path: path.display().to_string(),
+            file,
+        })
+    }
+
+    fn stage_reader(
+        &self,
+        reader: &mut dyn Read,
+        max_bytes: u64,
+    ) -> Result<(TemporaryArtifact, String)> {
+        let directory = self.objects_directory()?;
+        let mut staged = None;
+        for _ in 0..16 {
+            let mut nonce = [0; 16];
+            getrandom::fill(&mut nonce)?;
+            let path = directory.join(format!(".tmp-{}", hex::encode(nonce)));
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
             }
-            Err(e) => return Err(e.into()),
-        };
-        if let Err(error) = file.write_all(bytes) {
-            drop(file);
-            let _ = fs::remove_file(&p);
-            return Err(error.into());
+            match options.open(&path) {
+                Ok(file) => {
+                    staged = Some((TemporaryArtifact(path), file));
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
         }
-        Ok(p.display().to_string())
-    }
-    fn resolve(&self, name: &str, version: &Version) -> Result<Option<String>> {
-        let safe = match sanitize_package_name(name) {
-            Ok(s) => s,
-            Err(_) => return Ok(None),
-        };
-        let p = self
-            .root
-            .join("artifacts")
-            .join(safe)
-            .join(format!("{version}.tgz"));
-        match fs::symlink_metadata(&p) {
-            Ok(_) => Ok(Some(self.confined_file(&p)?.display().to_string())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
+        let (temporary, mut file) = staged
+            .ok_or_else(|| anyhow::anyhow!("could not create private artifact staging file"))?;
+        let mut hasher = Sha256::new();
+        let mut size = 0u64;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let remaining = max_bytes.saturating_sub(size);
+            let read_limit = usize::try_from(remaining.saturating_add(1).min(buffer.len() as u64))?;
+            let count = reader.read(&mut buffer[..read_limit])?;
+            if count == 0 {
+                break;
+            }
+            size = size
+                .checked_add(u64::try_from(count)?)
+                .ok_or_else(|| anyhow::anyhow!("artifact size overflow"))?;
+            ensure!(size <= max_bytes, "artifact exceeds its size limit");
+            hasher.update(&buffer[..count]);
+            file.write_all(&buffer[..count])?;
         }
+        file.sync_all()?;
+        let mut permissions = file.metadata()?.permissions();
+        permissions.set_readonly(true);
+        file.set_permissions(permissions)?;
+        drop(file);
+        Ok((temporary, hex::encode(hasher.finalize())))
     }
-    fn read(&self, path: &str) -> Result<Vec<u8>> {
-        let canonical = self.confined_file(Path::new(path))?;
-        Ok(fs::read(&canonical)?)
+
+    fn publish_object(&self, temporary: &Path, digest: &str) -> Result<()> {
+        let path = self.object_path(digest)?;
+        match fs::hard_link(temporary, &path) {
+            Ok(()) => {
+                #[cfg(unix)]
+                File::open(self.objects_directory()?)?.sync_all()?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                self.verify_object(&path, digest)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
+    fn map_artifact(&self, key: &ArtifactKey, digest: &str) -> Result<()> {
+        let mut connection = self.index_connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = transaction
+            .query_row(
+                "SELECT sha256 FROM artifact_mappings
+                 WHERE source = ?1 AND ecosystem = ?2 AND name = ?3
+                   AND version = ?4 AND filename = ?5",
+                params![
+                    key.source,
+                    ecosystem_key(&key.ecosystem),
+                    key.name,
+                    key.version.canonical(),
+                    key.filename
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if existing.as_deref().is_some_and(|stored| stored != digest) {
+            anyhow::bail!(
+                "artifact identity conflict for {} {}@{} ({})",
+                key.source,
+                key.name,
+                key.version,
+                key.filename
+            );
+        }
+        if existing.is_none() {
+            transaction.execute(
+                "INSERT INTO artifact_mappings
+                 (source, ecosystem, name, version, filename, sha256)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    key.source,
+                    ecosystem_key(&key.ecosystem),
+                    key.name,
+                    key.version.canonical(),
+                    key.filename,
+                    digest
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn verify_object(&self, path: &Path, digest: &str) -> Result<()> {
+        let metadata = fs::symlink_metadata(path)?;
+        ensure!(
+            metadata.file_type().is_file(),
+            "artifact object is not a regular file"
+        );
+        let mut file = File::open(path)?;
+        ensure!(
+            digest_reader(&mut file)? == digest,
+            "artifact object content does not match its digest"
+        );
+        Ok(())
+    }
+
+    fn open_verified_object(&self, digest: &str) -> Result<Option<File>> {
+        let path = self.object_path(digest)?;
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => ensure!(
+                metadata.file_type().is_file(),
+                "artifact object is not a regular file"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+        let objects_root = self.objects_directory()?.canonicalize()?;
+        let canonical = path.canonicalize()?;
+        ensure!(
+            canonical.starts_with(&objects_root),
+            "artifact object escapes store root: {}",
+            canonical.display()
+        );
+        let mut file = OpenOptions::new().read(true).open(canonical)?;
+        ensure!(
+            digest_reader(&mut file)? == digest,
+            "artifact object content does not match its digest"
+        );
+        file.seek(SeekFrom::Start(0))?;
+        Ok(Some(file))
+    }
+}
+
+fn ecosystem_key(ecosystem: &Ecosystem) -> &'static str {
+    match ecosystem {
+        Ecosystem::Npm => "npm",
+        Ecosystem::PyPi => "pypi",
+        Ecosystem::NuGet => "nuget",
+        Ecosystem::DockerImage => "docker-image",
+        Ecosystem::GitHubActions => "github-actions",
+        Ecosystem::AzurePipelines => "azure-pipelines",
+    }
+}
+
+fn is_sha256(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn digest_reader(reader: &mut impl Read) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+struct TemporaryArtifact(PathBuf);
+
+impl Drop for TemporaryArtifact {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+impl ArtifactStore for FsArtifactStore {
+    fn put(&self, reader: &mut dyn Read, max_bytes: u64) -> Result<crate::ports::StoredArtifact> {
+        self.store_reader(reader, max_bytes, None)
+    }
+
+    fn map(&self, key: &ArtifactKey, sha256: &str) -> Result<()> {
+        key.validate()?;
+        ensure!(is_sha256(sha256), "invalid SHA-256 digest");
+        let file = self
+            .open_verified_object(sha256)?
+            .ok_or_else(|| anyhow::anyhow!("artifact object is missing"))?;
+        drop(file);
+        self.map_artifact(key, sha256)
+    }
+
+    fn resolve(&self, key: &ArtifactKey) -> Result<Option<String>> {
+        let Some(digest) = self.digest_for(key)? else {
+            return Ok(None);
+        };
+        let Some(file) = self.open_verified_object(&digest)? else {
+            anyhow::bail!("indexed artifact object is missing");
+        };
+        drop(file);
+        let path = self.object_path(&digest)?.canonicalize()?;
+        let objects_root = self.objects_directory()?.canonicalize()?;
+        ensure!(
+            path.starts_with(&objects_root),
+            "artifact object escapes store root: {}",
+            path.display()
+        );
+        Ok(Some(path.display().to_string()))
+    }
+
+    fn open(&self, key: &ArtifactKey) -> Result<Option<File>> {
+        let Some(digest) = self.digest_for(key)? else {
+            return Ok(None);
+        };
+        self.open_verified_object(&digest)?
+            .map(Some)
+            .ok_or_else(|| anyhow::anyhow!("indexed artifact object is missing"))
+    }
+
+    fn import_legacy(&self, key: &ArtifactKey, expected_sha256: &str) -> Result<String> {
+        key.validate()?;
+        ensure!(
+            is_sha256(expected_sha256),
+            "invalid expected SHA-256 digest"
+        );
+        let legacy = self.confined_file(&self.legacy_path(key)?)?;
+        let mut source = File::open(legacy)?;
+        let stored = self.store_reader(&mut source, u64::MAX, Some(expected_sha256))?;
+        self.map(key, &stored.sha256)?;
+        Ok(stored.path)
     }
 }
 
@@ -141,7 +469,7 @@ impl MetadataStore for MemoryMetadataStore {
         &self,
         ecosystem: &Ecosystem,
         name: &str,
-        version: &Version,
+        version: &PackageVersionId,
     ) -> Result<Option<ContentFinding>> {
         Ok(self
             .findings
@@ -153,7 +481,12 @@ impl MetadataStore for MemoryMetadataStore {
                     && finding.package == name
                     && finding.version == *version
             })
-            .max_by_key(|finding| finding.score)
+            .max_by_key(|finding| {
+                (
+                    finding.scan_incomplete || finding.score.is_none(),
+                    finding.score,
+                )
+            })
             .cloned())
     }
 
@@ -166,42 +499,77 @@ impl MetadataStore for MemoryMetadataStore {
     }
     fn latest_frozen_satisfying(
         &self,
+        source: &str,
         ecosystem: &Ecosystem,
         name: &str,
-        requested: Option<&VersionReq>,
+        requested: Option<&Range>,
     ) -> Result<Option<FrozenArtifact>> {
+        let frozen = self
+            .frozen
+            .lock()
+            .map_err(|_| anyhow::anyhow!("lock poisoned"))?;
+        let mut latest: Option<&FrozenArtifact> = None;
+        for artifact in frozen.iter().filter(|artifact| {
+            artifact.key.source == source
+                && artifact.key.ecosystem == *ecosystem
+                && artifact.key.name == name
+        }) {
+            if let Some(range) = requested {
+                if *ecosystem != Ecosystem::Npm || !artifact.version.satisfies_npm_range(range) {
+                    continue;
+                }
+            }
+            let Some(current) = latest else {
+                latest = Some(artifact);
+                continue;
+            };
+            let order = artifact.version.precedence_cmp(&current.version)?;
+            let order = if order.is_eq() {
+                artifact
+                    .version
+                    .canonical()
+                    .cmp(current.version.canonical())
+                    .then_with(|| artifact.key.filename.cmp(&current.key.filename))
+            } else {
+                order
+            };
+            if order.is_gt() {
+                latest = Some(artifact);
+            }
+        }
+        Ok(latest.cloned())
+    }
+
+    fn get_frozen(&self, key: &ArtifactKey) -> Result<Option<FrozenArtifact>> {
         Ok(self
             .frozen
             .lock()
             .map_err(|_| anyhow::anyhow!("lock poisoned"))?
             .iter()
-            .filter(|a| a.package.ecosystem == *ecosystem)
-            .filter(|a| a.package.name == name)
-            .filter(|a| requested.is_none_or(|r| r.matches(&a.version)))
-            .max_by(|a, b| a.version.cmp(&b.version))
+            .find(|artifact| artifact.key == *key)
             .cloned())
     }
-    fn get_frozen(
-        &self,
-        ecosystem: &Ecosystem,
-        name: &str,
-        version: &Version,
-    ) -> Result<Option<FrozenArtifact>> {
-        Ok(self
+
+    fn put_frozen(&self, artifact: FrozenArtifact) -> Result<()> {
+        artifact.key.validate()?;
+        ensure!(
+            artifact.key.ecosystem == artifact.package.ecosystem
+                && artifact.key.name == artifact.package.name
+                && artifact.key.version == artifact.version,
+            "frozen artifact fields do not match its identity key"
+        );
+        let mut frozen = self
             .frozen
             .lock()
-            .map_err(|_| anyhow::anyhow!("lock poisoned"))?
-            .iter()
-            .find(|a| {
-                a.package.ecosystem == *ecosystem && a.package.name == name && a.version == *version
-            })
-            .cloned())
-    }
-    fn put_frozen(&self, a: FrozenArtifact) -> Result<()> {
-        self.frozen
-            .lock()
-            .map_err(|_| anyhow::anyhow!("lock poisoned"))?
-            .push(a);
+            .map_err(|_| anyhow::anyhow!("lock poisoned"))?;
+        if let Some(existing) = frozen.iter().find(|existing| existing.key == artifact.key) {
+            ensure!(
+                existing.sha256 == artifact.sha256,
+                "frozen artifact identity maps to conflicting digests"
+            );
+            return Ok(());
+        }
+        frozen.push(artifact);
         Ok(())
     }
 }
@@ -320,6 +688,30 @@ impl FindingFile {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use rust_decimal::Decimal;
+    fn npm_version(raw: &str) -> PackageVersionId {
+        PackageVersionId::parse(&Ecosystem::Npm, raw).unwrap()
+    }
+
+    fn artifact_key(url: &str, name: &str, version: &str) -> ArtifactKey {
+        ArtifactKey::from_tarball_url(url, &Ecosystem::Npm, name, &npm_version(version)).unwrap()
+    }
+    use std::io::Cursor;
+
+    fn put_bytes(
+        store: &FsArtifactStore,
+        key: &ArtifactKey,
+        bytes: &[u8],
+    ) -> Result<crate::ports::StoredArtifact> {
+        let mut reader = Cursor::new(bytes);
+        let stored = store.put(&mut reader, 64 * 1024 * 1024)?;
+        store.map(key, &stored.sha256)?;
+        Ok(stored)
+    }
+
+    fn put_path(store: &FsArtifactStore, key: &ArtifactKey, bytes: &[u8]) -> Result<String> {
+        Ok(put_bytes(store, key, bytes)?.path)
+    }
 
     #[test]
     fn finding_file_round_trips_jsonl_and_array() {
@@ -329,9 +721,10 @@ mod tests {
         let finding = |package: &str| ContentFinding {
             ecosystem: Ecosystem::Npm,
             package: package.to_string(),
-            version: Version::parse("1.0.0").unwrap(),
+            version: npm_version("1.0.0"),
             source: "static-heuristics".to_string(),
-            score: 9,
+            score: Some(Decimal::from(9)),
+            scan_incomplete: false,
             rules: vec![],
             summary: package.to_string(),
             detected_at: chrono::Utc::now(),
@@ -342,11 +735,11 @@ mod tests {
         let store = MemoryMetadataStore::default();
         assert_eq!(file.load_into(&store).unwrap(), 2);
         assert!(store
-            .content_finding(&Ecosystem::Npm, "a", &Version::parse("1.0.0").unwrap())
+            .content_finding(&Ecosystem::Npm, "a", &npm_version("1.0.0"))
             .unwrap()
             .is_some());
         assert!(store
-            .content_finding(&Ecosystem::Npm, "b", &Version::parse("1.0.0").unwrap())
+            .content_finding(&Ecosystem::Npm, "b", &npm_version("1.0.0"))
             .unwrap()
             .is_some());
 
@@ -359,7 +752,7 @@ mod tests {
         let store = MemoryMetadataStore::default();
         assert_eq!(FindingFile::new(&array_path).load_into(&store).unwrap(), 1);
         assert!(store
-            .content_finding(&Ecosystem::Npm, "c", &Version::parse("1.0.0").unwrap())
+            .content_finding(&Ecosystem::Npm, "c", &npm_version("1.0.0"))
             .unwrap()
             .is_some());
     }
@@ -371,9 +764,10 @@ mod tests {
         let finding = |package: &str| ContentFinding {
             ecosystem: Ecosystem::Npm,
             package: package.to_string(),
-            version: Version::parse("1.0.0").unwrap(),
+            version: npm_version("1.0.0"),
             source: "static-heuristics".to_string(),
-            score: 9,
+            score: Some(Decimal::from(9)),
+            scan_incomplete: false,
             rules: vec![],
             summary: package.to_string(),
             detected_at: chrono::Utc::now(),
@@ -397,9 +791,10 @@ mod tests {
         let finding = ContentFinding {
             ecosystem: Ecosystem::Npm,
             package: "a".to_string(),
-            version: Version::parse("1.0.0").unwrap(),
+            version: npm_version("1.0.0"),
             source: "static-heuristics".to_string(),
-            score: 9,
+            score: Some(Decimal::from(9)),
+            scan_incomplete: false,
             rules: vec![],
             summary: "a".to_string(),
             detected_at: chrono::Utc::now(),
@@ -411,7 +806,7 @@ mod tests {
         let store = MemoryMetadataStore::default();
         assert_eq!(file.load_into(&store).unwrap(), 1);
         assert!(store
-            .content_finding(&Ecosystem::Npm, "a", &Version::parse("1.0.0").unwrap())
+            .content_finding(&Ecosystem::Npm, "a", &npm_version("1.0.0"))
             .unwrap()
             .is_some());
     }
@@ -424,9 +819,10 @@ mod tests {
         let finding = |package: &str| ContentFinding {
             ecosystem: Ecosystem::Npm,
             package: package.to_string(),
-            version: Version::parse("1.0.0").unwrap(),
+            version: npm_version("1.0.0"),
             source: "static-heuristics".to_string(),
-            score: 9,
+            score: Some(Decimal::from(9)),
+            scan_incomplete: false,
             rules: vec![],
             summary: package.to_string(),
             detected_at: chrono::Utc::now(),
@@ -453,9 +849,10 @@ mod tests {
                     let finding = ContentFinding {
                         ecosystem: Ecosystem::Npm,
                         package: format!("pkg-{thread}-{index}"),
-                        version: Version::parse("1.0.0").unwrap(),
+                        version: npm_version("1.0.0"),
                         source: "static-heuristics".to_string(),
-                        score: 9,
+                        score: Some(Decimal::from(9)),
+                        scan_incomplete: false,
                         rules: vec![],
                         summary: "concurrent".to_string(),
                         detected_at: chrono::Utc::now(),
@@ -485,7 +882,7 @@ mod tests {
 
     #[test]
     fn parse_findings_handles_array_and_jsonl() {
-        let one = r#"{"ecosystem":"Npm","package":"a","version":"1.0.0","source":"s","score":9,"rules":[],"summary":"x"}"#;
+        let one = r#"{"ecosystem":"Npm","package":"a","version":{"ecosystem":"Npm","upstream":"1.0.0","canonical":"1.0.0"},"source":"s","score":9,"rules":[],"summary":"x"}"#;
         assert_eq!(parse_findings(&format!("[{one}]")).unwrap().len(), 1);
         assert_eq!(parse_findings(one).unwrap().len(), 1);
         assert_eq!(parse_findings(&format!("{one}\n{one}")).unwrap().len(), 2);
@@ -498,9 +895,10 @@ mod tests {
         let finding = |source: &str, score: u8| ContentFinding {
             ecosystem: Ecosystem::Npm,
             package: "evil".to_string(),
-            version: Version::parse("1.0.0").unwrap(),
+            version: npm_version("1.0.0"),
             source: source.to_string(),
-            score,
+            score: Some(score.into()),
+            scan_incomplete: false,
             rules: vec![],
             summary: source.to_string(),
             detected_at: chrono::Utc::now(),
@@ -510,11 +908,12 @@ mod tests {
             .unwrap();
         store.save_content_finding(&finding("guarddog", 1)).unwrap();
         let stored = store
-            .content_finding(&Ecosystem::Npm, "evil", &Version::parse("1.0.0").unwrap())
+            .content_finding(&Ecosystem::Npm, "evil", &npm_version("1.0.0"))
             .unwrap()
             .unwrap();
         assert_eq!(
-            stored.score, 9,
+            stored.score,
+            Some(Decimal::from(9)),
             "a later low score must not weaken enforcement"
         );
 
@@ -524,192 +923,481 @@ mod tests {
             .save_content_finding(&finding("static-heuristics", 9))
             .unwrap();
         let stored = store
-            .content_finding(&Ecosystem::Npm, "evil", &Version::parse("1.0.0").unwrap())
+            .content_finding(&Ecosystem::Npm, "evil", &npm_version("1.0.0"))
             .unwrap()
             .unwrap();
-        assert_eq!(stored.score, 9);
+        assert_eq!(stored.score, Some(Decimal::from(9)));
+    }
+
+    #[test]
+    fn incomplete_finding_takes_precedence_over_any_score() {
+        let store = MemoryMetadataStore::default();
+        let complete = ContentFinding {
+            ecosystem: Ecosystem::Npm,
+            package: "evil".to_string(),
+            version: npm_version("1.0.0"),
+            source: "guarddog".to_string(),
+            score: Some(Decimal::from(9)),
+            scan_incomplete: false,
+            rules: vec![],
+            summary: "completed scanner finding".to_string(),
+            detected_at: chrono::Utc::now(),
+        };
+        let incomplete = ContentFinding {
+            source: "static-heuristics".to_string(),
+            score: None,
+            scan_incomplete: true,
+            summary: "scanner timed out".to_string(),
+            ..complete.clone()
+        };
+        store.save_content_finding(&complete).unwrap();
+        store.save_content_finding(&incomplete).unwrap();
+
+        let stored = store
+            .content_finding(&Ecosystem::Npm, "evil", &npm_version("1.0.0"))
+            .unwrap()
+            .unwrap();
+
+        assert!(stored.scan_incomplete);
+        assert_eq!(stored.score, None);
+        assert_eq!(stored.summary, "scanner timed out");
     }
     #[test]
     fn content_findings_round_trip_and_replace() {
         let store = MemoryMetadataStore::default();
         assert!(store
-            .content_finding(
-                &Ecosystem::Npm,
-                "left-pad",
-                &Version::parse("2.0.0").unwrap()
-            )
+            .content_finding(&Ecosystem::Npm, "left-pad", &npm_version("2.0.0"))
             .unwrap()
             .is_none());
-        let finding = |score: u8, summary: &str| ContentFinding {
+        let finding = |score: Decimal, summary: &str| ContentFinding {
             ecosystem: Ecosystem::Npm,
             package: "left-pad".to_string(),
-            version: Version::parse("2.0.0").unwrap(),
+            version: npm_version("2.0.0"),
             source: "static-heuristics".to_string(),
-            score,
+            score: Some(score),
+            scan_incomplete: false,
             rules: vec!["install-script-network".to_string()],
             summary: summary.to_string(),
             detected_at: chrono::Utc::now(),
         };
-        store.save_content_finding(&finding(5, "first")).unwrap();
+        store
+            .save_content_finding(&finding(Decimal::new(75, 1), "first"))
+            .unwrap();
         let stored = store
-            .content_finding(
-                &Ecosystem::Npm,
-                "left-pad",
-                &Version::parse("2.0.0").unwrap(),
-            )
+            .content_finding(&Ecosystem::Npm, "left-pad", &npm_version("2.0.0"))
             .unwrap()
             .unwrap();
-        assert_eq!(stored.score, 5);
-        store.save_content_finding(&finding(9, "updated")).unwrap();
+        assert_eq!(stored.score, Some(Decimal::new(75, 1)));
+        store
+            .save_content_finding(&finding(Decimal::from(9), "updated"))
+            .unwrap();
         let stored = store
-            .content_finding(
-                &Ecosystem::Npm,
-                "left-pad",
-                &Version::parse("2.0.0").unwrap(),
-            )
+            .content_finding(&Ecosystem::Npm, "left-pad", &npm_version("2.0.0"))
             .unwrap()
             .unwrap();
-        assert_eq!(stored.score, 9);
+        assert_eq!(stored.score, Some(Decimal::from(9)));
         assert_eq!(stored.summary, "updated");
     }
     #[test]
-    fn frozen_lookup_is_ecosystem_scoped() {
-        let store = MemoryMetadataStore::default();
-        let artifact = |ecosystem, version: &str, sha: &str| FrozenArtifact {
-            package: PackageCoordinate {
-                ecosystem,
-                name: "requests".to_string(),
+    fn artifact_key_normalizes_registry_origin_and_extracts_filename() {
+        let key = artifact_key(
+            "HTTP://Registry.Example:80/left-pad/-/left-pad-1.0.0.tgz?download=1",
+            "left-pad",
+            "1.0.0",
+        );
+        assert_eq!(key.source, "http://registry.example");
+        assert_eq!(key.filename, "left-pad-1.0.0.tgz");
+    }
+
+    #[test]
+    fn artifact_key_rejects_unverifiable_tarball_urls() {
+        for url in [
+            "relative.tgz",
+            "ftp://registry.example/package.tgz",
+            "https://user:secret@registry.example/package.tgz",
+            "https://registry.example/",
+        ] {
+            assert!(
+                ArtifactKey::from_tarball_url(
+                    url,
+                    &Ecosystem::Npm,
+                    "left-pad",
+                    &npm_version("1.0.0"),
+                )
+                .is_err(),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_put_enforces_size_limit_and_returns_readonly_descriptor() -> Result<()> {
+        use std::io::{Read, Write};
+
+        let directory = tempfile::tempdir()?;
+        let store = FsArtifactStore {
+            root: directory.path().to_path_buf(),
+        };
+        let key = artifact_key(
+            "https://registry.example/pkg/-/pkg-1.0.0.tgz",
+            "pkg",
+            "1.0.0",
+        );
+        let missing_digest = "a".repeat(64);
+        assert!(store.map(&key, &missing_digest).is_err());
+        assert_eq!(store.resolve(&key)?, None);
+        let mut exact = Cursor::new(b"1234567890");
+        let mut stored = store.put(&mut exact, 10)?;
+        store.map(&key, &stored.sha256)?;
+        assert_eq!(store.resolve(&key)?.as_deref(), Some(stored.path.as_str()));
+        assert_eq!(stored.sha256, hex::encode(Sha256::digest(b"1234567890")));
+        assert!(stored.file.metadata()?.permissions().readonly());
+        let mut bytes = Vec::new();
+        stored.file.read_to_end(&mut bytes)?;
+        assert_eq!(bytes, b"1234567890");
+        assert!(stored.file.write_all(b"overwrite").is_err());
+
+        let oversized = artifact_key(
+            "https://registry.example/oversized/-/oversized-1.0.0.tgz",
+            "oversized",
+            "1.0.0",
+        );
+        let mut source = std::io::repeat(b'x').take(11);
+        assert!(store.put(&mut source, 10).is_err());
+        assert_eq!(store.resolve(&oversized)?, None);
+        assert_eq!(fs::read_dir(store.objects_directory()?)?.count(), 1);
+        Ok(())
+    }
+    #[test]
+    fn content_addressed_put_is_idempotent_and_reuses_identical_bytes() -> Result<()> {
+        use std::io::{Read, Write};
+
+        let directory = tempfile::tempdir()?;
+        let store = FsArtifactStore {
+            root: directory.path().to_path_buf(),
+        };
+        let first_key = artifact_key(
+            "https://registry.example/left-pad/-/left-pad-1.0.0.tgz",
+            "left-pad",
+            "1.0.0",
+        );
+        let second_key = artifact_key(
+            "https://mirror.example/left-pad/-/left-pad-1.0.0.tgz",
+            "left-pad",
+            "1.0.0",
+        );
+        let path = put_path(&store, &first_key, b"same bytes")?;
+        assert_eq!(put_path(&store, &first_key, b"same bytes")?, path);
+        assert_eq!(put_path(&store, &second_key, b"same bytes")?, path);
+        assert_eq!(store.resolve(&first_key)?.as_deref(), Some(path.as_str()));
+        let mut handle = store.open(&second_key)?.unwrap();
+        let mut bytes = Vec::new();
+        handle.read_to_end(&mut bytes)?;
+        assert_eq!(bytes, b"same bytes");
+        assert!(handle.write_all(b"overwrite").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn content_addressed_put_rejects_conflicting_bytes_for_same_identity() -> Result<()> {
+        use std::io::Read;
+
+        let directory = tempfile::tempdir()?;
+        let store = FsArtifactStore {
+            root: directory.path().to_path_buf(),
+        };
+        let key = artifact_key(
+            "https://registry.example/left-pad/-/left-pad-1.0.0.tgz",
+            "left-pad",
+            "1.0.0",
+        );
+        let path = put_path(&store, &key, b"original")?;
+        assert!(put_path(&store, &key, b"replacement").is_err());
+        assert_eq!(store.resolve(&key)?.as_deref(), Some(path.as_str()));
+        let mut handle = store.open(&key)?.unwrap();
+        let mut bytes = Vec::new();
+        handle.read_to_end(&mut bytes)?;
+        assert_eq!(bytes, b"original");
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_mapping_survives_reopening_and_detects_corruption() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let key = artifact_key(
+            "https://registry.example/left-pad/-/left-pad-1.0.0.tgz",
+            "left-pad",
+            "1.0.0",
+        );
+        let path = put_path(
+            &FsArtifactStore {
+                root: directory.path().to_path_buf(),
             },
-            version: Version::parse(version).unwrap(),
-            sha256: sha.to_string(),
-            integrity: None,
-            path: format!("/tmp/{version}"),
-            frozen_at: chrono::Utc::now(),
+            &key,
+            b"verified bytes",
+        )?;
+        let reopened = FsArtifactStore {
+            root: directory.path().to_path_buf(),
+        };
+        assert_eq!(reopened.resolve(&key)?.as_deref(), Some(path.as_str()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&path)?.permissions();
+            permissions.set_mode(permissions.mode() | 0o200);
+            fs::set_permissions(&path, permissions)?;
+        }
+        #[cfg(not(unix))]
+        {
+            let mut permissions = fs::metadata(&path)?.permissions();
+            permissions.set_readonly(false);
+            fs::set_permissions(&path, permissions)?;
+        }
+
+        fs::write(&path, b"tampered bytes")?;
+        assert!(reopened.resolve(&key).is_err());
+        assert!(reopened.open(&key).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_legacy_import_verifies_bytes_and_preserves_original_file() -> Result<()> {
+        use sha2::Digest;
+
+        let directory = tempfile::tempdir()?;
+        let key = artifact_key(
+            "https://registry.example/left-pad/-/left-pad-1.0.0.tgz",
+            "left-pad",
+            "1.0.0",
+        );
+        let legacy = directory
+            .path()
+            .join("artifacts")
+            .join("left-pad")
+            .join("1.0.0.tgz");
+        fs::create_dir_all(legacy.parent().unwrap())?;
+        fs::write(&legacy, b"legacy bytes")?;
+        let store = FsArtifactStore {
+            root: directory.path().to_path_buf(),
+        };
+        assert_eq!(store.resolve(&key)?, None);
+        assert!(store.import_legacy(&key, &"0".repeat(64)).is_err());
+        assert_eq!(store.resolve(&key)?, None);
+        let digest = hex::encode(Sha256::digest(b"legacy bytes"));
+        let object = store.import_legacy(&key, &digest)?;
+        assert_eq!(store.resolve(&key)?.as_deref(), Some(object.as_str()));
+        assert_eq!(fs::read(legacy)?, b"legacy bytes");
+        Ok(())
+    }
+
+    #[test]
+    fn frozen_lookup_is_scoped_by_source_and_ecosystem() {
+        let store = MemoryMetadataStore::default();
+        let artifact = |source: &str, ecosystem: Ecosystem, version: &str, sha: &str| {
+            let package = PackageCoordinate {
+                ecosystem: ecosystem.clone(),
+                name: "requests".to_string(),
+            };
+            let version = PackageVersionId::parse(&ecosystem, version).unwrap();
+            FrozenArtifact {
+                key: ArtifactKey {
+                    source: source.to_string(),
+                    ecosystem: ecosystem.clone(),
+                    name: package.name.clone(),
+                    version: version.clone(),
+                    filename: format!("requests-{version}.tgz"),
+                },
+                package,
+                version,
+                sha256: sha.to_string(),
+                integrity: None,
+                path: format!("/tmp/{sha}"),
+                frozen_at: chrono::Utc::now(),
+            }
         };
         store
-            .put_frozen(artifact(Ecosystem::Npm, "9.9.9", "npm"))
+            .put_frozen(artifact(
+                "https://registry.example",
+                Ecosystem::Npm,
+                "9.9.9",
+                "npm",
+            ))
             .unwrap();
         store
-            .put_frozen(artifact(Ecosystem::PyPi, "2.32.3", "pypi"))
+            .put_frozen(artifact(
+                "https://registry.other",
+                Ecosystem::Npm,
+                "9.9.9",
+                "other",
+            ))
+            .unwrap();
+        store
+            .put_frozen(artifact(
+                "https://registry.example",
+                Ecosystem::PyPi,
+                "2.32.3",
+                "pypi",
+            ))
             .unwrap();
         let found = store
-            .latest_frozen_satisfying(&Ecosystem::PyPi, "requests", None)
-            .unwrap();
-        assert_eq!(
-            found.map(|a| a.version.to_string()),
-            Some("2.32.3".to_string()),
-            "a pip fallback must never resolve to the npm artifact"
-        );
-        let found = store
-            .latest_frozen_satisfying(&Ecosystem::Npm, "requests", None)
-            .unwrap();
-        assert_eq!(
-            found.map(|a| a.version.to_string()),
-            Some("9.9.9".to_string())
-        );
-        assert!(store
-            .get_frozen(
+            .latest_frozen_satisfying(
+                "https://registry.example",
                 &Ecosystem::PyPi,
                 "requests",
-                &Version::parse("9.9.9").unwrap()
+                None,
             )
+            .unwrap();
+        assert_eq!(
+            found.map(|a| a.version.to_string()),
+            Some("2.32.3".to_string())
+        );
+        let found = store
+            .latest_frozen_satisfying("https://registry.other", &Ecosystem::Npm, "requests", None)
+            .unwrap();
+        assert_eq!(found.map(|a| a.sha256), Some("other".to_string()));
+        assert!(store
+            .latest_frozen_satisfying("https://missing.example", &Ecosystem::Npm, "requests", None,)
             .unwrap()
             .is_none());
+        let pypi_key = ArtifactKey::from_tarball_url(
+            "https://registry.example/requests-9.9.9.tgz",
+            &Ecosystem::PyPi,
+            "requests",
+            &PackageVersionId::parse(&Ecosystem::PyPi, "9.9.9").unwrap(),
+        )
+        .unwrap();
+        assert!(store.get_frozen(&pypi_key).unwrap().is_none());
     }
+
+    #[test]
+    fn frozen_metadata_is_idempotent_for_same_key_and_rejects_digest_conflicts() -> Result<()> {
+        let store = MemoryMetadataStore::default();
+        let key = artifact_key(
+            "https://registry.example/requests/-/requests-2.32.3.tgz",
+            "requests",
+            "2.32.3",
+        );
+        let artifact = |sha256: &str| FrozenArtifact {
+            package: PackageCoordinate {
+                ecosystem: Ecosystem::Npm,
+                name: "requests".to_string(),
+            },
+            version: npm_version("2.32.3"),
+            key: key.clone(),
+            sha256: sha256.to_string(),
+            integrity: None,
+            path: "/tmp/artifact".into(),
+            frozen_at: chrono::Utc::now(),
+        };
+        store.put_frozen(artifact("first"))?;
+        store.put_frozen(artifact("first"))?;
+        assert!(store.put_frozen(artifact("second")).is_err());
+        assert_eq!(
+            store.get_frozen(&key)?.map(|stored| stored.sha256),
+            Some("first".to_string())
+        );
+        Ok(())
+    }
+
     #[test]
     fn rejects_traversal_names() {
         let store = FsArtifactStore {
             root: tempfile::tempdir().unwrap().keep(),
         };
+        let mut key = artifact_key(
+            "https://registry.example/pkg/-/pkg-1.0.0.tgz",
+            "pkg",
+            "1.0.0",
+        );
         for name in ["..", "a/../b", "../escape", "a//b", "/abs", "back\\slash"] {
-            assert!(store
-                .put(name, &Version::parse("1.0.0").unwrap(), b"x")
-                .is_err());
+            key.name = name.to_string();
+            assert!(put_path(&store, &key, b"x").is_err());
         }
     }
 
     #[test]
-    fn stores_scoped_names() -> Result<()> {
-        let dir = tempfile::tempdir()?;
+    fn stores_scoped_names_by_content_address() -> Result<()> {
+        let directory = tempfile::tempdir()?;
         let store = FsArtifactStore {
-            root: dir.path().to_path_buf(),
+            root: directory.path().to_path_buf(),
         };
-        store.put("@scope/pkg", &Version::parse("1.0.0")?, b"bytes")?;
-        let written = dir
-            .path()
-            .join("artifacts")
-            .join("scope+pkg")
-            .join("1.0.0.tgz");
-        assert!(written.exists());
-        assert_eq!(store.read(written.to_str().unwrap())?, b"bytes");
-        // These previously aliased the scoped package's directory.
-        for name in [
+        let scoped = artifact_key(
+            "https://registry.example/@scope/pkg/-/pkg-1.0.0.tgz",
+            "@scope/pkg",
+            "1.0.0",
+        );
+        let unscoped = artifact_key(
+            "https://registry.example/scope+pkg/-/scope+pkg-1.0.0.tgz",
             "scope+pkg",
-            "scope/pkg",
-            "@@scope/pkg",
-            "@scope+pkg",
-            "Scope",
-        ] {
-            assert!(store
-                .put(name, &Version::parse("1.0.0")?, b"overwrite")
-                .is_err());
-        }
-        assert_eq!(store.read(written.to_str().unwrap())?, b"bytes");
+            "1.0.0",
+        );
+        let path = put_path(&store, &scoped, b"bytes")?;
+        assert_eq!(put_path(&store, &unscoped, b"bytes")?, path);
+        assert_eq!(store.resolve(&scoped)?.as_deref(), Some(path.as_str()));
+        assert_eq!(store.resolve(&unscoped)?.as_deref(), Some(path.as_str()));
         Ok(())
     }
 
     #[test]
-    fn reads_are_confined_to_regular_artifact_files() -> Result<()> {
-        let dir = tempfile::tempdir()?;
+    fn resolves_only_indexed_artifacts_and_opens_readonly_handle() -> Result<()> {
+        use std::io::{Read, Write};
+
+        let directory = tempfile::tempdir()?;
         let store = FsArtifactStore {
-            root: dir.path().to_path_buf(),
+            root: directory.path().to_path_buf(),
         };
-        let version = Version::parse("1.0.0")?;
-        let path = store.put("pkg", &version, b"artifact")?;
-        assert_eq!(store.resolve("pkg", &version)?, Some(path.clone()));
-        assert_eq!(store.read(&path)?, b"artifact");
-        fs::write(dir.path().join("secret"), b"secret")?;
-        for path in [
-            dir.path().join("secret"),
-            dir.path().join("artifacts/../secret"),
-            dir.path().join("artifacts/pkg"),
-        ] {
-            assert!(store.read(path.to_str().unwrap()).is_err());
-        }
-        assert_eq!(store.resolve("missing", &version)?, None);
+        let key = artifact_key(
+            "https://registry.example/pkg/-/pkg-1.0.0.tgz",
+            "pkg",
+            "1.0.0",
+        );
+        let path = put_path(&store, &key, b"artifact")?;
+        assert_eq!(store.resolve(&key)?, Some(path));
+        let mut handle = store.open(&key)?.unwrap();
+        let mut bytes = Vec::new();
+        handle.read_to_end(&mut bytes)?;
+        assert_eq!(bytes, b"artifact");
+        assert!(handle.write_all(b"overwrite").is_err());
+        let missing = artifact_key(
+            "https://registry.example/missing/-/missing-1.0.0.tgz",
+            "missing",
+            "1.0.0",
+        );
+        assert_eq!(store.resolve(&missing)?, None);
+        assert!(store.open(&missing)?.is_none());
         Ok(())
     }
 
     #[cfg(unix)]
     #[test]
-    fn rejects_symlink_escapes_for_reads_resolution_and_writes() -> Result<()> {
+    fn rejects_symlink_escapes_for_content_writes_and_open() -> Result<()> {
         use std::os::unix::fs::symlink;
-        for component in ["artifacts", "artifacts/pkg", "artifacts/pkg/1.0.0.tgz"] {
-            let dir = tempfile::tempdir()?;
-            let outside = tempfile::tempdir()?;
-            let store = FsArtifactStore {
-                root: dir.path().to_path_buf(),
-            };
-            let version = Version::parse("1.0.0")?;
-            let link = dir.path().join(component);
-            fs::create_dir_all(link.parent().unwrap())?;
-            let target = if component.ends_with(".tgz") {
-                outside.path().join("1.0.0.tgz")
-            } else {
-                outside.path().to_path_buf()
-            };
-            fs::create_dir_all(outside.path().join("pkg"))?;
-            fs::write(outside.path().join("1.0.0.tgz"), b"secret")?;
-            fs::write(outside.path().join("pkg/1.0.0.tgz"), b"secret")?;
-            symlink(&target, &link)?;
-            assert!(store.put("pkg", &version, b"overwrite").is_err());
-            assert!(store.resolve("pkg", &version).is_err());
-            assert!(store
-                .read(dir.path().join("artifacts/pkg/1.0.0.tgz").to_str().unwrap())
-                .is_err());
-            assert_eq!(fs::read(outside.path().join("1.0.0.tgz"))?, b"secret");
-            assert_eq!(fs::read(outside.path().join("pkg/1.0.0.tgz"))?, b"secret");
-        }
+
+        let directory = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        let store = FsArtifactStore {
+            root: directory.path().to_path_buf(),
+        };
+        let key = artifact_key(
+            "https://registry.example/pkg/-/pkg-1.0.0.tgz",
+            "pkg",
+            "1.0.0",
+        );
+        let secret = outside.path().join("secret");
+        fs::write(&secret, b"secret")?;
+        fs::create_dir(directory.path().join("artifacts"))?;
+        symlink(outside.path(), directory.path().join("artifacts/sha256"))?;
+        assert!(put_path(&store, &key, b"overwrite").is_err());
+        assert_eq!(fs::read(&secret)?, b"secret");
+
+        fs::remove_file(directory.path().join("artifacts/sha256"))?;
+        fs::create_dir(directory.path().join("artifacts/sha256"))?;
+        let path = put_path(&store, &key, b"verified")?;
+        fs::remove_file(&path)?;
+        symlink(&secret, &path)?;
+        assert!(store.resolve(&key).is_err());
+        assert!(store.open(&key).is_err());
+        assert_eq!(fs::read(&secret)?, b"secret");
         Ok(())
     }
 }

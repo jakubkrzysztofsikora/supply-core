@@ -1,6 +1,5 @@
 use crate::{domain::*, ports::VulnerabilitySource};
 use anyhow::{Context, Result};
-use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::fs;
@@ -10,7 +9,12 @@ use std::path::PathBuf;
 /// No-op source: returns no findings. Useful for tests and offline runs.
 pub struct NoopVulnerabilitySource;
 impl VulnerabilitySource for NoopVulnerabilitySource {
-    fn query(&self, _: Ecosystem, _: &str, _: &Version) -> Result<Vec<VulnerabilityFinding>> {
+    fn query(
+        &self,
+        _: Ecosystem,
+        _: &str,
+        _: &PackageVersionId,
+    ) -> Result<Vec<VulnerabilityFinding>> {
         Ok(vec![])
     }
 }
@@ -95,11 +99,21 @@ impl OsvVulnerabilitySource {
         self
     }
 
-    fn cache_path(&self, ecosystem: &Ecosystem, name: &str, version: &Version) -> Option<PathBuf> {
+    fn cache_path(
+        &self,
+        ecosystem: &Ecosystem,
+        name: &str,
+        version: &PackageVersionId,
+    ) -> Option<PathBuf> {
         let dir = self.cache_dir.as_ref()?;
         // Key on (ecosystem, name, version) with a stable hash so weird
         // scoped names don't escape the cache root.
-        let key = format!("v2|{}|{}|{}", ecosystem_label(ecosystem), name, version);
+        let key = format!(
+            "v2|{}|{}|{}",
+            ecosystem_label(ecosystem),
+            name,
+            version.canonical()
+        );
         let mut hasher = sha2::Sha256::new();
         hasher.update(key.as_bytes());
         let digest = hex::encode(hasher.finalize());
@@ -128,7 +142,7 @@ impl VulnerabilitySource for OsvVulnerabilitySource {
         &self,
         ecosystem: Ecosystem,
         name: &str,
-        version: &Version,
+        version: &PackageVersionId,
     ) -> Result<Vec<VulnerabilityFinding>> {
         if matches!(
             ecosystem,
@@ -158,7 +172,7 @@ impl VulnerabilitySource for OsvVulnerabilitySource {
 
         let body = serde_json::json!({
             "package": {"name": name, "ecosystem": ecosystem_label(&ecosystem)},
-            "version": version.to_string(),
+            "version": version.upstream(),
         });
         let raw = self.transport.post_json(&self.url, &body)?;
         anyhow::ensure!(raw.is_object(), "invalid OSV response");
@@ -225,13 +239,33 @@ pub fn parse_osv_response(raw: &serde_json::Value) -> Vec<VulnerabilityFinding> 
         out.push(VulnerabilityFinding {
             source: "OSV".into(),
             id: id.to_string(),
+            aliases: v
+                .get("aliases")
+                .and_then(|aliases| aliases.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|alias| alias.as_str())
+                .map(str::to_string)
+                .collect(),
             severity,
             summary,
+            modified: advisory_date(v, "modified"),
+            withdrawn: advisory_date(v, "withdrawn"),
         });
     }
     out
 }
 
+fn advisory_date(
+    vulnerability: &serde_json::Value,
+    field: &str,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    vulnerability
+        .get(field)
+        .and_then(|value| value.as_str())
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|date| date.with_timezone(&chrono::Utc))
+}
 fn best_severity(vuln: &serde_json::Value) -> Option<Severity> {
     if let Some(sev) = vuln.get("severity").and_then(|x| x.as_array()) {
         let mut best: Option<Severity> = None;
@@ -330,6 +364,38 @@ mod tests {
         assert_eq!(f[0].severity, Severity::Critical);
         assert_eq!(f[1].severity, Severity::Medium);
     }
+    #[test]
+    fn parse_preserves_aliases_and_advisory_lifecycle() {
+        let raw = serde_json::json!({"vulns": [
+            {
+                "id": "GHSA-active",
+                "aliases": ["CVE-2026-1234", "GHSA-alias"],
+                "modified": "2026-10-12T10:30:00Z",
+                "severity": [{"type": "CVSS_V3", "score": "7.5"}]
+            },
+            {
+                "id": "GHSA-withdrawn",
+                "withdrawn": "2026-10-13T10:30:00Z",
+                "summary": "corrected"
+            }
+        ]});
+
+        let findings = parse_osv_response(&raw);
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[0].aliases, vec!["CVE-2026-1234", "GHSA-alias"]);
+        assert_eq!(
+            findings[0].modified,
+            Some("2026-10-12T10:30:00Z".parse().unwrap())
+        );
+        assert_eq!(
+            findings[0].withdrawn, None,
+            "active advisory must stay active"
+        );
+        assert_eq!(
+            findings[1].withdrawn,
+            Some("2026-10-13T10:30:00Z".parse().unwrap())
+        );
+    }
 
     #[test]
     fn parse_with_database_specific_severity() {
@@ -369,8 +435,11 @@ mod tests {
             findings: vec![VulnerabilityFinding {
                 source: "OSV".into(),
                 id: "GHSA-cached".into(),
+                aliases: vec![],
                 severity: Severity::Critical,
                 summary: "cached".into(),
+                modified: None,
+                withdrawn: None,
             }],
         };
         let key = "v2|npm|lodash|4.17.20";
@@ -388,7 +457,7 @@ mod tests {
             Ok(serde_json::json!({}))
         };
         let src = OsvVulnerabilitySource::new(Box::new(transport)).with_cache(dir.path());
-        let v = semver::Version::parse("4.17.20").unwrap();
+        let v = PackageVersionId::parse(&Ecosystem::Npm, "4.17.20").unwrap();
         let f = src.query(Ecosystem::Npm, "lodash", &v).unwrap();
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].id, "GHSA-cached");
@@ -407,7 +476,7 @@ mod tests {
             ]}))
         };
         let src = OsvVulnerabilitySource::new(Box::new(transport)).with_cache(dir.path());
-        let v = semver::Version::parse("1.0.0").unwrap();
+        let v = PackageVersionId::parse(&Ecosystem::Npm, "1.0.0").unwrap();
         let f = src.query(Ecosystem::Npm, "demo", &v).unwrap();
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].severity, Severity::High);
@@ -427,7 +496,7 @@ mod tests {
             Ok(serde_json::json!({}))
         };
         let src = OsvVulnerabilitySource::new(Box::new(transport));
-        let v = semver::Version::parse("1.0.0").unwrap();
+        let v = PackageVersionId::parse(&Ecosystem::GitHubActions, "v1").unwrap();
         let f = src
             .query(Ecosystem::GitHubActions, "actions/checkout", &v)
             .unwrap();

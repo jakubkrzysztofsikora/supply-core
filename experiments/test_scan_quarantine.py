@@ -168,20 +168,43 @@ class WriteSummaryTest(unittest.TestCase):
 
 
 class SummaryTest(unittest.TestCase):
-    def test_summarize_merges_rules_and_scores(self):
-        findings = [
-            {"score": 5, "rules": ["slopsquat-name"], "source": "static-heuristics"},
-            {"score": 9, "rules": ["ai-prompt-injection"], "source": "static-heuristics"},
-        ]
+    def test_summarize_uses_artifact_report_scores_and_decision(self):
+        report = {
+            "decision": "block",
+            "coverage": "partial",
+            "engines": [
+                {
+                    "source": "static-heuristics",
+                    "findings": [
+                        {"policy_score": "5", "rule": "slopsquat-name"},
+                        {"policy_score": "9", "rule": "ai-prompt-injection"},
+                    ],
+                }
+            ],
+        }
         self.assertEqual(
-            scan_quarantine.summarize(findings),
-            {"findings": 2, "score": 9,
-             "rules": ["ai-prompt-injection", "slopsquat-name"],
-             "sources": ["static-heuristics"]},
+            scan_quarantine.summarize(report),
+            {
+                "decision": "block",
+                "coverage": "partial",
+                "findings": 2,
+                "score": 9,
+                "rules": ["ai-prompt-injection", "slopsquat-name"],
+                "sources": ["static-heuristics"],
+            },
         )
         self.assertEqual(
-            scan_quarantine.summarize([]),
-            {"findings": 0, "score": 0, "rules": [], "sources": []},
+            scan_quarantine.summarize(
+                {"decision": "pass", "coverage": "complete", "engines": []}
+            ),
+            {
+                "decision": "pass",
+                "coverage": "complete",
+                "findings": 0,
+                "score": 0,
+                "rules": [],
+                "sources": [],
+            },
         )
 
 
@@ -213,48 +236,88 @@ class CacheTest(unittest.TestCase):
 
 
 class IncompleteRecordTest(unittest.TestCase):
-    def test_record_is_block_level_and_tagged_by_engine(self):
-        record = scan_quarantine.incomplete_record("evil", "1.0.0", "boom", guarddog=True)
-        self.assertEqual(record["rules"], ["scan-incomplete", "guarddog"])
-        self.assertEqual(record["score"], 8)
+    def test_record_is_block_level_without_a_score(self):
+        record = scan_quarantine.incomplete_record("evil", "1.0.0", "boom")
+        self.assertEqual(record["rules"], ["scan-incomplete"])
+        self.assertTrue(record["scan_incomplete"])
+        self.assertNotIn("score", record)
         self.assertEqual(record["package"], "evil")
         self.assertIn("boom", record["summary"])
-        static = scan_quarantine.incomplete_record("evil", "1.0.0", "boom", guarddog=False)
-        self.assertEqual(static["rules"], ["scan-incomplete", "static"])
 
-    def test_append_and_clear_round_trip(self):
+    def test_append_and_clear_preserves_confirmed_findings(self):
         import tempfile
 
+        artifact_a, artifact_b = "a" * 64, "b" * 64
+        policy = "c" * 64
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "findings.jsonl"
             scan_quarantine.append_record(
-                path, scan_quarantine.incomplete_record("a", "1.0.0", "boom", guarddog=True)
+                path,
+                scan_quarantine.incomplete_record(
+                    "a", "1.0.0", "boom", artifact_a, policy
+                ),
             )
             scan_quarantine.append_record(
-                path, scan_quarantine.incomplete_record("b", "2.0.0", "boom", guarddog=False)
+                path,
+                scan_quarantine.incomplete_record(
+                    "b", "2.0.0", "boom", artifact_b, policy
+                ),
             )
             scan_quarantine.append_record(path, {
                 "ecosystem": "Npm", "package": "b", "version": "2.0.0",
                 "source": "guarddog", "score": 9, "rules": ["threat-x"], "summary": "real",
             })
-            # A static-only run must not clear a GuardDog-pending hold.
             self.assertEqual(
-                scan_quarantine.clear_incomplete(path, "a", "1.0.0", includes_guarddog=False), 0
+                scan_quarantine.clear_incomplete(
+                    path, "a", "1.0.0", artifact_a, policy
+                ),
+                1,
             )
             self.assertEqual(
-                scan_quarantine.clear_incomplete(path, "a", "1.0.0", includes_guarddog=True), 1
+                scan_quarantine.clear_incomplete(
+                    path, "a", "1.0.0", artifact_a, policy
+                ),
+                0,
             )
             self.assertEqual(
-                scan_quarantine.clear_incomplete(path, "a", "1.0.0", includes_guarddog=True), 0
-            )
-            # Static-tagged records clear after any successful scan.
-            self.assertEqual(
-                scan_quarantine.clear_incomplete(path, "b", "2.0.0", includes_guarddog=False), 1
+                scan_quarantine.clear_incomplete(
+                    path, "b", "2.0.0", artifact_b, policy
+                ),
+                1,
             )
             remaining = [line for line in path.read_text().splitlines() if line.strip()]
             self.assertEqual(len(remaining), 1)
             self.assertTrue(any('"threat-x"' in line for line in remaining))
             self.assertFalse(any('"scan-incomplete"' in line for line in remaining))
+
+    def test_clear_requires_matching_artifact_and_policy_identity(self):
+        import tempfile
+
+        artifact = "a" * 64
+        policy = "b" * 64
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "findings.jsonl"
+            records = [
+                ("a" * 64, "b" * 64),
+                ("c" * 64, "b" * 64),
+                ("a" * 64, "d" * 64),
+            ]
+            for artifact_sha256, policy_sha256 in records:
+                record = scan_quarantine.incomplete_record(
+                    "a", "1.0.0", "boom", artifact_sha256, policy_sha256
+                )
+                scan_quarantine.append_record(path, record)
+
+            removed = scan_quarantine.clear_incomplete(
+                path, "a", "1.0.0", artifact, policy
+            )
+
+            remaining = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual(removed, 1)
+        self.assertEqual(
+            [(record["artifact_sha256"], record["policy_sha256"]) for record in remaining],
+            [("c" * 64, "b" * 64), ("a" * 64, "d" * 64)],
+        )
 
     def test_clear_on_missing_file_is_a_noop(self):
         import tempfile
@@ -262,7 +325,10 @@ class IncompleteRecordTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "missing.jsonl"
             self.assertEqual(
-                scan_quarantine.clear_incomplete(path, "a", "1.0.0", includes_guarddog=False), 0
+                scan_quarantine.clear_incomplete(
+                    path, "a", "1.0.0", "a" * 64, "b" * 64
+                ),
+                0,
             )
 
     def test_incomplete_candidates_are_retried_and_merged(self):
@@ -271,7 +337,7 @@ class IncompleteRecordTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "findings.jsonl"
             scan_quarantine.append_record(
-                path, scan_quarantine.incomplete_record("a", "1.0.0", "boom", guarddog=True)
+                path, scan_quarantine.incomplete_record("a", "1.0.0", "boom")
             )
             scan_quarantine.append_record(path, {
                 "ecosystem": "Npm", "package": "b", "version": "2.0.0",
@@ -293,44 +359,72 @@ class IncompleteRecordTest(unittest.TestCase):
 
 
 class ScanPackageTest(unittest.TestCase):
-    def _fake_binary(self, directory):
+    def _fake_binary(self, directory, decision, coverage, returncode):
         binary = Path(directory) / "fake-supply"
+        report = json.dumps({
+            "artifact_sha256": "abc",
+            "policy_sha256": "def",
+            "coverage": coverage,
+            "decision": decision,
+            "engines": [],
+            "reason": None,
+        })
         binary.write_text(
             "#!/bin/sh\n"
-            "if [ -n \"${GUARDDOG_BIN:-}\" ]; then\n"
-            "  echo '[\"guarddog-env-set\"]'\n"
-            "else\n"
-            "  echo '[]'\n"
-            "fi\n"
+            "case \" $* \" in\n"
+            f"  *\" --json \"*) printf '%s\\n' '{report}'; exit {returncode} ;;\n"
+            "  *) printf '[]\\n'; exit 0 ;;\n"
+            "esac\n"
         )
         binary.chmod(0o755)
         return binary
 
-    def test_static_only_mode_does_not_crash(self):
+    def test_block_exit_returns_report_instead_of_execution_error(self):
         import tempfile
 
         with tempfile.TemporaryDirectory() as directory:
-            binary = self._fake_binary(directory)
-            findings = Path(directory) / "findings.jsonl"
-            with mock.patch.dict("os.environ", clear=True):
-                result = scan_quarantine.scan_package(
-                    str(binary), Path("archive.tgz"), "pkg", "1.0.0", findings, guarddog=None
-                )
-            self.assertEqual(result, [])
-
-    def test_guarddog_path_is_exported_to_the_scanner(self):
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as directory:
-            binary = self._fake_binary(directory)
-            findings = Path(directory) / "findings.jsonl"
+            binary = self._fake_binary(directory, "block", "partial", 2)
             result = scan_quarantine.scan_package(
-                str(binary), Path("archive.tgz"), "pkg", "1.0.0", findings,
-                guarddog="/opt/guarddog",
+                str(binary), Path("archive.tgz"), "pkg", "1.0.0",
+                Path(directory) / "findings.jsonl", scratch_dir=Path(directory),
             )
-            self.assertEqual(result, ["guarddog-env-set"])
+        self.assertEqual(result["decision"], "block")
+        self.assertEqual(result["coverage"], "partial")
 
+    def test_incomplete_exit_preserves_artifact_report(self):
+        import tempfile
 
+        with tempfile.TemporaryDirectory() as directory:
+            binary = self._fake_binary(directory, "incomplete", "partial", 3)
+            result = scan_quarantine.scan_package(
+                str(binary), Path("archive.tgz"), "pkg", "1.0.0",
+                Path(directory) / "findings.jsonl", scratch_dir=Path(directory),
+            )
+        self.assertEqual(result["decision"], "incomplete")
+
+    def test_unknown_exit_remains_an_execution_error(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            binary = self._fake_binary(directory, "pass", "complete", 1)
+            with self.assertRaises(RuntimeError):
+                scan_quarantine.scan_package(
+                    str(binary), Path("archive.tgz"), "pkg", "1.0.0",
+                    Path(directory) / "findings.jsonl", scratch_dir=Path(directory),
+                )
+
+    def test_durable_ledger_path_reaches_cli(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "ledger.sqlite"
+            binary = self._fake_binary(directory, "pass", "complete", 0)
+            result = scan_quarantine.scan_package(
+                str(binary), Path("archive.tgz"), "pkg", "1.0.0",
+                Path(directory) / "findings.jsonl", ledger_db=ledger,
+                scratch_dir=Path(directory),
+            )
+        self.assertEqual(result["decision"], "pass")
 class GuarddogBinaryTest(unittest.TestCase):
     def test_explicit_and_environment_win(self):
         self.assertEqual(scan_quarantine.guarddog_binary("/opt/guarddog"), "/opt/guarddog")
@@ -347,11 +441,6 @@ class GuarddogBinaryTest(unittest.TestCase):
              mock.patch.object(scan_quarantine.shutil, "which", return_value=None):
             self.assertEqual(scan_quarantine.guarddog_binary(None), "guarddog")
 
-    def test_available_uses_path(self):
-        with mock.patch.object(scan_quarantine.shutil, "which", return_value="/usr/local/bin/guarddog"):
-            self.assertTrue(scan_quarantine.guarddog_available("guarddog"))
-        with mock.patch.object(scan_quarantine.shutil, "which", return_value=None):
-            self.assertFalse(scan_quarantine.guarddog_available("definitely-missing"))
 
 
 if __name__ == "__main__":

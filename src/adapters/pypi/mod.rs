@@ -1,8 +1,7 @@
-use crate::domain::{Ecosystem, PackageCoordinate, PackageVersion};
+use crate::domain::{Ecosystem, PackageCoordinate, PackageVersion, PackageVersionId};
 use crate::ports::UpstreamPyPiRegistry;
 use anyhow::{Context, Result};
 use chrono::DateTime;
-use semver::Version;
 
 pub struct HttpPyPiRegistry {
     pub base_url: String,
@@ -158,7 +157,7 @@ fn upload_time(file: &serde_json::Value) -> Option<chrono::DateTime<chrono::Utc>
 pub fn package_version_from_pypi(
     payload: &serde_json::Value,
     name: &str,
-    version: &Version,
+    version: &PackageVersionId,
     expected_hashes: &[String],
 ) -> Result<PackageVersion> {
     let files = payload
@@ -333,7 +332,7 @@ urllib3===1.26.18
             {"filename":"yanked.whl","upload_time_iso_8601":"2026-09-12T00:00:00Z","yanked":true,
              "digests":{"sha256":yanked},"url":"https://files.example/yanked.whl"}
         ]});
-        let version = Version::parse("2.32.3").unwrap();
+        let version = PackageVersionId::parse(&Ecosystem::PyPi, "2.32.3").unwrap();
         let pv = package_version_from_pypi(&payload, "requests", &version, &[])?;
         assert_eq!(
             pv.published_at.map(|t| t.to_rfc3339()),
@@ -415,7 +414,7 @@ urllib3===1.26.18
             {"filename":"x.whl","upload_time_iso_8601":"2024-05-29T15:37:47.027275Z","yanked":false,
              "digests":{"sha256":"70761cfe"},"url":"https://files.example/x.whl"}
         ]});
-        let version = Version::parse("2.32.3").unwrap();
+        let version = PackageVersionId::parse(&Ecosystem::PyPi, "2.32.3").unwrap();
         let pv = package_version_from_pypi(&payload, "requests", &version, &[])?;
         assert_eq!(pv.package.ecosystem, Ecosystem::PyPi);
         assert_eq!(pv.integrity.as_deref(), Some("sha256-70761cfe"));

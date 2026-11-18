@@ -1,19 +1,28 @@
 use crate::domain::*;
 use crate::ports::*;
 use anyhow::Result;
-use semver::{Version, VersionReq};
+#[cfg(test)]
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 pub mod ai_scanner;
+pub mod image_scanner;
+pub mod ledger;
 pub mod scanner;
 
+#[derive(Debug, Clone, Copy)]
+pub enum VersionSelection<'a> {
+    Exact,
+    NpmRange(&'a node_semver::Range),
+}
 pub struct PackageEvaluator<'a> {
     pub policy: &'a Policy,
     pub clock: &'a dyn Clock,
     pub vulns: &'a dyn VulnerabilitySource,
     pub metadata: &'a dyn MetadataStore,
+    pub ledger: ledger::LedgerRecorder,
 }
 struct EcosystemPolicy<'p> {
     require_integrity: bool,
@@ -45,12 +54,22 @@ impl<'a> PackageEvaluator<'a> {
             },
         }
     }
-    /// `requested` is the client's semver range (e.g. `^1.2.0`). Fallback
-    /// serves the latest frozen version satisfying it; `None` allows any.
     pub fn evaluate(
         &self,
         version: &PackageVersion,
-        requested: Option<&VersionReq>,
+        requested: VersionSelection<'_>,
+    ) -> Result<Decision> {
+        let mut decision = self.evaluate_decision(version, requested)?;
+        self.ledger
+            .record_evaluation(version, self.policy, &decision, self.clock.now())
+            .map_err(|error| error.context(ledger::LedgerRecordingError))?;
+        decision.warnings.push(ledger::LEDGER_PENDING.to_string());
+        Ok(decision)
+    }
+    fn evaluate_decision(
+        &self,
+        version: &PackageVersion,
+        requested: VersionSelection<'_>,
     ) -> Result<Decision> {
         let name = &version.package.name;
         let ecosystem = version.package.ecosystem.clone();
@@ -64,9 +83,7 @@ impl<'a> PackageEvaluator<'a> {
         }
         if ecosystem_policy.require_integrity && version.integrity.is_none() {
             return self.fallback_or_block(
-                &ecosystem,
-                name,
-                &version.version,
+                version,
                 requested,
                 "package version is missing integrity",
             );
@@ -77,11 +94,16 @@ impl<'a> PackageEvaluator<'a> {
                 self.metadata
                     .content_finding(&ecosystem, name, &version.version)?
             {
-                if finding.score >= self.policy.quarantine_scanner.block_score {
+                let Some(score) = finding.score.filter(|_| !finding.scan_incomplete) else {
                     return self.fallback_or_block(
-                        &ecosystem,
-                        name,
-                        &version.version,
+                        version,
+                        requested,
+                        format!("content scan incomplete: {}", finding.summary),
+                    );
+                };
+                if score >= self.policy.quarantine_scanner.block_score.into() {
+                    return self.fallback_or_block(
+                        version,
                         requested,
                         format!(
                             "content scan: {} [{}]",
@@ -90,10 +112,9 @@ impl<'a> PackageEvaluator<'a> {
                         ),
                     );
                 }
-                if finding.score >= self.policy.quarantine_scanner.review_score {
+                if score >= self.policy.quarantine_scanner.review_score.into() {
                     review_warning = Some(format!(
-                        "content scan review (score {}): {} [{}]",
-                        finding.score,
+                        "content scan review (score {score}): {} [{}]",
                         finding.summary,
                         finding.rules.join(", ")
                     ));
@@ -104,7 +125,7 @@ impl<'a> PackageEvaluator<'a> {
             .vulns
             .query(ecosystem.clone(), name, &version.version)?;
         if let Some(reason) = self.vulnerability_reason(&findings) {
-            return self.fallback_or_block(&ecosystem, name, &version.version, requested, reason);
+            return self.fallback_or_block(version, requested, reason);
         }
         if is_version_quarantined(
             version.published_at,
@@ -112,9 +133,7 @@ impl<'a> PackageEvaluator<'a> {
             &self.policy.quarantine,
         ) {
             return self.fallback_or_block(
-                &ecosystem,
-                name,
-                &version.version,
+                version,
                 requested,
                 "package version is inside quarantine window",
             );
@@ -126,28 +145,59 @@ impl<'a> PackageEvaluator<'a> {
         Ok(decision)
     }
     fn vulnerability_reason(&self, findings: &[VulnerabilityFinding]) -> Option<String> {
-        if self.policy.quarantine.cve_keeps_quarantined {
-            strongest_vulnerability(findings)
-        } else {
-            blocks_vulnerability(findings, &self.policy.vulnerabilities)
-        }
+        strongest_osv_vulnerability(findings).or_else(|| {
+            if self.policy.quarantine.cve_keeps_quarantined {
+                strongest_vulnerability(findings)
+            } else {
+                blocks_vulnerability(findings, &self.policy.vulnerabilities)
+            }
+        })
     }
     fn fallback_or_block(
         &self,
-        ecosystem: &Ecosystem,
-        name: &str,
-        requested_version: &Version,
-        requested: Option<&VersionReq>,
+        version: &PackageVersion,
+        requested: VersionSelection<'_>,
         reason: impl Into<String>,
     ) -> Result<Decision> {
+        let name = &version.package.name;
+        let ecosystem = &version.package.ecosystem;
+        let requested_version = &version.version;
         let reason = reason.into();
         let ecosystem_policy = self.ecosystem_policy(ecosystem);
+        let requested_range = match requested {
+            VersionSelection::Exact => {
+                return Ok(Decision::block(
+                    name,
+                    Some(requested_version.to_string()),
+                    reason,
+                ));
+            }
+            VersionSelection::NpmRange(range) => range,
+        };
         if ecosystem_policy.fallback_to_frozen {
-            if let Some(frozen) = self
-                .metadata
-                .latest_frozen_satisfying(ecosystem, name, requested)?
-            {
-                // Frozen bytes are immutable, but vulnerability knowledge changes.
+            let Some(tarball_url) = version.tarball_url.as_deref() else {
+                return Ok(Decision::block(
+                    name,
+                    Some(requested_version.to_string()),
+                    format!("{reason}; registry source cannot be derived for frozen fallback"),
+                ));
+            };
+            let source = match ArtifactKey::source_from_tarball_url(tarball_url) {
+                Ok(source) => source,
+                Err(_) => {
+                    return Ok(Decision::block(
+                        name,
+                        Some(requested_version.to_string()),
+                        format!("{reason}; registry source cannot be derived for frozen fallback"),
+                    ));
+                }
+            };
+            if let Some(frozen) = self.metadata.latest_frozen_satisfying(
+                &source,
+                ecosystem,
+                name,
+                Some(requested_range),
+            )? {
                 let findings = self.vulns.query(ecosystem.clone(), name, &frozen.version)?;
                 if let Some(fallback_reason) = self.vulnerability_reason(&findings) {
                     return Ok(Decision::block(
@@ -164,7 +214,19 @@ impl<'a> PackageEvaluator<'a> {
                         self.metadata
                             .content_finding(ecosystem, name, &frozen.version)?
                     {
-                        if finding.score >= self.policy.quarantine_scanner.block_score {
+                        if finding.scan_incomplete || finding.score.is_none() {
+                            return Ok(Decision::block(
+                                name,
+                                Some(requested_version.to_string()),
+                                format!(
+                                    "{reason}; frozen fallback {} blocked: content scan incomplete: {}",
+                                    frozen.version, finding.summary
+                                ),
+                            ));
+                        }
+                        if finding.score.is_some_and(|score| {
+                            score >= self.policy.quarantine_scanner.block_score.into()
+                        }) {
                             return Ok(Decision::block(
                                 name,
                                 Some(requested_version.to_string()),
@@ -199,6 +261,7 @@ pub struct IngestService<'a> {
     pub artifacts: &'a dyn ArtifactStore,
     pub metadata: &'a dyn MetadataStore,
     pub clock: &'a dyn Clock,
+    pub ledger: ledger::LedgerRecorder,
 }
 impl<'a> IngestService<'a> {
     /// Fetch tarball bytes and freeze them only after dist.integrity verifies.
@@ -210,43 +273,47 @@ impl<'a> IngestService<'a> {
             .tarball_url
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("no tarball url for {name}"))?;
+        let key =
+            ArtifactKey::from_tarball_url(url, &version.package.ecosystem, name, &version.version)?;
         let integrity = version.integrity.as_deref().ok_or_else(|| {
             anyhow::anyhow!(
                 "no dist.integrity for {name}@{}: refusing to freeze unverified bytes",
                 version.version
             )
         })?;
-        let bytes = self.registry.tarball(url)?;
-        if self.policy.npm.require_integrity && !self.hasher.verify_npm_integrity(&bytes, integrity)
-        {
-            anyhow::bail!(
-                "integrity mismatch for {name}@{}: registry bytes do not match dist.integrity",
-                version.version
-            );
-        }
-        let sha256 = self.hasher.sha256(&bytes);
-        if let Some(existing) =
-            self.metadata
-                .get_frozen(&version.package.ecosystem, name, &version.version)?
-        {
-            if existing.sha256 != sha256 {
+        let existing = self.metadata.get_frozen(&key)?;
+        let upstream = self.registry.tarball(url)?;
+        let mut verified = self.hasher.verified_npm_reader(upstream, integrity)?;
+        let stored = self.artifacts.put(
+            verified.as_mut(),
+            crate::application::scanner::MAX_COMPRESSED_ARCHIVE_BYTES,
+        )?;
+        if let Some(existing) = existing {
+            if existing.sha256 != stored.sha256 {
                 anyhow::bail!(
                     "registry immutability violation: {name}@{} already frozen with different bytes",
                     version.version
                 );
             }
+            if existing.path != stored.path {
+                anyhow::bail!("frozen metadata path does not match its indexed artifact");
+            }
+            self.artifacts.map(&key, &stored.sha256)?;
+            self.ledger.record_discovered(&existing, self.clock.now())?;
             return Ok(existing);
         }
-        let path = self.artifacts.put(name, &version.version, &bytes)?;
+        self.artifacts.map(&key, &stored.sha256)?;
         let artifact = FrozenArtifact {
+            key,
             package: version.package.clone(),
             version: version.version.clone(),
-            sha256: self.hasher.sha256(&bytes),
+            sha256: stored.sha256,
             integrity: Some(integrity.to_string()),
-            path,
+            path: stored.path,
             frozen_at: self.clock.now(),
         };
         self.metadata.put_frozen(artifact.clone())?;
+        self.ledger.record_discovered(&artifact, self.clock.now())?;
         Ok(artifact)
     }
 }
@@ -883,6 +950,13 @@ mod tests {
     use super::*;
     use chrono::{DateTime, Duration, Utc};
     use std::{path::Path, sync::Mutex};
+    fn npm_version(raw: &str) -> PackageVersionId {
+        PackageVersionId::parse(&Ecosystem::Npm, raw).unwrap()
+    }
+
+    fn pypi_version(raw: &str) -> PackageVersionId {
+        PackageVersionId::parse(&Ecosystem::PyPi, raw).unwrap()
+    }
 
     struct FixedClock(DateTime<Utc>);
     impl Clock for FixedClock {
@@ -897,31 +971,29 @@ mod tests {
         }
         fn latest_frozen_satisfying(
             &self,
+            source: &str,
             ecosystem: &Ecosystem,
             _: &str,
-            requested: Option<&VersionReq>,
+            requested: Option<&node_semver::Range>,
         ) -> Result<Option<FrozenArtifact>> {
             let frozen = self
                 .0
                 .lock()
                 .map_err(|_| anyhow::anyhow!("lock poisoned"))?
                 .clone();
-            Ok(frozen.filter(|a| {
-                a.package.ecosystem == *ecosystem && requested.is_none_or(|r| r.matches(&a.version))
+            Ok(frozen.filter(|artifact| {
+                artifact.key.source == source
+                    && artifact.key.ecosystem == *ecosystem
+                    && requested.is_none_or(|range| artifact.version.satisfies_npm_range(range))
             }))
         }
-        fn get_frozen(
-            &self,
-            ecosystem: &Ecosystem,
-            _: &str,
-            version: &Version,
-        ) -> Result<Option<FrozenArtifact>> {
+        fn get_frozen(&self, key: &ArtifactKey) -> Result<Option<FrozenArtifact>> {
             let frozen = self
                 .0
                 .lock()
                 .map_err(|_| anyhow::anyhow!("lock poisoned"))?
                 .clone();
-            Ok(frozen.filter(|a| a.package.ecosystem == *ecosystem && a.version == *version))
+            Ok(frozen.filter(|artifact| artifact.key == *key))
         }
         fn save_content_finding(&self, _: &ContentFinding) -> Result<()> {
             Ok(())
@@ -930,7 +1002,7 @@ mod tests {
             &self,
             _: &Ecosystem,
             _: &str,
-            _: &Version,
+            _: &PackageVersionId,
         ) -> Result<Option<ContentFinding>> {
             Ok(None)
         }
@@ -939,12 +1011,20 @@ mod tests {
         }
     }
     fn frozen(version: &str) -> FrozenArtifact {
+        let version = npm_version(version);
         FrozenArtifact {
+            key: ArtifactKey {
+                source: "https://registry.example".into(),
+                ecosystem: Ecosystem::Npm,
+                name: "left-pad".into(),
+                filename: format!("left-pad-{version}.tgz"),
+                version: version.clone(),
+            },
             package: PackageCoordinate {
                 ecosystem: Ecosystem::Npm,
                 name: "left-pad".into(),
             },
-            version: Version::parse(version).unwrap(),
+            version,
             sha256: "x".into(),
             integrity: None,
             path: "p".into(),
@@ -957,27 +1037,33 @@ mod tests {
                 ecosystem: Ecosystem::Npm,
                 name: "left-pad".into(),
             },
-            version: Version::parse("2.0.0").unwrap(),
+            version: npm_version("2.0.0"),
             published_at: published,
             integrity: Some("sha512-x".into()),
-            tarball_url: None,
+            tarball_url: Some("https://registry.example/left-pad/-/left-pad-2.0.0.tgz".into()),
         }
     }
     fn evaluator<'a>(
         policy: &'a Policy,
         clock: &'a FixedClock,
         metadata: &'a dyn MetadataStore,
-    ) -> PackageEvaluator<'a> {
-        PackageEvaluator {
+    ) -> Result<PackageEvaluator<'a>> {
+        Ok(PackageEvaluator {
             policy,
             clock,
             vulns: &NoVulns,
             metadata,
-        }
+            ledger: crate::application::ledger::LedgerRecorder::open_in_memory()?,
+        })
     }
     struct NoVulns;
     impl VulnerabilitySource for NoVulns {
-        fn query(&self, _: Ecosystem, _: &str, _: &Version) -> Result<Vec<VulnerabilityFinding>> {
+        fn query(
+            &self,
+            _: Ecosystem,
+            _: &str,
+            _: &PackageVersionId,
+        ) -> Result<Vec<VulnerabilityFinding>> {
             Ok(vec![])
         }
     }
@@ -987,27 +1073,117 @@ mod tests {
         let p = Policy::default();
         let c = FixedClock(now);
         let m = M(Mutex::new(Some(frozen("1.0.0"))));
-        let e = evaluator(&p, &c, &m);
-        let d = e.evaluate(&package(Some(now - Duration::days(2))), None)?;
+        let e = evaluator(&p, &c, &m)?;
+        let d = e.evaluate(
+            &package(Some(now - Duration::days(2))),
+            VersionSelection::NpmRange(&node_semver::Range::parse("*")?),
+        )?;
         assert_eq!(d.status, DecisionStatus::Fallback);
+        assert!(d
+            .warnings
+            .iter()
+            .any(|warning| warning == ledger::LEDGER_PENDING));
+        let jobs = e.ledger.pending_jobs(10)?;
+        assert_eq!(jobs.len(), 1);
+        let payload: serde_json::Value = serde_json::from_slice(&jobs[0].payload)?;
+        assert_eq!(payload["operation"], "evaluate_version");
+        assert_eq!(payload["scope"], "complete");
         assert_eq!(d.served_version.as_deref(), Some("1.0.0"));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_findings_block_until_rescanned() -> Result<()> {
+        let now = Utc::now();
+        let legacy = ContentFinding {
+            ecosystem: Ecosystem::Npm,
+            package: "left-pad".into(),
+            version: npm_version("2.0.0"),
+            source: "guarddog".into(),
+            score: Some(rust_decimal::Decimal::from(6)),
+            scan_incomplete: false,
+            rules: vec![],
+            summary: "legacy finding".into(),
+            detected_at: now,
+        };
+        let mut legacy_json = serde_json::to_value(legacy)?;
+        legacy_json
+            .as_object_mut()
+            .unwrap()
+            .remove("scan_incomplete");
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("findings.jsonl");
+        std::fs::write(&path, format!("{legacy_json}\n"))?;
+
+        let store = crate::adapters::storage::MemoryMetadataStore::default();
+        assert_eq!(
+            crate::adapters::storage::FindingFile::new(&path).load_into(&store)?,
+            1
+        );
+        let mut policy = Policy::default();
+        policy.quarantine_scanner.enabled = true;
+        let clock = FixedClock(now);
+        let evaluator = evaluator(&policy, &clock, &store)?;
+        let decision = evaluator.evaluate(
+            &package(Some(now - Duration::days(30))),
+            VersionSelection::Exact,
+        )?;
+
+        assert_eq!(decision.status, DecisionStatus::Block);
+        assert!(decision
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("content scan incomplete")));
+        Ok(())
+    }
+    #[test]
+    fn evaluator_marks_ledger_append_failure() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("ledger.sqlite");
+        let recorder = crate::application::ledger::LedgerRecorder::open(&path)?;
+        rusqlite::Connection::open(&path)?.execute_batch(
+            "CREATE TRIGGER reject_ledger_events
+             BEFORE INSERT ON ledger_events
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected ledger failure');
+             END;",
+        )?;
+        let policy = Policy::default();
+        let clock = FixedClock(Utc::now());
+        let metadata = M(Mutex::new(None));
+        let evaluator = PackageEvaluator {
+            policy: &policy,
+            clock: &clock,
+            vulns: &NoVulns,
+            metadata: &metadata,
+            ledger: recorder,
+        };
+        let error = evaluator
+            .evaluate(
+                &package(Some(clock.now() - Duration::days(30))),
+                VersionSelection::Exact,
+            )
+            .unwrap_err();
+        assert!(error
+            .downcast_ref::<crate::application::ledger::LedgerRecordingError>()
+            .is_some());
         Ok(())
     }
     #[test]
     fn frozen_fallback_is_rechecked_for_vulnerabilities() -> Result<()> {
         struct Source {
             fail: bool,
-            queried: Mutex<Vec<Version>>,
+            queried: Mutex<Vec<PackageVersionId>>,
         }
         impl VulnerabilitySource for Source {
             fn query(
                 &self,
                 _: Ecosystem,
                 _: &str,
-                version: &Version,
+                version: &PackageVersionId,
             ) -> Result<Vec<VulnerabilityFinding>> {
                 self.queried.lock().unwrap().push(version.clone());
-                if version.major != 1 {
+                if version.canonical() != "1.0.0" {
                     return Ok(vec![]);
                 }
                 if self.fail {
@@ -1018,6 +1194,9 @@ mod tests {
                     id: "TEST-FROZEN".into(),
                     severity: Severity::High,
                     summary: "new advisory".into(),
+                    aliases: vec![],
+                    modified: None,
+                    withdrawn: None,
                 }])
             }
         }
@@ -1035,8 +1214,12 @@ mod tests {
                 clock: &clock,
                 vulns: &source,
                 metadata: &metadata,
+                ledger: crate::application::ledger::LedgerRecorder::open_in_memory()?,
             };
-            let result = evaluator.evaluate(&package(Some(now)), None);
+            let result = evaluator.evaluate(
+                &package(Some(now)),
+                VersionSelection::NpmRange(&node_semver::Range::parse("*")?),
+            );
             if fail {
                 assert!(result.is_err(), "fallback query errors must fail closed");
             } else {
@@ -1046,7 +1229,7 @@ mod tests {
             }
             assert_eq!(
                 *source.queried.lock().unwrap(),
-                vec![Version::new(2, 0, 0), Version::new(1, 0, 0)]
+                vec![npm_version("2.0.0"), npm_version("1.0.0")]
             );
         }
         Ok(())
@@ -1057,14 +1240,17 @@ mod tests {
             &self,
             _: Ecosystem,
             _: &str,
-            version: &Version,
+            version: &PackageVersionId,
         ) -> Result<Vec<VulnerabilityFinding>> {
-            if version.major == 2 {
+            if version.canonical() == "2.0.0" {
                 Ok(vec![VulnerabilityFinding {
                     source: "OSV".into(),
                     id: "GHSA-medium".into(),
                     severity: Severity::Medium,
                     summary: "medium advisory".into(),
+                    aliases: vec![],
+                    modified: None,
+                    withdrawn: None,
                 }])
             } else {
                 Ok(vec![])
@@ -1073,12 +1259,20 @@ mod tests {
     }
     struct MediumVulns;
     impl VulnerabilitySource for MediumVulns {
-        fn query(&self, _: Ecosystem, _: &str, _: &Version) -> Result<Vec<VulnerabilityFinding>> {
+        fn query(
+            &self,
+            _: Ecosystem,
+            _: &str,
+            _: &PackageVersionId,
+        ) -> Result<Vec<VulnerabilityFinding>> {
             Ok(vec![VulnerabilityFinding {
                 source: "OSV".into(),
                 id: "GHSA-medium".into(),
                 severity: Severity::Medium,
                 summary: "medium advisory".into(),
+                aliases: vec![],
+                modified: None,
+                withdrawn: None,
             }])
         }
     }
@@ -1093,8 +1287,12 @@ mod tests {
             clock: &c,
             vulns: &MediumVulns,
             metadata: &m,
+            ledger: crate::application::ledger::LedgerRecorder::open_in_memory()?,
         };
-        let d = e.evaluate(&package(Some(now - Duration::days(30))), None)?;
+        let d = e.evaluate(
+            &package(Some(now - Duration::days(30))),
+            VersionSelection::Exact,
+        )?;
         assert_eq!(
             d.status,
             DecisionStatus::Block,
@@ -1103,6 +1301,74 @@ mod tests {
         assert!(d.reasons[0].contains("GHSA-medium"));
         Ok(())
     }
+    #[test]
+    fn withdrawn_osv_advisory_does_not_block_version() -> Result<()> {
+        struct WithdrawnVulns;
+        impl VulnerabilitySource for WithdrawnVulns {
+            fn query(
+                &self,
+                _: Ecosystem,
+                _: &str,
+                _: &PackageVersionId,
+            ) -> Result<Vec<VulnerabilityFinding>> {
+                Ok(vec![VulnerabilityFinding {
+                    source: "OSV".into(),
+                    id: "GHSA-withdrawn".into(),
+                    aliases: vec!["CVE-2026-1234".into()],
+                    severity: Severity::Critical,
+                    summary: "withdrawn advisory".into(),
+                    modified: None,
+                    withdrawn: Some("2026-10-13T10:30:00Z".parse()?),
+                }])
+            }
+        }
+
+        let now = Utc::now();
+        let policy = Policy::default();
+        let clock = FixedClock(now);
+        let metadata = M(Mutex::new(None));
+        let decision = PackageEvaluator {
+            policy: &policy,
+            clock: &clock,
+            vulns: &WithdrawnVulns,
+            metadata: &metadata,
+            ledger: crate::application::ledger::LedgerRecorder::open_in_memory()?,
+        }
+        .evaluate(
+            &package(Some(now - Duration::days(30))),
+            VersionSelection::Exact,
+        )?;
+
+        assert_eq!(decision.status, DecisionStatus::Allow);
+        Ok(())
+    }
+
+    #[test]
+    fn active_osv_findings_block_even_when_severity_policy_is_disabled() -> Result<()> {
+        let now = Utc::now();
+        let mut policy = Policy::default();
+        policy.quarantine.cve_keeps_quarantined = false;
+        policy.vulnerabilities.block_severities.clear();
+        let clock = FixedClock(now);
+        let metadata = M(Mutex::new(None));
+        let evaluator = PackageEvaluator {
+            policy: &policy,
+            clock: &clock,
+            vulns: &MediumVulns,
+            metadata: &metadata,
+            ledger: crate::application::ledger::LedgerRecorder::open_in_memory()?,
+        };
+
+        let decision = evaluator.evaluate(
+            &package(Some(now - Duration::days(30))),
+            VersionSelection::Exact,
+        )?;
+
+        assert_eq!(decision.status, DecisionStatus::Block);
+        assert!(decision.reasons[0].contains("GHSA-medium"));
+        Ok(())
+    }
+
     #[test]
     fn cve_version_falls_back_to_clean_frozen() -> Result<()> {
         let now = Utc::now();
@@ -1114,8 +1380,12 @@ mod tests {
             clock: &c,
             vulns: &VersionedVulns,
             metadata: &m,
+            ledger: crate::application::ledger::LedgerRecorder::open_in_memory()?,
         };
-        let d = e.evaluate(&package(Some(now - Duration::days(30))), None)?;
+        let d = e.evaluate(
+            &package(Some(now - Duration::days(30))),
+            VersionSelection::NpmRange(&node_semver::Range::parse("*")?),
+        )?;
         assert_eq!(d.status, DecisionStatus::Fallback);
         assert_eq!(d.served_version.as_deref(), Some("1.0.0"));
         Ok(())
@@ -1131,8 +1401,12 @@ mod tests {
             clock: &c,
             vulns: &MediumVulns,
             metadata: &m,
+            ledger: crate::application::ledger::LedgerRecorder::open_in_memory()?,
         };
-        let d = e.evaluate(&package(Some(now - Duration::days(30))), None)?;
+        let d = e.evaluate(
+            &package(Some(now - Duration::days(30))),
+            VersionSelection::NpmRange(&node_semver::Range::parse("*")?),
+        )?;
         assert_eq!(d.status, DecisionStatus::Block);
         assert!(d.reasons[0].contains("GHSA-medium"));
         Ok(())
@@ -1210,18 +1484,19 @@ mod tests {
             clock: &c,
             vulns: &NoVulns,
             metadata: &m,
+            ledger: crate::application::ledger::LedgerRecorder::open_in_memory()?,
         };
         let pv = PackageVersion {
             package: PackageCoordinate {
                 ecosystem: Ecosystem::PyPi,
                 name: "requests".into(),
             },
-            version: Version::parse("2.32.3").unwrap(),
+            version: pypi_version("2.32.3"),
             published_at: Some(now - Duration::days(30)),
             integrity: None,
             tarball_url: None,
         };
-        let d = e.evaluate(&pv, None)?;
+        let d = e.evaluate(&pv, VersionSelection::Exact)?;
         assert_eq!(
             d.status,
             DecisionStatus::Allow,
@@ -1235,7 +1510,7 @@ mod tests {
             &self,
             ecosystem: Ecosystem,
             _: &str,
-            _: &Version,
+            _: &PackageVersionId,
         ) -> Result<Vec<VulnerabilityFinding>> {
             if ecosystem == Ecosystem::PyPi {
                 Ok(vec![VulnerabilityFinding {
@@ -1243,6 +1518,9 @@ mod tests {
                     id: "GHSA-pip".into(),
                     severity: Severity::Medium,
                     summary: "pip advisory".into(),
+                    aliases: vec![],
+                    modified: None,
+                    withdrawn: None,
                 }])
             } else {
                 Ok(vec![])
@@ -1260,29 +1538,31 @@ mod tests {
             clock: &c,
             vulns: &OnlyPyPiVulns,
             metadata: &m,
+            ledger: crate::application::ledger::LedgerRecorder::open_in_memory()?,
         };
         let pv = PackageVersion {
             package: PackageCoordinate {
                 ecosystem: Ecosystem::PyPi,
                 name: "requests".into(),
             },
-            version: Version::parse("2.32.3").unwrap(),
+            version: pypi_version("2.32.3"),
             published_at: Some(now - Duration::days(30)),
             integrity: Some("sha256-abc".into()),
             tarball_url: None,
         };
-        let d = e.evaluate(&pv, None)?;
+        let d = e.evaluate(&pv, VersionSelection::Exact)?;
         assert_eq!(d.status, DecisionStatus::Block);
         assert!(d.reasons[0].contains("GHSA-pip"));
         Ok(())
     }
-    fn finding(score: u8) -> ContentFinding {
+    fn finding(score: Decimal) -> ContentFinding {
         ContentFinding {
             ecosystem: Ecosystem::Npm,
             package: "left-pad".into(),
-            version: Version::parse("2.0.0").unwrap(),
+            version: npm_version("2.0.0"),
             source: "static-heuristics".into(),
-            score,
+            score: Some(score),
+            scan_incomplete: false,
             rules: vec!["install-script-network".into()],
             summary: "postinstall script posts environment to a webhook".into(),
             detected_at: chrono::Utc::now(),
@@ -1301,31 +1581,29 @@ mod tests {
         }
         fn latest_frozen_satisfying(
             &self,
+            source: &str,
             ecosystem: &Ecosystem,
             _: &str,
-            requested: Option<&VersionReq>,
+            requested: Option<&node_semver::Range>,
         ) -> Result<Option<FrozenArtifact>> {
             let frozen = self
                 .frozen
                 .lock()
                 .map_err(|_| anyhow::anyhow!("lock poisoned"))?
                 .clone();
-            Ok(frozen.filter(|a| {
-                a.package.ecosystem == *ecosystem && requested.is_none_or(|r| r.matches(&a.version))
+            Ok(frozen.filter(|artifact| {
+                artifact.key.source == source
+                    && artifact.key.ecosystem == *ecosystem
+                    && requested.is_none_or(|range| artifact.version.satisfies_npm_range(range))
             }))
         }
-        fn get_frozen(
-            &self,
-            ecosystem: &Ecosystem,
-            _: &str,
-            version: &Version,
-        ) -> Result<Option<FrozenArtifact>> {
+        fn get_frozen(&self, key: &ArtifactKey) -> Result<Option<FrozenArtifact>> {
             let frozen = self
                 .frozen
                 .lock()
                 .map_err(|_| anyhow::anyhow!("lock poisoned"))?
                 .clone();
-            Ok(frozen.filter(|a| a.package.ecosystem == *ecosystem && a.version == *version))
+            Ok(frozen.filter(|artifact| artifact.key == *key))
         }
         fn save_content_finding(&self, finding: &ContentFinding) -> Result<()> {
             *self
@@ -1338,7 +1616,7 @@ mod tests {
             &self,
             ecosystem: &Ecosystem,
             _: &str,
-            version: &Version,
+            version: &PackageVersionId,
         ) -> Result<Option<ContentFinding>> {
             let finding = self
                 .finding
@@ -1355,9 +1633,10 @@ mod tests {
         store.save_content_finding(&ContentFinding {
             ecosystem: Ecosystem::PyPi,
             package: "evil".into(),
-            version: Version::parse("1.0.0").unwrap_or_else(|_| panic!("valid semver")),
+            version: pypi_version("1.0.0"),
             source: "static-heuristics".into(),
-            score: 9,
+            score: Some(Decimal::from(9)),
+            scan_incomplete: false,
             rules: vec!["env-exfiltration".into()],
             summary: "exfiltrates the environment".into(),
             detected_at: Utc::now(),
@@ -1371,18 +1650,19 @@ mod tests {
             clock: &clock,
             vulns: &NoVulns,
             metadata: &store,
+            ledger: crate::application::ledger::LedgerRecorder::open_in_memory()?,
         };
         let pv = PackageVersion {
             package: PackageCoordinate {
                 ecosystem: Ecosystem::PyPi,
                 name: "evil".into(),
             },
-            version: Version::parse("1.0.0").unwrap_or_else(|_| panic!("valid semver")),
+            version: pypi_version("1.0.0"),
             published_at: Some(now - Duration::days(30)),
             integrity: Some("sha256-x".into()),
             tarball_url: None,
         };
-        let decision = evaluator.evaluate(&pv, None)?;
+        let decision = evaluator.evaluate(&pv, VersionSelection::Exact)?;
         assert_eq!(decision.status, DecisionStatus::Block);
         Ok(())
     }
@@ -1412,23 +1692,34 @@ mod tests {
     }
 
     #[test]
-    fn attested_archive_downgrades_block_to_review() -> Result<()> {
+    fn malicious_archive_blocks_without_provenance_evidence() -> Result<()> {
         use crate::adapters::storage::MemoryMetadataStore;
-        use crate::application::scanner::scan_archive_bytes_with_provenance;
+        use crate::application::scanner::scan_archive_bytes;
 
         let bytes = malicious_archive()?;
         let store = MemoryMetadataStore::default();
         let now = Utc::now();
-        let version = Version::parse("2.0.0").unwrap_or_else(|_| panic!("valid semver"));
-        let finding = scan_archive_bytes_with_provenance(
+        let version = npm_version("2.0.0");
+        let scratch = tempfile::tempdir()?;
+        let finding = scan_archive_bytes(
             &store,
+            &crate::application::ledger::LedgerRecorder::open_in_memory()?,
             &Ecosystem::Npm,
             "left-pad",
             &version,
             &bytes,
-            true,
+            scratch.path(),
         )?;
-        assert_eq!(finding.map(|finding| finding.score), Some(6));
+        assert!(finding.is_some());
+        let finding = store
+            .content_finding(&Ecosystem::Npm, "left-pad", &version)?
+            .unwrap_or_else(|| panic!("finding was persisted"));
+        assert!(!finding
+            .rules
+            .iter()
+            .any(|rule| rule == "provenance-attested"));
+        assert!(!finding.summary.contains("provenance"));
+
         let mut policy = Policy::default();
         policy.quarantine_scanner.enabled = true;
         let clock = FixedClock(now);
@@ -1437,16 +1728,17 @@ mod tests {
             clock: &clock,
             vulns: &NoVulns,
             metadata: &store,
+            ledger: crate::application::ledger::LedgerRecorder::open_in_memory()?,
         };
-        let decision = evaluator.evaluate(&package(Some(now - Duration::days(30))), None)?;
-        assert_eq!(decision.status, DecisionStatus::Allow);
+        let decision = evaluator.evaluate(
+            &package(Some(now - Duration::days(30))),
+            VersionSelection::Exact,
+        )?;
+        assert_eq!(decision.status, DecisionStatus::Block);
         assert!(
-            decision
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("review")),
+            decision.reasons[0].contains("content scan"),
             "{:?}",
-            decision.warnings
+            decision.reasons
         );
         Ok(())
     }
@@ -1458,8 +1750,17 @@ mod tests {
         let bytes = malicious_archive()?;
         let store = MemoryMetadataStore::default();
         let now = Utc::now();
-        let version = Version::parse("2.0.0").unwrap_or_else(|_| panic!("valid semver"));
-        let finding = scan_archive_bytes(&store, &Ecosystem::Npm, "left-pad", &version, &bytes)?;
+        let version = npm_version("2.0.0");
+        let scratch = tempfile::tempdir()?;
+        let finding = scan_archive_bytes(
+            &store,
+            &crate::application::ledger::LedgerRecorder::open_in_memory()?,
+            &Ecosystem::Npm,
+            "left-pad",
+            &version,
+            &bytes,
+            scratch.path(),
+        )?;
         assert!(finding.is_some());
         let mut policy = Policy::default();
         policy.quarantine_scanner.enabled = true;
@@ -1469,8 +1770,12 @@ mod tests {
             clock: &clock,
             vulns: &NoVulns,
             metadata: &store,
+            ledger: crate::application::ledger::LedgerRecorder::open_in_memory()?,
         };
-        let decision = evaluator.evaluate(&package(Some(now - Duration::days(30))), None)?;
+        let decision = evaluator.evaluate(
+            &package(Some(now - Duration::days(30))),
+            VersionSelection::Exact,
+        )?;
         assert_eq!(decision.status, DecisionStatus::Block);
         assert!(
             decision.reasons[0].contains("content scan"),
@@ -1487,15 +1792,19 @@ mod tests {
         let c = FixedClock(now);
         let m = FindingM {
             frozen: Mutex::new(None),
-            finding: Mutex::new(Some(finding(9))),
+            finding: Mutex::new(Some(finding(Decimal::from(9)))),
         };
         let e = PackageEvaluator {
             policy: &p,
             clock: &c,
             vulns: &NoVulns,
             metadata: &m,
+            ledger: crate::application::ledger::LedgerRecorder::open_in_memory()?,
         };
-        let d = e.evaluate(&package(Some(now - Duration::days(30))), None)?;
+        let d = e.evaluate(
+            &package(Some(now - Duration::days(30))),
+            VersionSelection::Exact,
+        )?;
         assert_eq!(d.status, DecisionStatus::Block);
         assert!(d.reasons[0].contains("content scan"), "{:?}", d.reasons);
         assert!(d.reasons[0].contains("install-script-network"));
@@ -1508,15 +1817,19 @@ mod tests {
         let c = FixedClock(now);
         let m = FindingM {
             frozen: Mutex::new(None),
-            finding: Mutex::new(Some(finding(9))),
+            finding: Mutex::new(Some(finding(Decimal::from(9)))),
         };
         let e = PackageEvaluator {
             policy: &p,
             clock: &c,
             vulns: &NoVulns,
             metadata: &m,
+            ledger: crate::application::ledger::LedgerRecorder::open_in_memory()?,
         };
-        let d = e.evaluate(&package(Some(now - Duration::days(30))), None)?;
+        let d = e.evaluate(
+            &package(Some(now - Duration::days(30))),
+            VersionSelection::Exact,
+        )?;
         assert_eq!(d.status, DecisionStatus::Allow);
         Ok(())
     }
@@ -1528,15 +1841,19 @@ mod tests {
         let c = FixedClock(now);
         let m = FindingM {
             frozen: Mutex::new(None),
-            finding: Mutex::new(Some(finding(5))),
+            finding: Mutex::new(Some(finding(Decimal::new(79, 1)))),
         };
         let e = PackageEvaluator {
             policy: &p,
             clock: &c,
             vulns: &NoVulns,
             metadata: &m,
+            ledger: crate::application::ledger::LedgerRecorder::open_in_memory()?,
         };
-        let d = e.evaluate(&package(Some(now - Duration::days(30))), None)?;
+        let d = e.evaluate(
+            &package(Some(now - Duration::days(30))),
+            VersionSelection::Exact,
+        )?;
         assert_eq!(d.status, DecisionStatus::Allow);
         assert!(
             d.warnings.iter().any(|warning| warning.contains("review")),
@@ -1546,13 +1863,42 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn incomplete_content_scan_blocks_without_a_score() -> Result<()> {
+        let now = Utc::now();
+        let mut policy = Policy::default();
+        policy.quarantine_scanner.enabled = true;
+        let clock = FixedClock(now);
+        let mut incomplete = finding(Decimal::ZERO);
+        incomplete.score = None;
+        incomplete.scan_incomplete = true;
+        incomplete.rules = vec!["scan-incomplete".into()];
+        let metadata = FindingM {
+            frozen: Mutex::new(None),
+            finding: Mutex::new(Some(incomplete)),
+        };
+        let evaluator = PackageEvaluator {
+            policy: &policy,
+            clock: &clock,
+            vulns: &NoVulns,
+            metadata: &metadata,
+            ledger: crate::application::ledger::LedgerRecorder::open_in_memory()?,
+        };
+        let decision = evaluator.evaluate(
+            &package(Some(now - Duration::days(30))),
+            VersionSelection::Exact,
+        )?;
+        assert_eq!(decision.status, DecisionStatus::Block);
+        assert!(decision.reasons[0].contains("scan incomplete"));
+        Ok(())
+    }
+    #[test]
     fn content_finding_blocks_frozen_fallback() -> Result<()> {
         let now = Utc::now();
         let mut p = Policy::default();
         p.quarantine_scanner.enabled = true;
         let c = FixedClock(now);
-        let mut frozen_finding = finding(9);
-        frozen_finding.version = Version::parse("1.0.0").unwrap();
+        let mut frozen_finding = finding(Decimal::from(9));
+        frozen_finding.version = npm_version("1.0.0");
         let m = FindingM {
             frozen: Mutex::new(Some(frozen("1.0.0"))),
             finding: Mutex::new(Some(frozen_finding)),
@@ -1562,31 +1908,14 @@ mod tests {
             clock: &c,
             vulns: &NoVulns,
             metadata: &m,
+            ledger: crate::application::ledger::LedgerRecorder::open_in_memory()?,
         };
-        let d = e.evaluate(&package(Some(now - Duration::days(2))), None)?;
+        let d = e.evaluate(
+            &package(Some(now - Duration::days(2))),
+            VersionSelection::NpmRange(&node_semver::Range::parse("*")?),
+        )?;
         assert_eq!(d.status, DecisionStatus::Block);
         assert!(d.reasons[0].contains("frozen fallback"), "{:?}", d.reasons);
-        Ok(())
-    }
-    #[test]
-    fn cve_permanence_can_be_disabled_by_policy() -> Result<()> {
-        let now = Utc::now();
-        let mut p = Policy::default();
-        p.quarantine.cve_keeps_quarantined = false;
-        let c = FixedClock(now);
-        let m = M(Mutex::new(None));
-        let e = PackageEvaluator {
-            policy: &p,
-            clock: &c,
-            vulns: &MediumVulns,
-            metadata: &m,
-        };
-        let d = e.evaluate(&package(Some(now - Duration::days(30))), None)?;
-        assert_eq!(
-            d.status,
-            DecisionStatus::Allow,
-            "with the strict rule disabled only block_severities applies"
-        );
         Ok(())
     }
     #[test]
@@ -1595,8 +1924,8 @@ mod tests {
         let p = Policy::default();
         let c = FixedClock(now);
         let m = M(Mutex::new(None));
-        let e = evaluator(&p, &c, &m);
-        let d = e.evaluate(&package(None), None)?;
+        let e = evaluator(&p, &c, &m)?;
+        let d = e.evaluate(&package(None), VersionSelection::Exact)?;
         assert_eq!(d.status, DecisionStatus::Block);
         assert!(d.reasons[0].contains("quarantine"));
         Ok(())
@@ -1608,8 +1937,11 @@ mod tests {
         p.npm.deny_packages = vec!["left-pad".into()];
         let c = FixedClock(now);
         let m = M(Mutex::new(Some(frozen("1.0.0"))));
-        let e = evaluator(&p, &c, &m);
-        let d = e.evaluate(&package(Some(now - Duration::days(30))), None)?;
+        let e = evaluator(&p, &c, &m)?;
+        let d = e.evaluate(
+            &package(Some(now - Duration::days(30))),
+            VersionSelection::Exact,
+        )?;
         assert_eq!(d.status, DecisionStatus::Block);
         assert!(d.reasons[0].contains("denylisted"));
         Ok(())
@@ -1620,8 +1952,11 @@ mod tests {
         let p = Policy::default();
         let c = FixedClock(now);
         let m = M(Mutex::new(None));
-        let e = evaluator(&p, &c, &m);
-        let d = e.evaluate(&package(Some(now - Duration::days(30))), None)?;
+        let e = evaluator(&p, &c, &m)?;
+        let d = e.evaluate(
+            &package(Some(now - Duration::days(30))),
+            VersionSelection::Exact,
+        )?;
         assert_eq!(d.status, DecisionStatus::Allow);
         Ok(())
     }
@@ -1634,13 +1969,13 @@ mod tests {
         store.put_frozen(frozen("1.0.0"))?;
         store.put_frozen(frozen("1.5.0"))?;
         let quarantined = package(Some(now - Duration::days(2)));
-        let e = evaluator(&p, &c, &store);
-        let caret_one = VersionReq::parse("^1.0.0")?;
-        let d = e.evaluate(&quarantined, Some(&caret_one))?;
+        let e = evaluator(&p, &c, &store)?;
+        let caret_one = node_semver::Range::parse("^1.0.0")?;
+        let d = e.evaluate(&quarantined, VersionSelection::NpmRange(&caret_one))?;
         assert_eq!(d.status, DecisionStatus::Fallback);
         assert_eq!(d.served_version.as_deref(), Some("1.5.0"));
-        let caret_two = VersionReq::parse("^2.0.0")?;
-        let d = e.evaluate(&quarantined, Some(&caret_two))?;
+        let caret_two = node_semver::Range::parse("^2.0.0")?;
+        let d = e.evaluate(&quarantined, VersionSelection::NpmRange(&caret_two))?;
         assert_eq!(
             d.status,
             DecisionStatus::Block,
@@ -1648,25 +1983,75 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn exact_pin_does_not_return_a_different_frozen_version() -> Result<()> {
+        let now = Utc::now();
+        let policy = Policy::default();
+        let clock = FixedClock(now);
+        let store = crate::adapters::storage::MemoryMetadataStore::default();
+        store.put_frozen(frozen("1.0.0"))?;
+        let decision = evaluator(&policy, &clock, &store)?.evaluate(
+            &package(Some(now - Duration::days(2))),
+            VersionSelection::Exact,
+        )?;
+        assert_eq!(decision.status, DecisionStatus::Block);
+        assert_eq!(decision.served_version, None);
+        Ok(())
+    }
     struct Reg(Vec<u8>);
     impl UpstreamNpmRegistry for Reg {
         fn metadata(&self, _: &str) -> Result<serde_json::Value> {
             Ok(serde_json::json!({}))
         }
-        fn tarball(&self, _: &str) -> Result<Vec<u8>> {
-            Ok(self.0.clone())
+        fn tarball(&self, _: &str) -> Result<Box<dyn std::io::Read + Send>> {
+            Ok(Box::new(std::io::Cursor::new(self.0.clone())))
         }
     }
     struct MemStore;
     impl ArtifactStore for MemStore {
-        fn put(&self, _: &str, _: &Version, _: &[u8]) -> Result<String> {
-            Ok("p".into())
+        fn put(
+            &self,
+            reader: &mut dyn std::io::Read,
+            max_bytes: u64,
+        ) -> Result<crate::ports::StoredArtifact> {
+            use sha2::{Digest, Sha256};
+            use std::io::{Seek, SeekFrom, Write};
+
+            let mut file = tempfile::tempfile()?;
+            let mut hasher = Sha256::new();
+            let mut size = 0u64;
+            let mut buffer = [0u8; 8192];
+            loop {
+                let count = reader.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                size = size
+                    .checked_add(u64::try_from(count)?)
+                    .ok_or_else(|| anyhow::anyhow!("artifact size overflow"))?;
+                anyhow::ensure!(size <= max_bytes, "artifact exceeds its size limit");
+                hasher.update(&buffer[..count]);
+                file.write_all(&buffer[..count])?;
+            }
+            file.seek(SeekFrom::Start(0))?;
+            Ok(crate::ports::StoredArtifact {
+                sha256: hex::encode(hasher.finalize()),
+                path: "p".into(),
+                file,
+            })
         }
-        fn resolve(&self, _: &str, _: &Version) -> Result<Option<String>> {
+        fn map(&self, _: &ArtifactKey, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn resolve(&self, _: &ArtifactKey) -> Result<Option<String>> {
             Ok(Some("p".into()))
         }
-        fn read(&self, _: &str) -> Result<Vec<u8>> {
-            Ok(vec![])
+        fn open(&self, _: &ArtifactKey) -> Result<Option<std::fs::File>> {
+            Ok(None)
+        }
+        fn import_legacy(&self, _: &ArtifactKey, _: &str) -> Result<String> {
+            Ok("p".into())
         }
     }
     fn sri_sha512(bytes: &[u8]) -> String {
@@ -1677,6 +2062,7 @@ mod tests {
     fn ingest_into(
         policy: &Policy,
         store: &crate::adapters::storage::MemoryMetadataStore,
+        ledger: &crate::application::ledger::LedgerRecorder,
         bytes: Vec<u8>,
         integrity: String,
     ) -> Result<FrozenArtifact> {
@@ -1686,7 +2072,7 @@ mod tests {
                 ecosystem: Ecosystem::Npm,
                 name: "left-pad".into(),
             },
-            version: Version::parse("1.3.0")?,
+            version: npm_version("1.3.0"),
             published_at: None,
             integrity: Some(integrity),
             tarball_url: Some("http://registry/t.tgz".into()),
@@ -1699,6 +2085,7 @@ mod tests {
             artifacts: &MemStore,
             metadata: store,
             clock: &FixedClock(Utc::now()),
+            ledger: ledger.clone(),
         }
         .freeze_verified(&pv)
     }
@@ -1706,21 +2093,53 @@ mod tests {
     fn republish_same_version_conflicting_bytes_rejected() -> Result<()> {
         let p = Policy::default();
         let store = crate::adapters::storage::MemoryMetadataStore::default();
+        let ledger = crate::application::ledger::LedgerRecorder::open_in_memory()?;
         let good = b"good bytes".to_vec();
-        let first = ingest_into(&p, &store, good.clone(), sri_sha512(&good))?;
+        let first = ingest_into(&p, &store, &ledger, good.clone(), sri_sha512(&good))?;
         assert_eq!(first.sha256.len(), 64);
-        let idempotent = ingest_into(&p, &store, good.clone(), sri_sha512(&good))?;
+        let idempotent = ingest_into(&p, &store, &ledger, good.clone(), sri_sha512(&good))?;
         assert_eq!(
             idempotent.sha256, first.sha256,
             "same bytes re-freeze is idempotent"
         );
+        let jobs = ledger.pending_jobs(10)?;
+        assert_eq!(jobs.len(), 2);
+        assert!(jobs.iter().all(|job| {
+            let payload: serde_json::Value = serde_json::from_slice(&job.payload).unwrap();
+            payload["operation"] == "evaluate_version" && payload["scope"] == "complete"
+        }));
         let evil = b"evil payload".to_vec();
-        let republished = ingest_into(&p, &store, evil.clone(), sri_sha512(&evil));
+        let republished = ingest_into(&p, &store, &ledger, evil.clone(), sri_sha512(&evil));
         let err = republished.unwrap_err().to_string();
         assert!(
             err.contains("immutability violation"),
             "expected immutability violation, got: {err}"
         );
+        Ok(())
+    }
+    #[test]
+    fn integrity_is_enforced_when_policy_flag_is_disabled() -> Result<()> {
+        let mut policy = Policy::default();
+        policy.npm.require_integrity = false;
+        let store = crate::adapters::storage::MemoryMetadataStore::default();
+        let ledger = crate::application::ledger::LedgerRecorder::open_in_memory()?;
+        let bytes = b"package bytes".to_vec();
+        let error = ingest_into(
+            &policy,
+            &store,
+            &ledger,
+            bytes,
+            sri_sha512(b"different bytes"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("npm integrity mismatch"));
+        let key = ArtifactKey::from_tarball_url(
+            "http://registry/t.tgz",
+            &Ecosystem::Npm,
+            "left-pad",
+            &PackageVersionId::parse(&Ecosystem::Npm, "1.3.0")?,
+        )?;
+        assert!(store.get_frozen(&key)?.is_none());
         Ok(())
     }
     struct R(Vec<(String, String)>);

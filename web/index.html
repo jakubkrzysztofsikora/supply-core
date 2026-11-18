@@ -146,6 +146,101 @@
           <div class="metric-note">Currently in quarantine</div>
         </article>
       </section>
+      <section class="section" aria-labelledby="scan-heading">
+        <div class="section-head">
+          <div>
+            <h2 id="scan-heading">Latest content scan</h2>
+            <p id="scan-captured-at">Waiting for published scan data…</p>
+          </div>
+        </div>
+        <div class="grid" aria-label="Content scan counts">
+          <article class="card">
+            <div class="metric-label">Candidates</div>
+            <div class="metric-value" id="scan-candidates">—</div>
+            <div class="metric-note">Packages selected for scanning</div>
+          </article>
+          <article class="card">
+            <div class="metric-label">Scanned</div>
+            <div class="metric-value" id="scan-count">—</div>
+            <div class="metric-note">Detailed scan results</div>
+          </article>
+          <article class="card">
+            <div class="metric-label">Scan blocks</div>
+            <div class="metric-value" id="scan-blocked-count">—</div>
+            <div class="metric-note">Block decisions only; confirmed OSV blocks are separate</div>
+          </article>
+          <article class="card">
+            <div class="metric-label">Scan errors</div>
+            <div class="metric-value" id="scan-error-count">—</div>
+            <div class="metric-note">Error count only</div>
+          </article>
+        </div>
+      </section>
+      <section class="section card" aria-labelledby="scanned-heading">
+        <div class="section-head">
+          <div>
+            <h2 id="scanned-heading">Scanned package details</h2>
+            <p>Latest published decisions, coverage, findings, scores, rules, and sources.</p>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">Package</th><th scope="col">Version</th><th scope="col">Decision</th>
+                <th scope="col">Coverage</th><th scope="col">Findings</th><th scope="col">Score</th>
+                <th scope="col">Rules</th><th scope="col">Sources</th>
+              </tr>
+            </thead>
+            <tbody id="scanned-list">
+              <tr><td colspan="8" class="empty">Loading scan details…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+      <section class="section card" aria-labelledby="blocked-heading">
+        <div class="section-head">
+          <div>
+            <h2 id="blocked-heading">Scan-derived blocks</h2>
+            <p>Scanned rows with a block decision only; confirmed OSV blocks are listed separately.</p>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">Package</th><th scope="col">Version</th><th scope="col">Decision</th>
+                <th scope="col">Coverage</th><th scope="col">Findings</th><th scope="col">Score</th>
+                <th scope="col">Rules</th><th scope="col">Sources</th>
+              </tr>
+            </thead>
+            <tbody id="blocked-list">
+              <tr><td colspan="8" class="empty">Loading blocked packages…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+      <section class="section card" aria-labelledby="confirmed-heading">
+        <div class="section-head">
+          <div>
+            <h2 id="confirmed-heading">Confirmed OSV blocks</h2>
+            <p>Confirmed advisory findings, separate from scan-derived block decisions.</p>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">Package</th><th scope="col">Version</th>
+                <th scope="col">Advisory</th><th scope="col">Severity</th>
+              </tr>
+            </thead>
+            <tbody id="confirmed-list">
+              <tr><td colspan="4" class="empty">Loading confirmed OSV blocks…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
       <section class="section card">
         <div class="section-head">
           <div>
@@ -186,7 +281,34 @@
     </main>
   </div>
   <script>
-    const text = (id, value) => { document.getElementById(id).textContent = value; };
+    const text = (id, value) => { document.getElementById(id).textContent = String(value ?? "—"); };
+    const showMessage = (id, columns, message) => {
+      const body = document.getElementById(id);
+      const row = document.createElement("tr");
+      const cell = document.createElement("td");
+      cell.colSpan = columns;
+      cell.className = "empty";
+      cell.textContent = message;
+      row.appendChild(cell);
+      body.replaceChildren(row);
+    };
+    const renderRows = (id, rows, columns, emptyMessage, valuesForRow) => {
+      const body = document.getElementById(id);
+      body.replaceChildren();
+      if (!Array.isArray(rows) || !rows.length) {
+        showMessage(id, columns, emptyMessage);
+        return;
+      }
+      rows.forEach((item) => {
+        const row = document.createElement("tr");
+        valuesForRow(item).forEach((value) => {
+          const cell = document.createElement("td");
+          cell.textContent = String(value ?? "—");
+          row.appendChild(cell);
+        });
+        body.appendChild(row);
+      });
+    };
     const render = (data) => {
       text("service-status", data.health.status === "ok" ? "Operational" : "Degraded");
       text("service-name", data.service);
@@ -196,6 +318,43 @@
       text("quarantine-count", data.quarantine.packages.length);
       text("footer-version", `v${data.version}`);
       text("updated-at", new Date(data.generated_at).toLocaleTimeString());
+      const scan = data.scan && typeof data.scan === "object" ? data.scan : null;
+      text("scan-captured-at", scan ? `Captured ${scan.captured_at}` : "No scan capture published.");
+      text("scan-candidates", scan ? scan.candidate_count : "—");
+      text("scan-count", scan ? scan.scanned_count : "—");
+      text("scan-blocked-count", scan ? scan.blocked_count : "—");
+      text("scan-error-count", scan ? scan.error_count : "—");
+      const scanCells = (row) => [
+        row.name,
+        row.version,
+        row.decision,
+        row.coverage,
+        row.findings,
+        row.score,
+        Array.isArray(row.rules) ? row.rules.join(", ") : "—",
+        Array.isArray(row.sources) ? row.sources.join(", ") : "—",
+      ];
+      renderRows(
+        "scanned-list",
+        scan ? scan.scanned : [],
+        8,
+        "No scanned package details were published.",
+        scanCells,
+      );
+      renderRows(
+        "blocked-list",
+        scan ? scan.blocked : [],
+        8,
+        "No blocked packages were reported.",
+        scanCells,
+      );
+      renderRows(
+        "confirmed-list",
+        data.quarantine.confirmed,
+        4,
+        "No confirmed OSV blocks were reported.",
+        (finding) => [finding.name, finding.version, finding.advisory, finding.severity],
+      );
       const list = document.getElementById("quarantine-list");
       list.replaceChildren();
       if (!data.quarantine.packages.length) {
@@ -217,7 +376,7 @@
         const status = document.createElement("td");
         const badge = document.createElement("span");
         badge.className = "badge";
-        badge.textContent = "Held";
+        badge.textContent = pkg.status;
         status.appendChild(badge);
         row.appendChild(status);
         list.appendChild(row);
@@ -244,6 +403,16 @@
           incompleteList.appendChild(row);
         });
       }
+      const incompleteTruncated = data.quarantine.scan_incomplete_truncated || 0;
+      if (incompleteTruncated > 0) {
+        const row = document.createElement("tr");
+        const cell = document.createElement("td");
+        cell.colSpan = 3;
+        cell.className = "empty";
+        cell.textContent = `Additional incomplete scan findings omitted: ${incompleteTruncated}.`;
+        row.appendChild(cell);
+        incompleteList.appendChild(row);
+      }
     };
     fetch("/api/v1/status", { headers: { Accept: "application/json" } })
       .then((response) => response.ok ? response.json() : Promise.reject(new Error("status unavailable")))
@@ -251,7 +420,11 @@
       .catch(() => {
         text("service-status", "Unavailable");
         text("health-value", "Error");
-        document.getElementById("quarantine-list").innerHTML = '<tr><td colspan="4" class="empty">Diagnostics are temporarily unavailable.</td></tr>';
+        showMessage("quarantine-list", 4, "Diagnostics are temporarily unavailable.");
+        showMessage("scanned-list", 8, "Scan details are temporarily unavailable.");
+        showMessage("blocked-list", 8, "Scan-derived block details are temporarily unavailable.");
+        showMessage("confirmed-list", 4, "Confirmed OSV details are temporarily unavailable.");
+        showMessage("incomplete-list", 3, "Incomplete scan details are temporarily unavailable.");
       });
   </script>
 </body>

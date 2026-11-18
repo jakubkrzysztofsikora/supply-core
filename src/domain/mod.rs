@@ -1,6 +1,9 @@
 use chrono::{DateTime, Utc};
-use semver::Version;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
+use std::fmt::{Display, Formatter};
+use std::hash::{Hash, Hasher};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Ecosystem {
@@ -12,6 +15,285 @@ pub enum Ecosystem {
     AzurePipelines,
 }
 
+#[derive(Debug, Clone)]
+enum ParsedPackageVersion {
+    Npm(node_semver::Version),
+    PyPi(pep440_rs::Version),
+    NuGet(NuGetVersion),
+    Opaque,
+}
+
+#[derive(Debug, Clone)]
+struct NuGetVersion {
+    numbers: [i32; 4],
+    prerelease: Option<semver::Prerelease>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PackageVersionId {
+    ecosystem: Ecosystem,
+    upstream: String,
+    canonical: String,
+    parsed: ParsedPackageVersion,
+}
+
+impl PackageVersionId {
+    pub fn parse(ecosystem: &Ecosystem, raw: &str) -> anyhow::Result<Self> {
+        let (canonical, parsed) = match ecosystem {
+            Ecosystem::Npm => {
+                let version = node_semver::Version::parse(raw)
+                    .map_err(|error| anyhow::anyhow!("invalid npm version {raw:?}: {error}"))?;
+                (version.to_string(), ParsedPackageVersion::Npm(version))
+            }
+            Ecosystem::PyPi => {
+                let version: pep440_rs::Version = raw
+                    .parse()
+                    .map_err(|error| anyhow::anyhow!("invalid PEP 440 version {raw:?}: {error}"))?;
+                let mut release = version.release().to_vec();
+                while release.len() > 1 && release.last() == Some(&0) {
+                    release.pop();
+                }
+                let version = version.with_release(release);
+                (version.to_string(), ParsedPackageVersion::PyPi(version))
+            }
+            Ecosystem::NuGet => {
+                let (version, canonical) = NuGetVersion::parse(raw)?;
+                (canonical, ParsedPackageVersion::NuGet(version))
+            }
+            _ => {
+                if raw.is_empty() {
+                    anyhow::bail!("package version cannot be empty");
+                }
+                (raw.to_string(), ParsedPackageVersion::Opaque)
+            }
+        };
+
+        Ok(Self {
+            ecosystem: ecosystem.clone(),
+            upstream: raw.to_string(),
+            canonical,
+            parsed,
+        })
+    }
+
+    pub fn ecosystem(&self) -> &Ecosystem {
+        &self.ecosystem
+    }
+
+    pub fn upstream(&self) -> &str {
+        &self.upstream
+    }
+
+    pub fn canonical(&self) -> &str {
+        &self.canonical
+    }
+
+    pub fn satisfies_npm_range(&self, range: &node_semver::Range) -> bool {
+        match &self.parsed {
+            ParsedPackageVersion::Npm(version) => version.satisfies(range),
+            _ => false,
+        }
+    }
+
+    pub fn precedence_cmp(&self, other: &Self) -> anyhow::Result<Ordering> {
+        if self.ecosystem != other.ecosystem {
+            anyhow::bail!("cannot compare versions from different ecosystems");
+        }
+
+        match (&self.parsed, &other.parsed) {
+            (ParsedPackageVersion::Npm(left), ParsedPackageVersion::Npm(right)) => {
+                Ok(left.cmp(right))
+            }
+            (ParsedPackageVersion::PyPi(left), ParsedPackageVersion::PyPi(right)) => {
+                Ok(left.cmp(right))
+            }
+            (ParsedPackageVersion::NuGet(left), ParsedPackageVersion::NuGet(right)) => {
+                Ok(left.precedence_cmp(right))
+            }
+            _ => anyhow::bail!("version parser does not match ecosystem"),
+        }
+    }
+}
+
+impl PartialEq for PackageVersionId {
+    fn eq(&self, other: &Self) -> bool {
+        self.ecosystem == other.ecosystem && self.canonical == other.canonical
+    }
+}
+
+impl Eq for PackageVersionId {}
+
+impl Hash for PackageVersionId {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.ecosystem.hash(state);
+        self.canonical.hash(state);
+    }
+}
+
+impl Display for PackageVersionId {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.canonical)
+    }
+}
+
+impl Serialize for PackageVersionId {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            ecosystem: &'a Ecosystem,
+            upstream: &'a str,
+            canonical: &'a str,
+        }
+
+        Wire {
+            ecosystem: &self.ecosystem,
+            upstream: &self.upstream,
+            canonical: &self.canonical,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for PackageVersionId {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            ecosystem: Ecosystem,
+            upstream: String,
+            canonical: String,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let parsed = Self::parse(&wire.ecosystem, &wire.upstream)
+            .map_err(<D::Error as serde::de::Error>::custom)?;
+        if parsed.canonical != wire.canonical {
+            return Err(serde::de::Error::custom(
+                "canonical package version does not match upstream version",
+            ));
+        }
+        Ok(parsed)
+    }
+}
+
+impl NuGetVersion {
+    fn parse(raw: &str) -> anyhow::Result<(Self, String)> {
+        let input = raw.trim();
+        if input.is_empty() {
+            anyhow::bail!("NuGet version cannot be empty");
+        }
+
+        let (without_metadata, metadata) = match input.split_once('+') {
+            Some((version, metadata)) => {
+                Self::validate_identifiers(metadata, "build metadata")?;
+                (version, Some(metadata))
+            }
+            None => (input, None),
+        };
+        if metadata.is_some_and(|_| without_metadata.contains('+')) {
+            anyhow::bail!("NuGet version contains multiple build separators");
+        }
+
+        let (numeric, prerelease) = match without_metadata.split_once('-') {
+            Some((numeric, prerelease)) => {
+                if prerelease.is_empty() {
+                    anyhow::bail!("NuGet prerelease label cannot be empty");
+                }
+                (numeric, Some(prerelease))
+            }
+            None => (without_metadata, None),
+        };
+
+        let components: Vec<&str> = numeric.split('.').collect();
+        if !(1..=4).contains(&components.len()) {
+            anyhow::bail!("NuGet version needs 1 to 4 numeric components");
+        }
+
+        let mut numbers = [0; 4];
+        for (index, component) in components.iter().enumerate() {
+            if component.is_empty() || !component.bytes().all(|byte| byte.is_ascii_digit()) {
+                anyhow::bail!("invalid NuGet numeric component {component:?}");
+            }
+            numbers[index] = component
+                .parse::<i32>()
+                .map_err(|_| anyhow::anyhow!("NuGet numeric component overflows: {component:?}"))?;
+        }
+
+        let prerelease = prerelease
+            .map(|value| {
+                Self::validate_identifiers(value, "prerelease")?;
+                let normalized = value.to_ascii_lowercase();
+                for identifier in normalized.split('.') {
+                    if identifier.len() > 1
+                        && identifier.starts_with('0')
+                        && identifier.bytes().all(|byte| byte.is_ascii_digit())
+                    {
+                        anyhow::bail!(
+                            "NuGet numeric prerelease identifiers cannot have leading zeroes"
+                        );
+                    }
+                }
+                semver::Prerelease::new(&normalized)
+                    .map_err(|error| anyhow::anyhow!("invalid NuGet prerelease: {error}"))
+            })
+            .transpose()?;
+
+        let version = Self {
+            numbers,
+            prerelease,
+        };
+        let canonical = version.canonical();
+        Ok((version, canonical))
+    }
+
+    fn validate_identifiers(value: &str, part: &str) -> anyhow::Result<()> {
+        if value.is_empty()
+            || value.split('.').any(|identifier| {
+                identifier.is_empty()
+                    || !identifier
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            })
+        {
+            anyhow::bail!("invalid NuGet {part} {value:?}");
+        }
+        Ok(())
+    }
+
+    fn canonical(&self) -> String {
+        use std::fmt::Write as _;
+
+        let mut canonical = format!(
+            "{}.{}.{}",
+            self.numbers[0], self.numbers[1], self.numbers[2]
+        );
+        if self.numbers[3] != 0 {
+            let _ = write!(&mut canonical, ".{}", self.numbers[3]);
+        }
+        if let Some(prerelease) = &self.prerelease {
+            canonical.push('-');
+            canonical.push_str(&prerelease.to_string());
+        }
+        canonical
+    }
+
+    fn precedence_cmp(&self, other: &Self) -> Ordering {
+        self.numbers
+            .cmp(&other.numbers)
+            .then_with(|| match (&self.prerelease, &other.prerelease) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => Ordering::Greater,
+                (Some(_), None) => Ordering::Less,
+                (Some(left), Some(right)) => left.cmp(right),
+            })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PackageCoordinate {
     pub ecosystem: Ecosystem,
@@ -21,16 +303,142 @@ pub struct PackageCoordinate {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PackageVersion {
     pub package: PackageCoordinate,
-    pub version: Version,
+    pub version: PackageVersionId,
     pub published_at: Option<DateTime<Utc>>,
     pub integrity: Option<String>,
     pub tarball_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactKey {
+    pub source: String,
+    pub ecosystem: Ecosystem,
+    pub name: String,
+    pub version: PackageVersionId,
+    pub filename: String,
+}
+
+impl ArtifactKey {
+    pub fn from_tarball_url(
+        tarball_url: &str,
+        ecosystem: &Ecosystem,
+        name: &str,
+        version: &PackageVersionId,
+    ) -> anyhow::Result<Self> {
+        let (source, filename) = artifact_url_identity(tarball_url)?;
+        let key = Self {
+            source,
+            ecosystem: ecosystem.clone(),
+            name: name.to_string(),
+            version: version.clone(),
+            filename,
+        };
+        key.validate()?;
+        Ok(key)
+    }
+
+    pub fn source_from_tarball_url(tarball_url: &str) -> anyhow::Result<String> {
+        artifact_url_identity(tarball_url).map(|(source, _)| source)
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.source != normalized_source(&self.source)? {
+            anyhow::bail!("artifact source must be a normalized HTTP(S) origin");
+        }
+        if self.version.ecosystem() != &self.ecosystem {
+            anyhow::bail!("artifact version ecosystem does not match artifact ecosystem");
+        }
+        if self.name.is_empty()
+            || self.name.contains('\\')
+            || self.name.chars().any(char::is_control)
+            || self
+                .name
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == "..")
+        {
+            anyhow::bail!("invalid artifact package name: {:?}", self.name);
+        }
+        if self.filename.is_empty()
+            || self.filename == "."
+            || self.filename == ".."
+            || self.filename.contains('/')
+            || self.filename.contains('\\')
+            || self.filename.chars().any(char::is_control)
+        {
+            anyhow::bail!("invalid artifact filename: {:?}", self.filename);
+        }
+        Ok(())
+    }
+}
+
+fn artifact_url_identity(tarball_url: &str) -> anyhow::Result<(String, String)> {
+    let uri = tarball_url
+        .parse::<http::Uri>()
+        .map_err(|error| anyhow::anyhow!("invalid tarball URL: {error}"))?;
+    let source = normalized_source_uri(&uri)?;
+    let filename = uri
+        .path()
+        .rsplit('/')
+        .next()
+        .filter(|filename| !filename.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("tarball URL has no filename"))?
+        .to_string();
+    if filename == "."
+        || filename == ".."
+        || filename.contains('/')
+        || filename.contains('\\')
+        || filename.chars().any(char::is_control)
+    {
+        anyhow::bail!("invalid tarball URL filename: {filename:?}");
+    }
+    Ok((source, filename))
+}
+
+fn normalized_source(source: &str) -> anyhow::Result<String> {
+    let uri = source
+        .parse::<http::Uri>()
+        .map_err(|error| anyhow::anyhow!("invalid artifact source: {error}"))?;
+    normalized_source_uri(&uri)
+}
+
+fn normalized_source_uri(uri: &http::Uri) -> anyhow::Result<String> {
+    let scheme = uri
+        .scheme_str()
+        .ok_or_else(|| anyhow::anyhow!("tarball URL must be absolute"))?
+        .to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        anyhow::bail!("tarball URL must use HTTP or HTTPS");
+    }
+    let authority = uri
+        .authority()
+        .ok_or_else(|| anyhow::anyhow!("tarball URL must include a host"))?;
+    if authority.as_str().contains('@') {
+        anyhow::bail!("tarball URL must not include credentials");
+    }
+    let mut host = authority.host().to_ascii_lowercase();
+    if host.is_empty() {
+        anyhow::bail!("tarball URL must include a host");
+    }
+    if host.contains(':') && !host.starts_with('[') {
+        host = format!("[{host}]");
+    }
+    let port = authority.port_u16();
+    let default_port = matches!(
+        (scheme.as_str(), port),
+        ("http", Some(80)) | ("https", Some(443))
+    );
+    let port = if default_port { None } else { port };
+    Ok(match port {
+        Some(port) => format!("{scheme}://{host}:{port}"),
+        None => format!("{scheme}://{host}"),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FrozenArtifact {
+    pub key: ArtifactKey,
     pub package: PackageCoordinate,
-    pub version: Version,
+    pub version: PackageVersionId,
     pub sha256: String,
     pub integrity: Option<String>,
     pub path: String,
@@ -59,8 +467,47 @@ impl Severity {
 pub struct VulnerabilityFinding {
     pub source: String,
     pub id: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
     pub severity: Severity,
     pub summary: String,
+    #[serde(default)]
+    pub modified: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub withdrawn: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Verdict {
+    Pending,
+    Held,
+    ScanIncomplete,
+    Review,
+    Blocked,
+    Released,
+    Withdrawn,
+}
+
+impl Verdict {
+    pub fn combine(self, other: Self) -> Self {
+        if self.precedence() >= other.precedence() {
+            self
+        } else {
+            other
+        }
+    }
+
+    fn precedence(self) -> u8 {
+        match self {
+            Self::Released => 0,
+            Self::Held => 1,
+            Self::Review => 2,
+            Self::Pending => 3,
+            Self::ScanIncomplete => 4,
+            Self::Blocked => 5,
+            Self::Withdrawn => 6,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,6 +600,15 @@ impl Default for VulnerabilityPolicy {
         }
     }
 }
+impl VulnerabilityPolicy {
+    pub fn blocks_severity(&self, severity: &Severity) -> bool {
+        self.block_severities
+            .iter()
+            .map(Severity::rank)
+            .min()
+            .is_some_and(|minimum| severity.rank() >= minimum)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ImagePinKind {
@@ -239,14 +695,20 @@ impl Default for DockerPolicy {
 fn default_detected_at() -> chrono::DateTime<chrono::Utc> {
     chrono::Utc::now()
 }
+fn default_scan_incomplete() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentFinding {
     pub ecosystem: Ecosystem,
     pub package: String,
-    pub version: Version,
+    pub version: PackageVersionId,
     pub source: String,
-    pub score: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<Decimal>,
+    #[serde(default = "default_scan_incomplete")]
+    pub scan_incomplete: bool,
     pub rules: Vec<String>,
     pub summary: String,
     #[serde(default = "default_detected_at")]
@@ -532,15 +994,27 @@ fn severity_word(severity: &Severity) -> &'static str {
 }
 
 pub fn strongest_vulnerability(findings: &[VulnerabilityFinding]) -> Option<String> {
+    strongest_vulnerability_matching(findings, |_| true)
+}
+
+pub fn strongest_osv_vulnerability(findings: &[VulnerabilityFinding]) -> Option<String> {
+    strongest_vulnerability_matching(findings, |finding| finding.source == "OSV")
+}
+
+fn strongest_vulnerability_matching(
+    findings: &[VulnerabilityFinding],
+    matches: impl Fn(&VulnerabilityFinding) -> bool,
+) -> Option<String> {
     findings
         .iter()
-        .max_by_key(|f| (f.severity.rank(), f.id.as_str()))
-        .map(|f| {
+        .filter(|finding| finding.withdrawn.is_none() && matches(finding))
+        .max_by_key(|finding| (finding.severity.rank(), finding.id.as_str()))
+        .map(|finding| {
             format!(
                 "{} vulnerability {} from {}",
-                severity_word(&f.severity),
-                f.id,
-                f.source
+                severity_word(&finding.severity),
+                finding.id,
+                finding.source
             )
         })
 }
@@ -549,10 +1023,9 @@ pub fn blocks_vulnerability(
     findings: &[VulnerabilityFinding],
     policy: &VulnerabilityPolicy,
 ) -> Option<String> {
-    let min_rank = policy.block_severities.iter().map(Severity::rank).min()?;
     findings
         .iter()
-        .filter(|f| f.severity.rank() >= min_rank)
+        .filter(|finding| finding.withdrawn.is_none() && policy.blocks_severity(&finding.severity))
         .max_by_key(|f| (f.severity.rank(), f.id.as_str()))
         .map(|f| {
             format!(
@@ -610,13 +1083,131 @@ mod tests {
         ));
     }
     #[test]
+    fn package_version_accepts_pep440_release_versions() {
+        let encoded = serde_json::json!({
+            "package": {"ecosystem": "PyPi", "name": "demo"},
+            "version": {
+                "ecosystem": "PyPi",
+                "upstream": "1.0.post1",
+                "canonical": "1.post1"
+            },
+            "published_at": null,
+            "integrity": null,
+            "tarball_url": null
+        });
+
+        let package = match serde_json::from_value::<PackageVersion>(encoded) {
+            Ok(package) => package,
+            Err(error) => panic!("PEP 440 release version rejected: {error}"),
+        };
+
+        assert_eq!(package.version.to_string(), "1.post1");
+    }
+
+    #[test]
+    fn npm_build_metadata_changes_identity_but_not_precedence() -> anyhow::Result<()> {
+        let first = PackageVersionId::parse(&Ecosystem::Npm, "1.2.3+build.1")?;
+        let second = PackageVersionId::parse(&Ecosystem::Npm, "1.2.3+build.2")?;
+
+        assert_ne!(first, second);
+        assert_eq!(first.precedence_cmp(&second)?, std::cmp::Ordering::Equal);
+        assert_eq!(first.canonical(), "1.2.3+build.1");
+        assert_eq!(first.upstream(), "1.2.3+build.1");
+        Ok(())
+    }
+
+    #[test]
+    fn pypi_package_identity_uses_pep440_equality_and_preserves_local_segments(
+    ) -> anyhow::Result<()> {
+        let short = PackageVersionId::parse(&Ecosystem::PyPi, "1.0")?;
+        let long = PackageVersionId::parse(&Ecosystem::PyPi, "1.0.0")?;
+        assert_eq!(short, long);
+        assert_eq!(short.canonical(), "1");
+
+        let alias = PackageVersionId::parse(&Ecosystem::PyPi, "1.0RC1")?;
+        let normalized = PackageVersionId::parse(&Ecosystem::PyPi, "1.0-rc1")?;
+        assert_eq!(alias, normalized);
+
+        let local = PackageVersionId::parse(&Ecosystem::PyPi, "1.0+ABC.01")?;
+        let other_local = PackageVersionId::parse(&Ecosystem::PyPi, "1.0+abc.2")?;
+        assert_ne!(local, other_local);
+        assert_eq!(local.canonical(), "1+abc.1");
+        assert_eq!(local.upstream(), "1.0+ABC.01");
+        Ok(())
+    }
+
+    #[test]
+    fn nuget_package_versions_match_microsoft_normalization_cases() -> anyhow::Result<()> {
+        #[derive(Deserialize)]
+        struct Case {
+            input: String,
+            canonical: String,
+        }
+
+        let fixture: Vec<Case> =
+            serde_json::from_str(include_str!("../../tests/fixtures/nuget_versions.json"))?;
+
+        for case in fixture {
+            let parsed = PackageVersionId::parse(&Ecosystem::NuGet, &case.input)?;
+            assert_eq!(parsed.canonical(), case.canonical, "input {}", case.input);
+        }
+
+        assert_eq!(
+            PackageVersionId::parse(&Ecosystem::NuGet, "1.6.2-BeTa")?,
+            PackageVersionId::parse(&Ecosystem::NuGet, "1.6.02-beta")?
+        );
+        assert_eq!(
+            PackageVersionId::parse(&Ecosystem::NuGet, "1.0.0+beta.2")?,
+            PackageVersionId::parse(&Ecosystem::NuGet, "1.0.0+beta.1")?
+        );
+        assert_eq!(
+            PackageVersionId::parse(&Ecosystem::NuGet, "1.0.0-alpha.2")?.precedence_cmp(
+                &PackageVersionId::parse(&Ecosystem::NuGet, "1.0.0-alpha.10")?
+            )?,
+            std::cmp::Ordering::Less
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nuget_package_version_parser_rejects_invalid_and_overflowing_values() {
+        for raw in [
+            "1.2.3.4.5",
+            "1.2147483648",
+            "1.2.3.2147483648",
+            "1.4.7-",
+            "1.4.7+*",
+            "1.2Av^c",
+        ] {
+            assert!(
+                PackageVersionId::parse(&Ecosystem::NuGet, raw).is_err(),
+                "accepted {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn package_version_id_round_trips_with_canonical_and_upstream_values() -> anyhow::Result<()> {
+        let parsed = PackageVersionId::parse(&Ecosystem::PyPi, "1.0.post1")?;
+        let encoded = serde_json::to_string(&parsed)?;
+        let decoded: PackageVersionId = serde_json::from_str(&encoded)?;
+
+        assert_eq!(decoded, parsed);
+        assert_eq!(decoded.upstream(), "1.0.post1");
+        assert_eq!(decoded.canonical(), "1.post1");
+        Ok(())
+    }
+
+    #[test]
     fn content_finding_serializes_to_osv_record() {
         let finding = ContentFinding {
             ecosystem: Ecosystem::Npm,
             package: "evil-pkg".into(),
-            version: Version::parse("1.2.3").unwrap_or_else(|_| panic!("valid semver")),
+            version: PackageVersionId::parse(&Ecosystem::Npm, "1.2.3")
+                .unwrap_or_else(|_| panic!("valid npm version")),
             source: "static-heuristics".into(),
-            score: 9,
+            score: Some(Decimal::from(9)),
+            scan_incomplete: false,
             rules: vec!["install-script-network".into()],
             summary: "postinstall beacon".into(),
             detected_at: chrono::Utc::now(),
@@ -679,12 +1270,34 @@ mod tests {
         assert!(p.docker.require_digest_pin);
     }
     #[test]
+    fn verdict_combination_uses_safety_precedence() {
+        let order = [
+            Verdict::Withdrawn,
+            Verdict::Blocked,
+            Verdict::ScanIncomplete,
+            Verdict::Pending,
+            Verdict::Review,
+            Verdict::Held,
+            Verdict::Released,
+        ];
+
+        for (index, stronger) in order.iter().copied().enumerate() {
+            for weaker in order.iter().copied().skip(index) {
+                assert_eq!(stronger.combine(weaker), stronger);
+                assert_eq!(weaker.combine(stronger), stronger);
+            }
+        }
+    }
+    #[test]
     fn strongest_vulnerability_is_order_independent() {
         let finding = |id: &str| VulnerabilityFinding {
             source: "OSV".into(),
             id: id.into(),
             severity: Severity::Medium,
             summary: "x".into(),
+            aliases: vec![],
+            modified: None,
+            withdrawn: None,
         };
         let forward = vec![finding("GHSA-a"), finding("GHSA-b")];
         let reverse = vec![finding("GHSA-b"), finding("GHSA-a")];
@@ -700,6 +1313,9 @@ mod tests {
             id: "GHSA-x".into(),
             severity: Severity::High,
             summary: "x".into(),
+            aliases: vec![],
+            modified: None,
+            withdrawn: None,
         }];
         assert!(blocks_vulnerability(&f, &VulnerabilityPolicy::default()).is_some());
     }

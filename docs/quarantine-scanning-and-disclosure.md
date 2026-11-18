@@ -45,13 +45,12 @@ previous release, and scored static signals:
 - suspicion score **45/100 → "review"**, i.e. a false positive on a popular,
   legitimate build tool.
 
-The conclusion from the experiment: raw capability regexes drown in legitimate
-tooling behavior. What made the verdict easy to dismiss was the *context*:
-verified SLSA provenance attestation (`dist.attestations`,
-`predicateType: slsa.dev/provenance/v1`), registry signatures, two maintainers,
-repo link matching the package metadata, and a small, reviewable diff. A real
-scanner must combine capability + threat indicators + provenance + diff, and
-score them together (which is exactly the design GuardDog converged on).
+The PoC shows that raw capability regexes can misclassify benign packages.
+It did not inspect `dist.attestations`, verify a signature, or validate an
+attested build identity. Registry metadata may advertise provenance, but
+field presence does not establish verified provenance. A separately
+verified, identity-bound statement may inform review; it must not lower
+scanner scores by itself.
 
 ## Proposed pipeline
 
@@ -68,11 +67,11 @@ Stage 1 — static content scan (per quarantine-window version)
   For a Rust-native MVP, port only the high-signal rules (install-script
   network/exec, credential paths, obfuscated blobs, native binaries).
 
-Stage 2 — provenance and identity checks
-  npm: verify `dist.attestations` (SLSA) via sigstore and compare the attested
-  repo/workflow with the package metadata; PyPI: PEP 740 attestations; NuGet:
-  repository signatures. Maintainer-set changes, publisher ≠ repo org, or
-  first-time publisher of an old package are escalation signals, not proof.
+Stage 2 — provenance and identity checks (planned; not implemented here)
+  npm: verify `dist.attestations` (SLSA) via Sigstore and compare the attested
+  repo/workflow with package metadata; PyPI: verify PEP 740 attestations;
+  NuGet: verify repository signatures. Metadata presence alone is not
+  verification or score relief.
 
 Stage 3 — version diff (high signal, cheap)
   Compare with the previous release: new lifecycle scripts, new binary
@@ -89,14 +88,84 @@ Stage 4 — optional dynamic analysis
 Stage 5 — scoring and policy
   Extend `Policy` with `quarantine_scanner { enabled, static, dynamic,
   review_score, block_score, report_score }`. New blocking reason kind
-  `content-risk`. A confirmed-malicious decision is permanent (same semantics
-  as `cve_keeps_quarantined`) and appends to the denylist with the finding id.
+  `content-risk`. Active OSV advisories block regardless of severity. A
+  confirmed-malicious decision remains permanent and records its finding id.
 
 Stage 6 — findings store and reporting surface
   Persist findings next to decisions (state dir JSON + metadata store API).
   Snapshot entries gain `content_findings: [...]`; the public snapshot and
   status card publish name/version-level facts only (quarantine holds,
   confirmed advisories, suspected scan scores/rules).
+## Durable scanner evidence
+
+Package scan ledger events persist scanner findings separately from CVE findings. Each finding retains its source, rules, summary, decimal score, incomplete flag, and detection time. The package score is the highest score among complete findings; any incomplete or scoreless finding clears the aggregate score and marks overall coverage `Partial`, matching enforcement, which discards scores from incomplete scans. Failed scans retain findings observed before the failure.
+
+Combined scan events use `supply-core` as the event source; each finding retains its scanner source. The reported score remains evidence, not an enforcement verdict.
+
+
+
+## Optional OSSGadget engine
+
+`scripts/install-ossgadget.sh <new-install-directory>` builds OSSGadget from
+Microsoft commit `4063457b40211c25b41d56465d41783f2d42c5c1`, applies the
+maintained coverage patch, and writes a local manifest binding the binary and
+`Resources/BackdoorRules` digests. Set `OSSGADGET_BIN` to the installed
+executable; `OSSGADGET_MANIFEST` may select its manifest explicitly. The
+manifest detects byte changes but is not an independent signature or trust
+anchor.
+
+The installer disables NBGV's Git engine for archive builds; its manifest still
+records the pinned upstream commit.
+
+The Linux adapter requires bubblewrap. It unshares network access, mounts the
+package and scanner installation read-only, and limits memory, runtime, and
+output. The patched CLI scans each file separately and reports scanned,
+skipped, and diagnostic paths. A file counts as scanned only when its result
+identifies that exact file and reports one analyzed input. Missing results,
+enumeration errors, malformed output, truncation, or a missing rule bundle
+leave coverage partial. OSSGadget findings score 4 for review; its detector
+has a high false-positive rate. macOS remains incomplete because the current
+adapter cannot enforce its memory limit there.
+
+## Verify local ledger
+
+Run `cargo run -- ledger verify` to check event payloads, contiguous positions,
+leaf hashes, the RFC 6962 root, and persisted Merkle nodes. The default path is
+`$HOME/.local/share/supply-core/ledger.sqlite`; pass `--ledger-db PATH` to select
+another database.
+
+Verification requires an existing database and uses a read-only SQLite
+connection. It does not initialize the schema or change journal mode.
+
+This checks internal consistency only. An actor who can rewrite the complete
+database can recompute its hashes and root. Detecting a full rewrite requires
+comparing against a trusted external checkpoint or witness.
+
+## Approving one scanner finding
+
+For a reviewed false positive, use the exact `artifact_sha256`, finding `id`,
+and `engine_policy_revision_sha256` from the scan report:
+
+```sh
+cargo run -- approve-rule \
+  --artifact-sha256 "$ARTIFACT_SHA256" \
+  --finding-id "$FINDING_ID" \
+  --policy-sha256 "$ENGINE_POLICY_REVISION_SHA256" \
+  --expires-at "$FUTURE_RFC3339" \
+  --reason "Reviewed false positive"
+```
+
+The command appends a local `RuleApproved` event. It requires matching real
+and effective Unix user IDs and a ledger owned by that user. The ledger file
+must have mode `0600`; non-Unix platforms fail closed. No remote approval
+endpoint exists.
+
+An approval affects only `scan-package`'s decision for the exact finding ID,
+artifact digest, and engine-policy revision, and only until expiry. A changed
+artifact or engine-policy revision requires a new approval. The original scan
+finding remains in evidence. Approval cannot change incomplete coverage to
+complete or clear other findings; it does not alter `FindingFile` JSONL records
+or `snapshot-*` decisions.
 
 ## Acting like a CVE
 
@@ -136,14 +205,24 @@ Guardrails before any automated submission:
 ## Implementation status (2026-09-13)
 
 0. **Wired path** — `supply scan-package <eco> <archive> --name --version
-   [--external <cmd>] [--findings-out <jsonl>]` extracts the archive
-   (file/size/traversal-limited, fail-closed on oversized entries), runs the
-   static scanner and the optional external scanner, and persists findings.
+   [--scratch-dir <dir>] [--external <cmd>] [--findings-out <jsonl>] [--json]`
+   requires a real dedicated scratch directory through `--scratch-dir` or
+   compressed input is normally capped at 64 MiB. Unix large scans support up to
+   2 GiB compressed and 8 GiB expanded data; they require a separate user-owned,
+   non-shared scratch volume, one active large scan per scratch directory, and
+   10 GiB free space maintained throughout. Other platforms fail closed.
+   External engines stay unknown for large scans until their per-scan scratch
+   quota can be enforced; built-in findings remain available.
+   Incomplete extraction yields partial coverage. JSON mode emits `ArtifactReport` and
+   returns 0 for pass/review, 2 for block, and 3 for incomplete/error.
+   Archive input must be a regular file; symlinks and special files are rejected.
+   Current archive inventory covers npm `.tgz`, PyPI sdist/wheel, and NuGet
+   `.nupkg`; `scan-package` accepts `npm`, `pypi`/`pip`, and `nuget`.
    `snapshot-npm`, `snapshot-pip` and `snapshot-nuget` accept `--findings
    <jsonl>`; with `quarantine_scanner.enabled` those findings become
    blocks/fallback. The scanner→store→evaluator chain is covered by
-   fixture-archive tests, and the external scanner is bounded by a timeout,
-   an output cap, and process-group termination.
+   fixture-archive tests, and external scanning is bounded by timeout, output
+   limits, and process-group termination.
 1. **Policy + finding model** — done. `Policy.quarantine_scanner`
    (`enabled=false`, `review_score=4`, `block_score=8`) and
    `ContentFinding`; the evaluator blocks at/above `block_score`, warns on
@@ -155,18 +234,20 @@ Guardrails before any automated submission:
    capability + threat correlation per file, install-script network/pipe
    rules, cross-file install-script chain, benign build tooling stays clean
    (fixture-tested).
+   NuGet hook detection flags `tools/init.ps1` and inline `CodeTaskFactory`/
+   `RoslynCodeTaskFactory` tasks under `build/`, `buildMultiTargeting/`, and
+   `buildTransitive/`. DTD/custom entities and malformed XML leave coverage
+   incomplete; the scanner never executes package code.
 4. **External scanner adapter** — done (`adapters::command_scanner`):
    normalized `{"score","rules","summary"}` reports plus a **first-class
    GuardDog v3 parser** (`CommandScanner::guarddog`, pinned against GuardDog
    3.2.0 output: `risk_score.score`, matched `results` rules, `errors` fail
-   closed). `scan-package --guarddog` runs it via `$GUARDDOG_BIN`; both
-   findings persist with their source intact.
-5. **Provenance** — done: `has_provenance` (npm `dist.attestations`) plus
-   score downgrade via `apply_provenance`/`PROVENANCE_RELIEF` (3 points).
-   `scan-package` resolves the attestation from the package's npm registry
-   metadata; a lookup failure means unattested (fail closed) and callers
-   cannot assert provenance themselves. An attested malicious archive drops
-   from Block to a review warning.
+   closed). `scan-package` automatically attempts it for npm/PyPI via
+   `$GUARDDOG_BIN`; findings persist with their source intact.
+5. **Provenance** — not implemented. Registry metadata is not verified as
+   build provenance and cannot change scan scores or verdicts. Provenance-based
+   policy requires cryptographic verification and publisher/workflow identity
+   checks before use.
 6. **Version diff** — done (`diff_package_files`, `scan_version_diff`):
    newly introduced lifecycle scripts score 9 with rule `new-install-script`.
 7. **OSV export + CLI** — done: `ContentFinding::to_osv()` and
@@ -176,13 +257,11 @@ Guardrails before any automated submission:
    automated registry/OpenSSF submission stays out until the false-positive
    rate is measured on real releases.
 9. **GuardDog installed and wired** — `uv tool install guarddog` (3.2.0,
-   Python 3.13); `scan-package --guarddog` runs it under a 180 s timeout and
-   an 8 MiB output cap. `experiments/scan-quarantine.py` scans every version
-   a daily capture holds in the quarantine window, and it verifies the
-   tarball against `dist.integrity` (sha512) before any scanner sees it. The
-   self-hosted radar image copies `scan-quarantine.py` and `policy.yml` and
-   runs the scan each cycle; without GuardDog it falls back to the static
-   rules.
+   Python 3.13); `scan-package` attempts it under a 180 s timeout and an 8 MiB
+   output cap. Isolation failures, root execution, or missing engines stay
+   incomplete; static-only scans cannot claim clean coverage. The daily
+   capture verifies tarballs against `dist.integrity` (sha512) before any
+   scanner sees them.
 10. **AI/agent-threat rules** — `application::ai_scanner` adds deterministic,
     offline rules: `ai-prompt-injection` (LLM role tokens or
     instruction-override text, with zero-width/bidi normalization),
@@ -205,17 +284,19 @@ Guardrails before any automated submission:
     quarantine window — and a static-only run cannot clear a GuardDog-pending
     hold.
 12. **Public status surface** — `experiments/publish-status.py` builds the
-    snapshot from the day's capture plus `content-scan.json`: quarantine
-    holds, confirmed OSV advisories (parsed from evaluator reasons), and
-    suspected scan findings (score + rules, preferring the structured scan
-    report). The server stores it behind `PUT /api/v1/status/quarantine`
-    (bearer token, size- and shape-validated) and serves
-    `GET /api/v1/status` (JSON) and `GET /api/v1/status/card.svg` (dynamic
-    SVG with the three lists, `Cache-Control: public, max-age=300`). The
-    README embeds the card. Only name/version-level facts are published: no
-    repository paths, ranges, or file contents. Publishing flags are
-    backwards compatible — older snapshots without the new arrays still
-    validate.
+    snapshot from the day's capture plus `content-scan.json`: quarantine holds,
+    confirmed OSV advisories (parsed from evaluator reasons), suspected scan
+    findings (score + rules), and incomplete scans. Incomplete findings cap at
+    1,000; the JSON API reports the omitted count, while the card shows the
+    total and remaining rows. The server stores it behind
+    `PUT /api/v1/status/quarantine` (bearer token, size- and shape-validated)
+    and serves `GET /api/v1/status` (JSON) and
+    `GET /api/v1/status/card.svg` (dynamic SVG with four lists,
+    `Cache-Control: public, max-age=300`). Long card rows clip within their
+    columns and retain full text in accessible labels. Only name/version-level
+    facts are published: no repository paths, ranges, or file contents.
+    Older snapshots remain valid; missing fields default to empty lists and
+    zero omitted rows.
 
 ## Original plan
 
@@ -265,5 +346,5 @@ Guardrails before any automated submission:
 }
 ```
 
-Provenance present (`dist.attestations` → SLSA v1) and the diff is small, so a
-context-aware score would land well below the review threshold.
+The PoC did not verify provenance. Upstream `dist.attestations` metadata
+cannot establish provenance or lower this PoC's score.

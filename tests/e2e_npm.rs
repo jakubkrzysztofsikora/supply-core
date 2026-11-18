@@ -2,13 +2,15 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
-use semver::Version;
+use std::io::Read;
 use supply_core::adapters::crypto::ShaHasher;
 use supply_core::adapters::npm::{package_version_from_metadata, HttpNpmRegistry};
 use supply_core::adapters::osv::NoopVulnerabilitySource;
 use supply_core::adapters::storage::{FsArtifactStore, MemoryMetadataStore};
-use supply_core::application::{IngestService, PackageEvaluator};
-use supply_core::domain::{DecisionStatus, Ecosystem, FrozenArtifact, PackageVersion, Policy};
+use supply_core::application::{IngestService, PackageEvaluator, VersionSelection};
+use supply_core::domain::{
+    DecisionStatus, Ecosystem, FrozenArtifact, PackageVersion, PackageVersionId, Policy,
+};
 use supply_core::ports::{Clock, MetadataStore, UpstreamNpmRegistry};
 
 struct SystemClock;
@@ -30,24 +32,41 @@ impl Clock for FixedClock {
 struct TamperRegistry<'a> {
     inner: &'a HttpNpmRegistry,
 }
+struct TamperReader {
+    inner: Box<dyn Read + Send>,
+    changed: bool,
+}
+impl Read for TamperReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.inner.read(buffer)?;
+        if !self.changed && count > 0 {
+            buffer[0] ^= 0xff;
+            self.changed = true;
+        }
+        Ok(count)
+    }
+}
 impl UpstreamNpmRegistry for TamperRegistry<'_> {
     fn metadata(&self, package: &str) -> Result<serde_json::Value> {
         self.inner.metadata(package)
     }
-    fn tarball(&self, url: &str) -> Result<Vec<u8>> {
-        let mut bytes = self.inner.tarball(url)?;
-        if let Some(first) = bytes.first_mut() {
-            *first ^= 0xff;
-        }
-        Ok(bytes)
+    fn tarball(&self, url: &str) -> Result<Box<dyn Read + Send>> {
+        Ok(Box::new(TamperReader {
+            inner: self.inner.tarball(url)?,
+            changed: false,
+        }))
     }
 }
 
 fn fixture(registry: &HttpNpmRegistry) -> Result<PackageVersion> {
     let name = "left-pad";
     let metadata = registry.metadata(name).context("fetch registry metadata")?;
-    package_version_from_metadata(&metadata, name, &Version::parse("1.3.0")?)
-        .context("map metadata to domain")
+    package_version_from_metadata(
+        &metadata,
+        name,
+        &PackageVersionId::parse(&Ecosystem::Npm, "1.3.0")?,
+    )
+    .context("map metadata to domain")
 }
 
 /// Full real-registry flow per docs/e2e-npm-plan.md: fetch → evaluate →
@@ -56,7 +75,7 @@ fn fixture(registry: &HttpNpmRegistry) -> Result<PackageVersion> {
 #[ignore = "hits registry.npmjs.org"]
 fn left_pad_end_to_end() -> Result<()> {
     let name = "left-pad";
-    let version = Version::parse("1.3.0")?;
+    let version = PackageVersionId::parse(&Ecosystem::Npm, "1.3.0")?;
     let registry = HttpNpmRegistry::new()?;
     let pv = fixture(&registry)?;
     let published_at = pv
@@ -70,8 +89,9 @@ fn left_pad_end_to_end() -> Result<()> {
         clock: &SystemClock,
         vulns: &NoopVulnerabilitySource,
         metadata: &store,
+        ledger: supply_core::application::ledger::LedgerRecorder::open_in_memory()?,
     }
-    .evaluate(&pv, None)
+    .evaluate(&pv, VersionSelection::Exact)
     .context("evaluate for allow")?;
     assert_eq!(
         allow.status,
@@ -91,12 +111,16 @@ fn left_pad_end_to_end() -> Result<()> {
         artifacts: &artifacts,
         metadata: &store,
         clock: &SystemClock,
+        ledger: supply_core::application::ledger::LedgerRecorder::open_in_memory()?,
     }
     .freeze_verified(&pv)
     .context("verified freeze of real tarball")?;
     assert_eq!(frozen.version, version);
     assert_eq!(
-        store.latest_frozen(&Ecosystem::Npm, name)?.unwrap().version,
+        store
+            .latest_frozen(&frozen.key.source, &Ecosystem::Npm, name)?
+            .unwrap()
+            .version,
         version
     );
 
@@ -106,8 +130,12 @@ fn left_pad_end_to_end() -> Result<()> {
         clock: &quarantined_clock,
         vulns: &NoopVulnerabilitySource,
         metadata: &store,
+        ledger: supply_core::application::ledger::LedgerRecorder::open_in_memory()?,
     }
-    .evaluate(&pv, None)
+    .evaluate(
+        &pv,
+        VersionSelection::NpmRange(&node_semver::Range::parse("*")?),
+    )
     .context("evaluate quarantine fallback")?;
     assert_eq!(fallback.status, DecisionStatus::Fallback);
     assert_eq!(fallback.served_version.as_deref(), Some("1.3.0"));
@@ -119,8 +147,9 @@ fn left_pad_end_to_end() -> Result<()> {
         clock: &SystemClock,
         vulns: &NoopVulnerabilitySource,
         metadata: &store,
+        ledger: supply_core::application::ledger::LedgerRecorder::open_in_memory()?,
     }
-    .evaluate(&pv, None)
+    .evaluate(&pv, VersionSelection::Exact)
     .context("evaluate denylist block")?;
     assert_eq!(
         denied.status,
@@ -156,6 +185,7 @@ fn zero_day_update_quarantined_tamper_blocked() -> Result<()> {
         artifacts: &artifacts,
         metadata: &store,
         clock: &SystemClock,
+        ledger: supply_core::application::ledger::LedgerRecorder::open_in_memory()?,
     };
     ingest
         .freeze_verified(&known_good)
@@ -165,7 +195,7 @@ fn zero_day_update_quarantined_tamper_blocked() -> Result<()> {
     // exactly the "no CVE assigned yet" supply-chain attack window.
     let zero_day = PackageVersion {
         package: known_good.package.clone(),
-        version: Version::parse("9.9.9")?,
+        version: PackageVersionId::parse(&Ecosystem::Npm, "9.9.9")?,
         published_at: Some(Utc::now() - Duration::days(2)),
         integrity: known_good.integrity.clone(),
         tarball_url: known_good.tarball_url.clone(),
@@ -179,6 +209,7 @@ fn zero_day_update_quarantined_tamper_blocked() -> Result<()> {
         artifacts: &artifacts,
         metadata: &store,
         clock: &SystemClock,
+        ledger: supply_core::application::ledger::LedgerRecorder::open_in_memory()?,
     };
     let tampered = tamper_ingest.freeze_verified(&known_good);
     assert!(
@@ -192,14 +223,15 @@ fn zero_day_update_quarantined_tamper_blocked() -> Result<()> {
 
     // Quarantine catches the 0-day; frozen 1.3.0 rescues the build.
     // Range-aware: ^1.0.0 satisfied by frozen 1.3.0; ^9.0.0 must block.
-    let caret_one = semver::VersionReq::parse("^1.0.0")?;
+    let caret_one = node_semver::Range::parse("^1.0.0")?;
     let decision = PackageEvaluator {
         policy: &policy,
         clock: &SystemClock,
         vulns: &NoopVulnerabilitySource,
         metadata: &store,
+        ledger: supply_core::application::ledger::LedgerRecorder::open_in_memory()?,
     }
-    .evaluate(&zero_day, Some(&caret_one))
+    .evaluate(&zero_day, VersionSelection::NpmRange(&caret_one))
     .context("evaluate 0-day")?;
     assert_eq!(
         decision.status,
@@ -209,14 +241,15 @@ fn zero_day_update_quarantined_tamper_blocked() -> Result<()> {
     assert_eq!(decision.served_version.as_deref(), Some("1.3.0"));
     assert!(decision.warnings.iter().any(|w| w.contains("quarantine")));
 
-    let caret_nine = semver::VersionReq::parse("^9.0.0")?;
+    let caret_nine = node_semver::Range::parse("^9.0.0")?;
     let unsatisfiable = PackageEvaluator {
         policy: &policy,
         clock: &SystemClock,
         vulns: &NoopVulnerabilitySource,
         metadata: &store,
+        ledger: supply_core::application::ledger::LedgerRecorder::open_in_memory()?,
     }
-    .evaluate(&zero_day, Some(&caret_nine))?;
+    .evaluate(&zero_day, VersionSelection::NpmRange(&caret_nine))?;
     assert_eq!(
         unsatisfiable.status,
         DecisionStatus::Block,
@@ -230,8 +263,12 @@ fn zero_day_update_quarantined_tamper_blocked() -> Result<()> {
         clock: &SystemClock,
         vulns: &NoopVulnerabilitySource,
         metadata: &empty_store,
+        ledger: supply_core::application::ledger::LedgerRecorder::open_in_memory()?,
     }
-    .evaluate(&zero_day, None)?;
+    .evaluate(
+        &zero_day,
+        VersionSelection::NpmRange(&node_semver::Range::parse("*")?),
+    )?;
     assert_eq!(
         blocked.status,
         DecisionStatus::Block,
@@ -246,8 +283,12 @@ fn zero_day_update_quarantined_tamper_blocked() -> Result<()> {
         clock: &aged_clock,
         vulns: &NoopVulnerabilitySource,
         metadata: &empty_store,
+        ledger: supply_core::application::ledger::LedgerRecorder::open_in_memory()?,
     }
-    .evaluate(&zero_day, None)?;
+    .evaluate(
+        &zero_day,
+        VersionSelection::NpmRange(&node_semver::Range::parse("*")?),
+    )?;
     assert_eq!(aged.status, DecisionStatus::Allow);
 
     Ok(())
@@ -276,6 +317,7 @@ fn same_version_republish_detected() -> Result<()> {
         artifacts: &artifacts,
         metadata: &store,
         clock: &SystemClock,
+        ledger: supply_core::application::ledger::LedgerRecorder::open_in_memory()?,
     }
     .freeze_verified(&pv)
     .context("baseline freeze of real 1.3.0")?;
@@ -284,7 +326,9 @@ fn same_version_republish_detected() -> Result<()> {
     // an integrity string matching those bytes — so sha512 alone would
     // pass; only the frozen-ledger conflict detects the re-publish.
     let tamper = TamperRegistry { inner: &registry };
-    let tampered_bytes = tamper.tarball(pv.tarball_url.as_deref().unwrap())?;
+    let mut tampered_stream = tamper.tarball(pv.tarball_url.as_deref().unwrap())?;
+    let mut tampered_bytes = Vec::new();
+    tampered_stream.read_to_end(&mut tampered_bytes)?;
     let mut republish = pv.clone();
     republish.integrity = Some(sri_sha512(&tampered_bytes));
     let conflict = IngestService {
@@ -294,6 +338,7 @@ fn same_version_republish_detected() -> Result<()> {
         artifacts: &artifacts,
         metadata: &store,
         clock: &SystemClock,
+        ledger: supply_core::application::ledger::LedgerRecorder::open_in_memory()?,
     }
     .freeze_verified(&republish);
     let err = conflict.unwrap_err().to_string();
@@ -303,7 +348,7 @@ fn same_version_republish_detected() -> Result<()> {
     );
     assert_eq!(
         store
-            .latest_frozen(&Ecosystem::Npm, "left-pad")?
+            .latest_frozen(&baseline.key.source, &Ecosystem::Npm, "left-pad")?
             .unwrap()
             .sha256,
         baseline.sha256,

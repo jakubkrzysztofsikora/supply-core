@@ -1,8 +1,7 @@
-use crate::domain::{Ecosystem, PackageCoordinate, PackageVersion};
+use crate::domain::{Ecosystem, PackageCoordinate, PackageVersion, PackageVersionId};
 use crate::ports::UpstreamNpmRegistry;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use semver::Version;
 pub struct HttpNpmRegistry {
     pub base_url: String,
     pub client: reqwest::blocking::Client,
@@ -26,14 +25,8 @@ impl UpstreamNpmRegistry for HttpNpmRegistry {
         );
         Ok(self.client.get(url).send()?.error_for_status()?.json()?)
     }
-    fn tarball(&self, url: &str) -> Result<Vec<u8>> {
-        Ok(self
-            .client
-            .get(url)
-            .send()?
-            .error_for_status()?
-            .bytes()?
-            .to_vec())
+    fn tarball(&self, url: &str) -> Result<Box<dyn std::io::Read + Send>> {
+        Ok(Box::new(self.client.get(url).send()?.error_for_status()?))
     }
 }
 pub fn rewrite_tarball_urls(
@@ -72,11 +65,11 @@ pub fn rewrite_tarball_urls(
 pub fn package_version_from_metadata(
     metadata: &serde_json::Value,
     package: &str,
-    version: &Version,
+    version: &PackageVersionId,
 ) -> Result<PackageVersion> {
     let entry = metadata
         .get("versions")
-        .and_then(|v| v.get(version.to_string()))
+        .and_then(|v| v.get(version.upstream()))
         .ok_or_else(|| anyhow::anyhow!("{package}@{version} not found in registry metadata"))?;
     let dist = entry
         .get("dist")
@@ -91,7 +84,7 @@ pub fn package_version_from_metadata(
         .map(str::to_string);
     let published_at = metadata
         .get("time")
-        .and_then(|t| t.get(version.to_string()))
+        .and_then(|t| t.get(version.upstream()))
         .and_then(|t| t.as_str())
         .map(DateTime::parse_from_rfc3339)
         .transpose()?
@@ -108,15 +101,6 @@ pub fn package_version_from_metadata(
     })
 }
 
-pub fn has_provenance(metadata: &serde_json::Value, version: &str) -> bool {
-    metadata
-        .get("versions")
-        .and_then(|versions| versions.get(version))
-        .and_then(|entry| entry.get("dist"))
-        .and_then(|dist| dist.get("attestations"))
-        .is_some()
-}
-
 pub fn integrity_for(metadata: &serde_json::Value, version: &str) -> Option<String> {
     metadata
         .get("versions")
@@ -130,19 +114,6 @@ pub fn integrity_for(metadata: &serde_json::Value, version: &str) -> Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn detects_provenance_attestations() {
-        let with = serde_json::json!({
-            "versions": {"1.2.3": {"dist": {"attestations": {
-                "url": "https://registry.npmjs.org/-/npm/v1/attestations/x@1.2.3",
-                "provenance": {"predicateType": "https://slsa.dev/provenance/v1"}}}}}
-        });
-        let without =
-            serde_json::json!({"versions": {"1.2.3": {"dist": {"integrity": "sha512-x"}}}});
-        assert!(has_provenance(&with, "1.2.3"));
-        assert!(!has_provenance(&without, "1.2.3"));
-        assert!(!has_provenance(&with, "9.9.9"));
-    }
     #[test]
     fn extracts_integrity_for_a_version() {
         let metadata =
@@ -172,7 +143,11 @@ mod tests {
             }}},
             "time": {"1.3.0": "2018-02-05T02:27:32.476Z"}
         });
-        let pv = package_version_from_metadata(&meta, "left-pad", &Version::parse("1.3.0")?)?;
+        let pv = package_version_from_metadata(
+            &meta,
+            "left-pad",
+            &PackageVersionId::parse(&Ecosystem::Npm, "1.3.0")?,
+        )?;
         assert_eq!(pv.integrity.as_deref(), Some("sha512-abc"));
         assert!(pv
             .tarball_url
@@ -182,9 +157,80 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn tarball_returns_before_the_response_body_finishes() -> Result<()> {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            sync::mpsc,
+            thread,
+            time::Duration,
+        };
+
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let address = listener.local_addr()?;
+        let (started_tx, started_rx) = mpsc::channel();
+        let (continue_tx, continue_rx) = mpsc::channel();
+        let server = thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request)?;
+            stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nabc",
+            )?;
+            stream.flush()?;
+            started_tx.send(())?;
+            continue_rx
+                .recv_timeout(Duration::from_secs(2))
+                .map_err(|error| anyhow::anyhow!("test did not release response: {error}"))?;
+            let _ = stream.write_all(b"def");
+            let _ = stream.flush();
+            Ok(())
+        });
+        let registry = HttpNpmRegistry {
+            base_url: String::new(),
+            client: reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(2))
+                .build()?,
+        };
+        let url = format!("http://{address}/tarball");
+        let (returned_tx, returned_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let client = thread::spawn(move || {
+            let result = registry.tarball(&url).and_then(|mut body| {
+                returned_tx.send(())?;
+                let mut bytes = Vec::new();
+                body.read_to_end(&mut bytes)?;
+                Ok(bytes)
+            });
+            let _ = result_tx.send(result);
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|error| anyhow::anyhow!("server did not start response: {error}"))?;
+        let early = returned_rx.recv_timeout(Duration::from_secs(1));
+        continue_tx.send(())?;
+        let bytes = result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|error| anyhow::anyhow!("client did not finish response: {error}"))??;
+        client
+            .join()
+            .map_err(|_| anyhow::anyhow!("client thread panicked"))?;
+        server
+            .join()
+            .map_err(|_| anyhow::anyhow!("server thread panicked"))??;
+
+        assert!(
+            early.is_ok(),
+            "tarball call buffered the complete response body"
+        );
+        assert_eq!(bytes, b"abcdef");
+        Ok(())
+    }
+    #[test]
     fn unknown_version_errors() -> Result<()> {
         let meta = serde_json::json!({"versions": {}});
-        let v = Version::parse("9.9.9")?;
+        let v = PackageVersionId::parse(&Ecosystem::Npm, "9.9.9")?;
         assert!(package_version_from_metadata(&meta, "x", &v).is_err());
         Ok(())
     }

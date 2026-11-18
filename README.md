@@ -83,6 +83,69 @@ cargo run -- scan-docker .
 
 *`snapshot-*` prints a JSON report; `scan-docker` exits `2` when an image is unpinned.*
 
+Inspect local image archives without starting containers. Set
+`SUPPLY_SCRATCH_DIR` to an existing real directory. Compressed image archives
+above 64 MiB need a user-owned, non-shared directory on a Unix volume separate
+from `/`, with at least 10 GiB free. Compressed input is capped at 2 GiB.
+
+```bash
+SUPPLY_SCRATCH_DIR=/path/to/private-scratch \
+  cargo run -- scan-image ./image.oci.tar --json
+```
+
+Require cosign verification for OCI archives:
+
+```bash
+SUPPLY_SCRATCH_DIR=/path/to/private-scratch \
+COSIGN_BIN=/path/to/cosign \
+  cargo run -- scan-image ./image.oci.tar \
+  --image-ref 'registry.example/app@sha256:<digest>' \
+  --require-signature \
+  --certificate-identity '<certificate identity>' \
+  --certificate-oidc-issuer '<OIDC issuer>' \
+  --json
+```
+
+For Docker-save archives, also set `CRANE_BIN` to the crane executable:
+
+```bash
+SUPPLY_SCRATCH_DIR=/path/to/private-scratch \
+CRANE_BIN=/path/to/crane COSIGN_BIN=/path/to/cosign \
+  cargo run -- scan-image ./image.docker.tar \
+  --image-ref 'registry.example/app@sha256:<digest>' \
+  --require-signature \
+  --certificate-identity '<certificate identity>' \
+  --certificate-oidc-issuer '<OIDC issuer>' \
+  --json
+```
+
+Required verification needs a digest-pinned `--image-ref` and configured
+certificate identity and OIDC issuer. For OCI archives, the digest must match
+an index or manifest in the archive. For Docker-save archives, `crane` fetches
+the registry manifest at that immutable reference. Verification succeeds only
+when its manifest digest, config descriptor, and ordered uncompressed layer
+digests match the local archive and config diff IDs. Compressed Docker-save
+layers remain incomplete. Archives with more than one image also remain
+incomplete, because one signature cannot cover the other images. Only `crane`
+and `cosign` receive network access.
+Their Linux sandbox mounts one public system CA bundle read-only; private-key
+directories remain hidden. Image contents never execute. Archive and layer
+inputs remain read-only. All tools share a separate private writable scratch
+directory. Trivy, YaraHunter, capa, crane, and cosign run in isolated sandboxes.
+Each Linux sandbox starts a new session without a controlling terminal, so a
+scanner cannot inject input into the operator's terminal.
+
+Set `TRIVY_BIN` and `TRIVY_CACHE_DIR`, `YARAHUNTER_BIN` and
+`YARAHUNTER_RULES_DIR`, and `CAPA_BIN` and `CAPA_RULES_DIR` for required image
+scanners. Build YaraHunter at commit
+`8cb5a008056a407cf5a273fabb0ecf6626acd50e` and apply
+`patches/yarahunter-coverage.patch`. Image scanner resource limits currently
+require Linux. The Linux sandbox mounts its private scratch directory over
+`/tmp`, so install scanner binaries outside `/tmp`.
+
+Trivy preserves native vulnerability severity and applies the configured
+`vulnerabilities.block_severities` threshold, including more severe findings.
+
 ### 5. Quarantine Content Scanning (0-day and AI-agent threats)
 
 Inspect package bytes **while a version sits in the quarantine window** — before
@@ -94,10 +157,26 @@ external malware engine:
 uv tool install guarddog        # or: pipx install guarddog
 # If the default Python has no pygit2 wheel yet: uv tool install --python 3.13 guarddog
 
-# Scan one verified archive (static AI/agent rules + GuardDog)
+# Large scans need separate Unix scratch, 10 GiB free, one job per directory.
+# External scanners stay incomplete until per-scan scratch quotas are enforced.
+export SUPPLY_SCRATCH_DIR=/path/to/dedicated-scratch
 cargo run -- scan-package npm ./evil.tgz --name evil --version 1.2.3 \
-  --guarddog --findings-out findings.jsonl
+  --scratch-dir "$SUPPLY_SCRATCH_DIR" --json --findings-out findings.jsonl
 ```
+
+
+OSSGadget is an optional static scanner. It does not execute package files.
+Build its pinned Linux x86-64 binary with .NET 8, Git, Python 3, and bubblewrap:
+
+```bash
+scripts/install-ossgadget.sh "$HOME/.local/lib/supply-core/ossgadget"
+export OSSGADGET_BIN="$HOME/.local/lib/supply-core/ossgadget/ossgadget"
+export OSSGADGET_MANIFEST="$HOME/.local/lib/supply-core/ossgadget/supply-ossgadget-manifest.json"
+```
+
+The first install fetches pinned source and restores public NuGet dependencies from nuget.org.
+The scanner fails incomplete when isolation or coverage cannot be verified.
+This integration currently reports OSSGadget unavailable on macOS.
 
 The daily capture wires this automatically: every version held by the
 quarantine window is downloaded from the registry, verified against
@@ -110,6 +189,15 @@ decisions on the next capture:
 python3 experiments/scan-quarantine.py experiments/data/2026-09-13 \
   --bin target/release/supply-core    # one capture; the cron wrapper does this daily
 ```
+
+Verify local ledger consistency:
+
+```bash
+cargo run -- ledger verify
+```
+
+By default, this checks `$HOME/.local/share/supply-core/ledger.sqlite`.
+Verification requires an existing database and opens it read-only.
 
 ### 6. Machine-Wide Daily Radar (macOS)
 Scan **all** git repositories across your machine every morning at 08:30 AM:
@@ -158,15 +246,99 @@ server over the compose network. Captures land in `radar/data/`. Without the
 - Local health check: `curl http://localhost:4873/health`
 - Pre-built binary download: `curl -sSL https://supply-core.example.com/api/v1/download/supply-core-linux-x86_64 -o supply-core` (falls back to a redirect to GitHub Releases when the artifact cache is empty)
 - Remote pipeline scan: set `SUPPLY_AUTH_TOKEN` on the server and include a matching bearer token in scan requests.
-- **Status card**: `GET /api/v1/status/card.svg` renders a dynamic SVG with three columns — quarantine-window holds, confirmed CVEs, and packages the content scan suspects. `GET /api/v1/status` returns the same data as JSON. Both are read-only, unauthenticated, and cache for 5 minutes.
-- **Status publishing**: the daily capture publishes the snapshot (package names, versions, ages, decisions, advisory ids, and scan scores/rules) using the same token. It contains no repository paths, version ranges, or file contents. Store the publisher configuration outside the repository at `~/.config/supply-core/status-publisher.env`:
+- **Status card**: `GET /api/v1/status/card.svg` renders quarantine, confirmed CVEs, suspected scan findings, and incomplete scans. `GET /api/v1/status` returns service metadata, quarantine data, and optional scan details. Both GET endpoints are public and read-only; the SVG card caches for 5 minutes.
+- **Status publishing**: the daily capture publishes package/version results, quarantine records, and sanitized scan details. Incomplete records cap at 1,000, with omitted count reported. No repository paths, file contents, raw scanner errors, or arbitrary tool output leave the publisher. Store publisher settings outside the repository at `~/.config/supply-core/status-publisher.env`:
 
   ```bash
   SUPPLY_STATUS_URL=https://supply-core.example.com
   SUPPLY_STATUS_AUTH_TOKEN=the-matching-SUPPLY_AUTH_TOKEN
   ```
 
-  The next successful capture updates the card; the scan runs before publishing, so the snapshot carries the same day's suspected findings.
+  Each dashboard response shows the latest successful published capture, not a registry-wide real-time feed.
+
+  `PUT /api/v1/status/quarantine` requires `Authorization: Bearer <SUPPLY_AUTH_TOKEN>` and accepts a JSON snapshot. `captured_at` must be RFC 3339; `packages` is required. `confirmed`, `suspected`, `scan_incomplete`, and `scan_incomplete_truncated` default to empty arrays or zero. The new `scan` object is optional, so older uploads remain valid. The publisher sends `scan.captured_at`, `candidate_count`, sanitized `scanned` rows, and `error_count` only. A valid upload returns `204 No Content`; invalid data returns `400`, invalid credentials return `401`, and missing auth or storage configuration returns `503`:
+
+  ```json
+  {
+    "captured_at": "2026-11-15T08:00:00Z",
+    "packages": [],
+    "scan": {
+      "captured_at": "2026-11-15T08:30:00Z",
+      "candidate_count": 1,
+      "scanned": [
+        {
+          "name": "example-package",
+          "version": "1.2.3",
+          "decision": "block",
+          "coverage": "complete",
+          "findings": 1,
+          "score": "8.25",
+          "rules": ["nuget-init-ps1"],
+          "sources": ["static-heuristics"]
+        }
+      ],
+      "error_count": 0
+    }
+  }
+  ```
+
+  Each scan row has only `name`, `version`, `decision`, `coverage`, `findings`, `score`, `rules`, and `sources`. Decisions are `pass`, `review`, `block`, or `incomplete`. Coverage is `complete`, `partial`, or `unknown`. `score` is `null` or an exact decimal string from 0 through 10. `error_count` counts failures; it never includes error text. The upload does not accept a `blocked` list.
+
+  `GET /api/v1/status` is public and returns `200` with `generated_at`, `service`, `version`, `health`, existing `quarantine` data, and top-level `scan`. `scan` is `null` when no scan summary exists. Otherwise it contains `captured_at`, `candidate_count`, `scanned_count`, `blocked_count`, `error_count`, `scanned`, and `blocked`. `blocked` contains full scanned rows whose decision is `block`; the server derives this list from `scanned`. The public page shows confirmed OSV blocks separately; scan-block counts do not include OSV rows. The quarantine table shows each package's `Block` or `Fallback` status.
+
+  ```json
+  {
+    "generated_at": "2026-11-15T08:32:00Z",
+    "service": "supply-core",
+    "version": "0.3.1",
+    "health": {"status": "ok"},
+    "quarantine": {
+      "enabled": true,
+      "minimum_age_days": 7,
+      "captured_at": "2026-11-15T08:00:00Z",
+      "packages": [],
+      "confirmed": [],
+      "suspected": [],
+      "scan_incomplete": [],
+      "scan_incomplete_truncated": 0
+    },
+    "scan": {
+      "captured_at": "2026-11-15T08:30:00Z",
+      "candidate_count": 1,
+      "scanned_count": 1,
+      "blocked_count": 1,
+      "error_count": 0,
+      "scanned": [
+        {
+          "name": "example-package",
+          "version": "1.2.3",
+          "decision": "block",
+          "coverage": "complete",
+          "findings": 1,
+          "score": "8.25",
+          "rules": ["nuget-init-ps1"],
+          "sources": ["static-heuristics"]
+        }
+      ],
+      "blocked": [
+        {
+          "name": "example-package",
+          "version": "1.2.3",
+          "decision": "block",
+          "coverage": "complete",
+          "findings": 1,
+          "score": "8.25",
+          "rules": ["nuget-init-ps1"],
+          "sources": ["static-heuristics"]
+        }
+      ]
+    }
+  }
+  ```
+
+  The publisher rejects `content-scan.json` files larger than 1,000,000 bytes, more than 1,000 scanned rows, or more than 100,000 candidates, errors, or findings per row. Names and versions cap at 256 UTF-8 bytes. Each `rules` or `sources` list caps at 16 identifiers; each identifier caps at 120 bytes. Error text caps at 2,048 bytes for validation, then is discarded. Scan timestamps cap at 64 bytes. Scores cap at 32 bytes, 29 digits, and 28 fractional digits. Unknown row fields are dropped by the publisher and rejected by the upload API. The API also rejects invalid decisions, coverage, paths, scores, and oversized lists. Existing incomplete records cap at 1,000; `scan_incomplete_truncated` reports omissions.
+
+  Existing `quarantine` rows retain these fields: `packages[]` has `name`, `version`, non-negative `age_days`, and `status` (`Block` or `Fallback`); `confirmed[]` has `name`, `version`, `advisory`, and `severity`; `suspected[]` has `name`, `version`, integer `score` from 0 through 10, and `rules`; `scan_incomplete[]` has `name`, `version`, and verdict `scan_incomplete`. `scan_incomplete_truncated` counts omitted incomplete rows. Upload limits are 5,000 packages; 1,000 confirmed, suspected, or incomplete rows; and 16 rules per suspected row, with each rule capped at 120 bytes. Confirmed advisory and severity strings cap at 256 and 32 bytes.
 
 **Deploy to Kubernetes:**
 ```bash
@@ -261,11 +433,11 @@ Every morning, open `~/.local/share/supply-core/latest.json` or `runs/<timestamp
 
 Time-based quarantine keeps a fresh version out of the build; the content scan
 looks *inside* the bytes while upstream has reported nothing yet. `scan-package`
-runs two engines over a verified archive:
+accepts npm, pypi/pip, and NuGet archives. Built-in static rules run for all.
+GuardDog runs automatically only for npm/PyPI:
 
-1. **GuardDog 3.2** (`--guarddog`, uses `$GUARDDOG_BIN` or `guarddog` on PATH) —
-   YARA-style heuristics for install hooks, credential access, exfiltration,
-   obfuscation, bundled binaries, and typosquat metadata.
+1. **GuardDog 3.2** — YARA-style heuristics for install hooks, credential
+   access, exfiltration, obfuscation, bundled binaries, and typosquat metadata.
 2. **Built-in static rules** — capability/threat correlation plus an
    AI/agent-targeting set:
 
@@ -277,12 +449,20 @@ runs two engines over a verified archive:
 | `ai-hidden-instructions` | Zero-width / bidirectional Unicode smuggling around instructions |
 | `ai-install-script` | Lifecycle scripts touching agent state or provider credentials |
 | `slopsquat-name` | Package name one edit away from a popular package (the LLM-hallucination shape) |
+| `nuget-init-ps1` | NuGet `tools/init.ps1` installation hooks |
+| `nuget-inline-using-task` | MSBuild inline-code tasks in NuGet build definitions |
 
 Findings score 0–10 and are enforced per policy: `block_score` (default 8)
 blocks or falls back, `review_score` (default 4) warns, and verified npm build
 provenance lowers a score by 3. Every extracted file is scored, including test
 and coverage paths; dynamic-evaluation signals only escalate when an encoded
 payload is present, so ordinary `new Function`/coverage builds stay quiet.
+NuGet scans flag `tools/init.ps1` and `CodeTaskFactory` or
+`RoslynCodeTaskFactory` tasks in `.props`/`.targets` under `build/`,
+`buildMultiTargeting/`, and `buildTransitive/`. These findings score 8,
+blocking at the default threshold. The scanner parses these files; it never
+executes package code. DTDs, custom XML entities, and malformed build files
+leave coverage incomplete.
 
 A scan that fails (registry, integrity, GuardDog, timeout) persists a
 block-level `scan-incomplete` finding instead of failing open, so the version
@@ -301,6 +481,26 @@ published with the snapshot and rendered on the status card.
 `supply report findings.json --submit` exports OSV records plus the manual
 disclosure checklist — nothing is submitted automatically.
 
+### Approving one scanner finding
+
+Use exact values from the scan report. `--policy-sha256` takes its
+`engine_policy_revision_sha256`, not its separate `policy_sha256` field.
+
+```sh
+cargo run -- approve-rule \
+  --artifact-sha256 "$ARTIFACT_SHA256" \
+  --finding-id "$FINDING_ID" \
+  --policy-sha256 "$ENGINE_POLICY_REVISION_SHA256" \
+  --expires-at "$FUTURE_RFC3339" \
+  --reason "Reviewed false positive"
+```
+
+Approval changes only the matching `scan-package` decision for that finding,
+artifact, and engine-policy revision. It expires at the supplied RFC 3339
+time. The ledger retains the original finding; incomplete coverage remains
+incomplete. This does not change `--findings` JSONL or snapshot decisions.
+The command requires a same-UID Unix operator and a private ledger file.
+
 The self-hosted radar container runs the same scan after each capture (the
 image ships `scan-quarantine.py` and `policy.yml`); install GuardDog into a
 derived image or set `GUARDDOG_BIN` to add the external engine — the static
@@ -316,7 +516,8 @@ Policies are defined in a clean YAML structure (see [`examples/supply-core.yml`]
 quarantine:
   enabled: true
   minimum_age_days: 7
-  cve_keeps_quarantined: true   # overrides block_severities: any CVE, any severity, blocks forever
+  cve_keeps_quarantined: true   # Also blocks non-OSV findings at every severity
+  # OSV advisories always block, regardless of severity or this setting.
 
 vulnerabilities:
   block_severities: [High, Critical]

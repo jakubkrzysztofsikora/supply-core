@@ -38,22 +38,24 @@ crontab -l | grep supply-core
 
 Log: `experiments/data/cron.log`.
 
-## Content scan (GuardDog + AI/agent rules)
+Each daily capture scans package versions held by the quarantine window.
+`scan-quarantine.py` verifies registry `sha512` downloads, then requests a
+JSON `ArtifactReport` from `supply scan-package`. GuardDog 3.2 and OSSGadget
+remain required for complete coverage; missing engines keep versions held.
+Per-capture results land in `data/<day>/content-scan.json`. Findings append to
+`data/content-findings.jsonl` for later `snapshot-npm --findings` enforcement.
 
-Each daily capture content-scans the versions held by the quarantine window
-(`scan-quarantine.py`): registry-verified (sha512) downloads, GuardDog 3.2,
-and the built-in AI/agent-targeting rules. Per-capture results land in
-`data/<day>/content-scan.json`; findings append to
-`data/content-findings.jsonl` and `run.sh` enforces them through `policy.yml`
-on later captures. Failed scans persist a block-level `scan-incomplete`
-record until a successful scan clears it (fail closed). `guarddog` must be on
-PATH (`~/.local/bin`) or reachable through `GUARDDOG_BIN`; install with
-`uv tool install guarddog`.
+Set `SUPPLY_SCRATCH_DIR` to a dedicated scan volume. The wrapper passes it to
+`scan-package`; do not use a boot-disk path. Set `GUARDDOG_BIN` or
+`--guarddog-bin` to select the GuardDog executable. There is no static-only
+bypass. Incomplete scans remain held and retry later. A block appears in the
+report without turning a completed scan into a process error.
 
-`publish-status.py` then builds the public snapshot from the same day:
-quarantine holds, confirmed advisories, and suspected scan findings. The
-official server renders it as JSON (`/api/v1/status`) and as the status card
-(`/api/v1/status/card.svg`).
+`publish-status.py` builds the public snapshot from the same day: quarantine
+holds, confirmed advisories, suspected scan findings, and incomplete scans.
+Incomplete findings cap at 1,000; JSON reports the omitted count. The official
+server renders the snapshot at `/api/v1/status` and as
+`/api/v1/status/card.svg`.
 
 ## Day-0 baseline observations (2026-08-15)
 

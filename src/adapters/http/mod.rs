@@ -139,6 +139,36 @@ struct IncompleteFinding {
     verdict: String,
 }
 
+const MAX_SCAN_ROWS: usize = 1_000;
+const MAX_SCAN_CANDIDATES: usize = 100_000;
+const MAX_SCAN_ERRORS: usize = 100_000;
+const MAX_SCAN_FINDINGS: usize = 100_000;
+const MAX_SCAN_IDENTIFIERS: usize = 16;
+const MAX_SCAN_FIELD_BYTES: usize = 256;
+const MAX_SCAN_IDENTIFIER_BYTES: usize = 120;
+const MAX_SCAN_SCORE_BYTES: usize = 32;
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct ScannedPackageSummary {
+    name: String,
+    version: String,
+    decision: String,
+    coverage: String,
+    findings: usize,
+    score: Option<String>,
+    rules: Vec<String>,
+    sources: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct ScanSummary {
+    captured_at: String,
+    candidate_count: usize,
+    scanned: Vec<ScannedPackageSummary>,
+    error_count: usize,
+}
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 struct QuarantineSnapshot {
@@ -150,6 +180,10 @@ struct QuarantineSnapshot {
     suspected: Vec<SuspectedFinding>,
     #[serde(default)]
     scan_incomplete: Vec<IncompleteFinding>,
+    #[serde(default)]
+    scan_incomplete_truncated: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scan: Option<ScanSummary>,
 }
 
 pub fn app() -> Router {
@@ -213,6 +247,25 @@ async fn public_status(State(state): State<Arc<ServerConfig>>) -> Json<Value> {
     let snapshot = read_quarantine_snapshot(state.status_file.as_deref())
         .ok()
         .flatten();
+    let scan = snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.scan.as_ref())
+        .map(|scan| {
+            let blocked: Vec<_> = scan
+                .scanned
+                .iter()
+                .filter(|row| row.decision == "block")
+                .collect();
+            json!({
+                "captured_at": &scan.captured_at,
+                "candidate_count": scan.candidate_count,
+                "scanned_count": scan.scanned.len(),
+                "blocked_count": blocked.len(),
+                "error_count": scan.error_count,
+                "scanned": &scan.scanned,
+                "blocked": blocked
+            })
+        });
     Json(json!({
         "generated_at": chrono::Utc::now().to_rfc3339(),
         "service": state.service_name,
@@ -225,13 +278,16 @@ async fn public_status(State(state): State<Arc<ServerConfig>>) -> Json<Value> {
             "packages": snapshot.as_ref().map(|snapshot| snapshot.packages.clone()).unwrap_or_default(),
             "confirmed": snapshot.as_ref().map(|snapshot| snapshot.confirmed.clone()).unwrap_or_default(),
             "suspected": snapshot.as_ref().map(|snapshot| snapshot.suspected.clone()).unwrap_or_default(),
-            "scan_incomplete": snapshot.as_ref().map(|snapshot| snapshot.scan_incomplete.clone()).unwrap_or_default()
-        }
+            "scan_incomplete": snapshot.as_ref().map(|snapshot| snapshot.scan_incomplete.clone()).unwrap_or_default(),
+            "scan_incomplete_truncated": snapshot.as_ref().map(|snapshot| snapshot.scan_incomplete_truncated).unwrap_or_default()
+        },
+        "scan": scan
     }))
 }
 
 const CARD_FONT: &str = "ui-monospace,SFMono-Regular,Menlo,monospace";
 const CARD_MAX_ROWS: usize = 8;
+const MAX_INCOMPLETE_FINDINGS: usize = 1_000;
 
 fn xml_escape(raw: &str) -> String {
     raw.replace('&', "&amp;")
@@ -250,7 +306,7 @@ fn card_section<T>(items: &[T], format_row: impl Fn(&T) -> String) -> (Vec<Strin
     (lines, hidden)
 }
 
-/// Dynamic SVG listing quarantined, confirmed-CVE and scan-suspected packages.
+/// Dynamic SVG listing quarantined, confirmed, suspected and incomplete scans.
 fn render_status_card(snapshot: Option<&QuarantineSnapshot>) -> String {
     let empty_packages: Vec<QuarantinedPackage> = Vec::new();
     let empty_confirmed: Vec<ConfirmedFinding> = Vec::new();
@@ -268,6 +324,9 @@ fn render_status_card(snapshot: Option<&QuarantineSnapshot>) -> String {
     let scan_incomplete = snapshot
         .map(|snapshot| &snapshot.scan_incomplete)
         .unwrap_or(&empty_incomplete);
+    let scan_incomplete_truncated = snapshot
+        .map(|snapshot| snapshot.scan_incomplete_truncated)
+        .unwrap_or_default();
     let captured_at = snapshot
         .map(|snapshot| snapshot.captured_at.as_str())
         .unwrap_or("no snapshot yet");
@@ -301,10 +360,13 @@ fn render_status_card(snapshot: Option<&QuarantineSnapshot>) -> String {
             finding.name, finding.version, finding.score, suffix
         )
     });
-    let (incomplete_lines, incomplete_hidden) =
-        card_section(scan_incomplete, |finding| {
-            format!("{}@{} · scan incomplete", finding.name, finding.version)
-        });
+    let (incomplete_lines, incomplete_hidden) = card_section(scan_incomplete, |finding| {
+        format!("{}@{} · scan incomplete", finding.name, finding.version)
+    });
+    let incomplete_hidden = incomplete_hidden.saturating_add(scan_incomplete_truncated);
+    let incomplete_total = scan_incomplete
+        .len()
+        .saturating_add(scan_incomplete_truncated);
 
     let sections: [(&str, &str, &Vec<String>, usize, usize); 4] = [
         (
@@ -333,7 +395,7 @@ fn render_status_card(snapshot: Option<&QuarantineSnapshot>) -> String {
             "SCAN INCOMPLETE",
             &incomplete_lines,
             incomplete_hidden,
-            scan_incomplete.len(),
+            incomplete_total,
         ),
     ];
     let rows = sections
@@ -357,6 +419,20 @@ fn render_status_card(snapshot: Option<&QuarantineSnapshot>) -> String {
         "<text x=\"876\" y=\"40\" text-anchor=\"end\" fill=\"#8b949e\" font-family=\"{CARD_FONT}\" font-size=\"12\">{}</text>",
         xml_escape(captured_at)
     ));
+    svg.push_str("<defs>");
+    for index in 0..sections.len() {
+        let x = 24 + index * 219;
+        let width = if index + 1 == sections.len() {
+            876 - x
+        } else {
+            207
+        };
+        svg.push_str(&format!(
+            "<clipPath id=\"status-column-{index}\" clipPathUnits=\"userSpaceOnUse\"><rect x=\"{x}\" y=\"88\" width=\"{width}\" height=\"{}\"/></clipPath>",
+            height - 88
+        ));
+    }
+    svg.push_str("</defs>");
 
     for (index, (color, title, lines, hidden, total)) in sections.iter().enumerate() {
         let x = 24 + index * 219;
@@ -366,9 +442,14 @@ fn render_status_card(snapshot: Option<&QuarantineSnapshot>) -> String {
         let mut row = 0usize;
         for line in lines.iter() {
             let y = 104 + row * 22;
+            let escaped = xml_escape(line);
+            let aria_label = if line == "(none captured yet)" {
+                String::new()
+            } else {
+                format!(" aria-label=\"{escaped}\"")
+            };
             svg.push_str(&format!(
-                "<text x=\"{x}\" y=\"{y}\" fill=\"#c9d1d9\" font-family=\"{CARD_FONT}\" font-size=\"13\">{}</text>",
-                xml_escape(line)
+                "<text x=\"{x}\" y=\"{y}\" clip-path=\"url(#status-column-{index})\"{aria_label} fill=\"#c9d1d9\" font-family=\"{CARD_FONT}\" font-size=\"13\">{escaped}</text>"
             ));
             row += 1;
         }
@@ -445,7 +526,7 @@ fn validate_quarantine_snapshot(
                 && finding.rules.len() <= 16
                 && finding.rules.iter().all(|rule| rule.len() <= 120)
         });
-    let valid_incomplete = snapshot.scan_incomplete.len() <= 1_000
+    let valid_incomplete = snapshot.scan_incomplete.len() <= MAX_INCOMPLETE_FINDINGS
         && snapshot.scan_incomplete.iter().all(|finding| {
             !finding.name.trim().is_empty()
                 && finding.name.len() <= 256
@@ -453,7 +534,18 @@ fn validate_quarantine_snapshot(
                 && finding.version.len() <= 256
                 && finding.verdict == "scan_incomplete"
         });
-    if valid_time && valid_packages && valid_confirmed && valid_suspected && valid_incomplete {
+    let valid_scan = snapshot
+        .scan
+        .as_ref()
+        .map(valid_scan_summary)
+        .unwrap_or(true);
+    if valid_time
+        && valid_packages
+        && valid_confirmed
+        && valid_suspected
+        && valid_incomplete
+        && valid_scan
+    {
         Ok(())
     } else {
         Err((
@@ -461,6 +553,109 @@ fn validate_quarantine_snapshot(
             Json(json!({"error": "invalid quarantine snapshot"})),
         ))
     }
+}
+
+fn valid_scan_identity(value: &str, allow_scope: bool) -> bool {
+    let path_prefix = value
+        .get(..2)
+        .map(|prefix| prefix.as_bytes()[0].is_ascii_alphabetic() && prefix.as_bytes()[1] == b':')
+        .unwrap_or(false);
+    if value.trim().is_empty()
+        || value.len() > MAX_SCAN_FIELD_BYTES
+        || value.chars().any(char::is_control)
+        || value.starts_with('/')
+        || value.starts_with('\\')
+        || value.contains('\\')
+        || path_prefix
+        || value
+            .get(..5)
+            .map(|prefix| prefix.eq_ignore_ascii_case("file:"))
+            .unwrap_or(false)
+    {
+        return false;
+    }
+    if value.contains('/') {
+        if !allow_scope || !value.starts_with('@') || value.matches('/').count() != 1 {
+            return false;
+        }
+        let Some((scope, package)) = value.split_once('/') else {
+            return false;
+        };
+        if scope.len() <= 1 || package.is_empty() {
+            return false;
+        }
+    }
+    true
+}
+
+fn valid_scan_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_SCAN_IDENTIFIER_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_.:-".contains(&byte))
+}
+
+fn valid_scan_score(value: &str) -> bool {
+    if value.len() > MAX_SCAN_SCORE_BYTES {
+        return false;
+    }
+    let (negative, unsigned) = match value.strip_prefix('-') {
+        Some(unsigned) => (true, unsigned),
+        None => (false, value),
+    };
+    let (integer, fraction) = match unsigned.split_once('.') {
+        Some((integer, fraction)) if !fraction.is_empty() => (integer, fraction),
+        Some(_) => return false,
+        None => (unsigned, ""),
+    };
+    if integer.is_empty()
+        || !integer.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        || fraction.len() > 28
+        || integer.len() + fraction.len() > 29
+    {
+        return false;
+    }
+    let integer = integer.trim_start_matches('0');
+    let integer = if integer.is_empty() { "0" } else { integer };
+    let fraction_is_zero = fraction.bytes().all(|byte| byte == b'0');
+    let in_range = match integer.len() {
+        1 => true,
+        2 => integer == "10" && fraction_is_zero,
+        _ => false,
+    };
+    in_range && (!negative || (integer == "0" && fraction_is_zero))
+}
+
+fn valid_scan_summary(scan: &ScanSummary) -> bool {
+    chrono::DateTime::parse_from_rfc3339(&scan.captured_at).is_ok()
+        && scan.captured_at.len() <= 64
+        && scan.candidate_count <= MAX_SCAN_CANDIDATES
+        && scan.error_count <= MAX_SCAN_ERRORS
+        && scan.scanned.len() <= MAX_SCAN_ROWS
+        && scan.candidate_count >= scan.scanned.len()
+        && scan.scanned.iter().all(|row| {
+            valid_scan_identity(&row.name, true)
+                && valid_scan_identity(&row.version, false)
+                && matches!(
+                    row.decision.as_str(),
+                    "pass" | "review" | "block" | "incomplete"
+                )
+                && matches!(row.coverage.as_str(), "complete" | "partial" | "unknown")
+                && row.findings <= MAX_SCAN_FINDINGS
+                && row
+                    .score
+                    .as_ref()
+                    .is_none_or(|score| valid_scan_score(score))
+                && row.rules.len() <= MAX_SCAN_IDENTIFIERS
+                && row.rules.iter().all(|rule| valid_scan_identifier(rule))
+                && row.sources.len() <= MAX_SCAN_IDENTIFIERS
+                && row
+                    .sources
+                    .iter()
+                    .all(|source| valid_scan_identifier(source))
+        })
 }
 
 fn read_quarantine_snapshot(path: Option<&Path>) -> Result<Option<QuarantineSnapshot>> {
@@ -799,7 +994,11 @@ mod tests {
                 "version": "16.3.4",
                 "age_days": 6,
                 "status": "Block"
-            }]
+            }],
+            "scan_incomplete": [
+                {"name": "pkg", "version": "1.0.0", "verdict": "scan_incomplete"}
+            ],
+            "scan_incomplete_truncated": 1
         });
 
         let response = app
@@ -834,7 +1033,12 @@ mod tests {
             serde_json::from_slice(&body).unwrap_or_else(|_| panic!("response is JSON"));
         assert_eq!(status["quarantine"]["captured_at"], "2026-09-08T08:15:00Z");
         assert_eq!(status["quarantine"]["packages"], snapshot["packages"]);
-        assert_eq!(status["quarantine"]["scan_incomplete"], json!([]));
+        assert_eq!(
+            status["quarantine"]["scan_incomplete"],
+            snapshot["scan_incomplete"]
+        );
+        assert_eq!(status["quarantine"]["scan_incomplete_truncated"], 1);
+        assert_eq!(status["scan"], Value::Null);
     }
 
     #[test]
@@ -864,6 +1068,8 @@ mod tests {
                 version: "2.0.0".into(),
                 verdict: "scan_incomplete".into(),
             }],
+            scan_incomplete_truncated: 0,
+            scan: None,
         };
         let svg = render_status_card(Some(&snapshot));
         assert!(svg.starts_with("<svg"), "card must be an SVG document");
@@ -876,6 +1082,45 @@ mod tests {
         assert!(svg.contains("high GHSA-35jh"));
         assert!(svg.contains("ai-prompt-injection"));
         assert!(svg.contains("2026-09-13T08:15:00Z"));
+    }
+
+    #[test]
+    fn card_reports_incomplete_snapshot_truncation() {
+        let snapshot: QuarantineSnapshot = serde_json::from_value(json!({
+            "captured_at": "2026-11-14T00:00:00Z",
+            "packages": [],
+            "scan_incomplete": [
+                {"name": "pkg", "version": "1.0.0", "verdict": "scan_incomplete"}
+            ],
+            "scan_incomplete_truncated": 1
+        }))
+        .unwrap_or_else(|_| panic!("valid truncated snapshot"));
+
+        assert!(validate_quarantine_snapshot(&snapshot).is_ok());
+        let svg = render_status_card(Some(&snapshot));
+        assert!(svg.contains("SCAN INCOMPLETE (2)"), "{svg}");
+        assert!(svg.contains("+1 more"), "{svg}");
+    }
+
+    #[test]
+    fn card_clips_long_rows_and_exposes_full_text() {
+        let snapshot: QuarantineSnapshot = serde_json::from_value(json!({
+            "captured_at": "2026-11-14T00:00:00Z",
+            "packages": [{
+                "name": "@typescript-eslint/eslint-plugin",
+                "version": "1.0.0",
+                "age_days": 0,
+                "status": "Block"
+            }]
+        }))
+        .unwrap_or_else(|_| panic!("valid status snapshot"));
+        let svg = render_status_card(Some(&snapshot));
+
+        assert!(svg.contains("clip-path=\"url(#status-column-0)\""), "{svg}");
+        assert!(
+            svg.contains("aria-label=\"@typescript-eslint/eslint-plugin@1.0.0 · 0d\""),
+            "{svg}"
+        );
     }
 
     #[test]
@@ -962,7 +1207,176 @@ mod tests {
             status["quarantine"]["scan_incomplete"],
             json!([{"name": "missing-score", "version": "1.0.0", "verdict": "scan_incomplete"}])
         );
-        assert!(status["quarantine"]["scan_incomplete"][0].get("score").is_none());
+        assert!(status["quarantine"]["scan_incomplete"][0]
+            .get("score")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn published_scan_details_project_blocked_rows_and_keep_scores_exact() {
+        let directory = tempfile::tempdir().unwrap_or_else(|_| panic!("temporary directory"));
+        let app = app_with_config(ServerConfig {
+            auth_token: Some("test-token".into()),
+            status_file: Some(directory.path().join("quarantine-status.json")),
+            ..ServerConfig::default()
+        });
+        let blocked = json!({
+            "name": "@scope/evil",
+            "version": "1.0.0",
+            "decision": "block",
+            "coverage": "partial",
+            "findings": 2,
+            "score": "8.1234567890123456789012345678",
+            "rules": ["install-script-pipe"],
+            "sources": ["static-heuristics"]
+        });
+        let passed = json!({
+            "name": "clean",
+            "version": "2.0.0",
+            "decision": "pass",
+            "coverage": "complete",
+            "findings": 0,
+            "score": "0",
+            "rules": [],
+            "sources": []
+        });
+        let snapshot = json!({
+            "captured_at": "2026-11-15T08:30:00Z",
+            "packages": [],
+            "scan": {
+                "captured_at": "2026-11-15T08:31:00Z",
+                "candidate_count": 3,
+                "scanned": [blocked.clone(), passed.clone()],
+                "error_count": 1
+            }
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/status/quarantine")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .body(axum::body::Body::from(snapshot.to_string()))
+                    .unwrap_or_else(|_| panic!("valid request")),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("request succeeds"));
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/status")
+                    .body(axum::body::Body::empty())
+                    .unwrap_or_else(|_| panic!("valid request")),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("request succeeds"));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap_or_else(|_| panic!("body"));
+        let status: Value =
+            serde_json::from_slice(&body).unwrap_or_else(|_| panic!("response is JSON"));
+
+        assert_eq!(status["scan"]["captured_at"], "2026-11-15T08:31:00Z");
+        assert_eq!(status["scan"]["candidate_count"], 3);
+        assert_eq!(status["scan"]["scanned_count"], 2);
+        assert_eq!(status["scan"]["blocked_count"], 1);
+        assert_eq!(status["scan"]["error_count"], 1);
+        assert_eq!(status["scan"]["scanned"], json!([blocked.clone(), passed]));
+        assert_eq!(status["scan"]["blocked"], json!([blocked]));
+        assert!(status["scan"].get("errors").is_none());
+    }
+
+    #[tokio::test]
+    async fn publish_rejects_unlisted_scan_tool_output() {
+        let directory = tempfile::tempdir().unwrap_or_else(|_| panic!("temporary directory"));
+        let app = app_with_config(ServerConfig {
+            auth_token: Some("test-token".into()),
+            status_file: Some(directory.path().join("quarantine-status.json")),
+            ..ServerConfig::default()
+        });
+        let snapshot = json!({
+            "captured_at": "2026-11-15T08:30:00Z",
+            "packages": [],
+            "scan": {
+                "captured_at": "2026-11-15T08:31:00Z",
+                "candidate_count": 1,
+                "scanned": [{
+                    "name": "pkg",
+                    "version": "1.0.0",
+                    "decision": "block",
+                    "coverage": "complete",
+                    "findings": 1,
+                    "score": "8",
+                    "rules": ["malware-rule"],
+                    "sources": ["static-heuristics"],
+                    "tool_output": "/Users/private/source.tar"
+                }],
+                "error_count": 0
+            }
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/status/quarantine")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .body(axum::body::Body::from(snapshot.to_string()))
+                    .unwrap_or_else(|_| panic!("valid request")),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("request succeeds"));
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn publish_rejects_oversized_scan_detail_lists() {
+        let directory = tempfile::tempdir().unwrap_or_else(|_| panic!("temporary directory"));
+        let app = app_with_config(ServerConfig {
+            auth_token: Some("test-token".into()),
+            status_file: Some(directory.path().join("quarantine-status.json")),
+            ..ServerConfig::default()
+        });
+        let row = json!({
+            "name": "pkg",
+            "version": "1.0.0",
+            "decision": "block",
+            "coverage": "complete",
+            "findings": 1,
+            "score": "8",
+            "rules": ["malware-rule"],
+            "sources": ["static-heuristics"]
+        });
+        let snapshot = json!({
+            "captured_at": "2026-11-15T08:30:00Z",
+            "packages": [],
+            "scan": {
+                "captured_at": "2026-11-15T08:31:00Z",
+                "candidate_count": MAX_SCAN_CANDIDATES,
+                "scanned": vec![row; MAX_SCAN_ROWS + 1],
+                "error_count": 0
+            }
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/status/quarantine")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .body(axum::body::Body::from(snapshot.to_string()))
+                    .unwrap_or_else(|_| panic!("valid request")),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("request succeeds"));
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -1019,12 +1433,10 @@ mod tests {
             1_001
         ];
         assert!(validate_quarantine_snapshot(&snapshot).is_err());
-        assert!(
-            serde_json::from_value::<IncompleteFinding>(
-                json!({"name": "pkg", "version": "1.0", "verdict": "scan_incomplete", "score": 0})
-            )
-            .is_err()
-        );
+        assert!(serde_json::from_value::<IncompleteFinding>(
+            json!({"name": "pkg", "version": "1.0", "verdict": "scan_incomplete", "score": 0})
+        )
+        .is_err());
     }
 
     #[tokio::test]

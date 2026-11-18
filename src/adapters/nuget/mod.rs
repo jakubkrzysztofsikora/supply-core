@@ -1,8 +1,7 @@
-use crate::domain::{Ecosystem, PackageCoordinate, PackageVersion};
+use crate::domain::{Ecosystem, PackageCoordinate, PackageVersion, PackageVersionId};
 use crate::ports::UpstreamNuGetRegistry;
 use anyhow::{Context, Result};
 use chrono::DateTime;
-use semver::Version;
 
 pub struct HttpNuGetRegistry {
     pub base_url: String,
@@ -141,7 +140,7 @@ fn strip_sha512_prefix(raw: &str) -> &str {
 pub fn package_version_from_nuget(
     payload: &serde_json::Value,
     name: &str,
-    version: &Version,
+    version: &PackageVersionId,
     lockfile_hash: Option<&str>,
 ) -> Result<PackageVersion> {
     let catalog_hash = payload
@@ -291,7 +290,7 @@ mod tests {
 
     #[test]
     fn lockfile_hash_must_match_registry_hash() -> Result<()> {
-        let version = Version::parse("1.0.0").unwrap();
+        let version = PackageVersionId::parse(&Ecosystem::NuGet, "1.0.0").unwrap();
         let base = serde_json::json!({
             "published": "2023-03-08T07:42:54.647Z",
             "listed": true,
@@ -331,7 +330,7 @@ mod tests {
             "packageHashAlgorithm": "SHA512",
             "packageContent": "https://api.nuget.org/v3-flatcontainer/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg"
         });
-        let version = Version::parse("13.0.3").unwrap();
+        let version = PackageVersionId::parse(&Ecosystem::NuGet, "13.0.3").unwrap();
         let pv = package_version_from_nuget(&payload, "Newtonsoft.Json", &version, None)?;
         assert_eq!(pv.package.ecosystem, Ecosystem::NuGet);
         assert_eq!(pv.integrity.as_deref(), Some("sha512-mbJSvHfRxfX3tR"));
@@ -346,7 +345,7 @@ mod tests {
     #[test]
     fn unlisted_versions_have_no_published_date() -> Result<()> {
         let payload = json!({ "listed": false, "packageContent": "https://x/y.nupkg" });
-        let version = Version::parse("1.0.0").unwrap();
+        let version = PackageVersionId::parse(&Ecosystem::NuGet, "1.0.0").unwrap();
         let pv = package_version_from_nuget(&payload, "Example", &version, None)?;
         assert!(pv.published_at.is_none());
         Ok(())

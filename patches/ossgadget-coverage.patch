@@ -1,0 +1,211 @@
+diff --git a/src/Shared.CLI/Tools/DetectBackdoorTool.cs b/src/Shared.CLI/Tools/DetectBackdoorTool.cs
+--- a/src/Shared.CLI/Tools/DetectBackdoorTool.cs
++++ b/src/Shared.CLI/Tools/DetectBackdoorTool.cs
+@@ -10,2 +10,3 @@
+ using System.Linq;
++using System.Text.Json;
+ using System.Threading.Tasks;
+@@ -40,5 +41,6 @@
+         public override async Task<ErrorCode> RunAsync(DetectBackdoorToolOptions options)
+         {
+             List<Dictionary<string, AnalyzeResult?>>? detectionResults = await LegacyRunAsync(options);
++            WriteCoverageReport(options, detectionResults);
+ 
+             foreach (Dictionary<string, AnalyzeResult?>? result in detectionResults)
+@@ -123,7 +125,168 @@
+                 }
+             }
+ 
+             return ErrorCode.Ok;
+         }
++
++        private sealed record CoverageSkippedPath(string path, string reason);
++
++        private sealed record CoverageReport(
++            int version,
++            List<string> scanned_paths,
++            List<CoverageSkippedPath> skipped_paths,
++            List<string> diagnostics);
++
++        private static void WriteCoverageReport(
++            DetectBackdoorToolOptions options,
++            List<Dictionary<string, AnalyzeResult?>>? results)
++        {
++            string? coveragePath = Environment.GetEnvironmentVariable("SUPPLY_OSSGADGET_COVERAGE_PATH");
++            if (string.IsNullOrWhiteSpace(coveragePath))
++            {
++                return;
++            }
++
++            List<string> scannedPaths = new();
++            List<CoverageSkippedPath> skippedPaths = new();
++            List<string> diagnostics = new();
++            string[] targets = options.Targets?.ToArray() ?? Array.Empty<string>();
++            if (targets.Length == 0)
++            {
++                diagnostics.Add("local_target_missing");
++            }
++
++            Dictionary<string, AnalyzeResult> analyses = new(StringComparer.Ordinal);
++            if (results != null)
++            {
++                foreach (Dictionary<string, AnalyzeResult?>? result in results)
++                {
++                    if (result == null)
++                    {
++                        continue;
++                    }
++
++                    foreach (KeyValuePair<string, AnalyzeResult?> entry in result)
++                    {
++                        if (entry.Value != null)
++                        {
++                            analyses.TryAdd(entry.Key, entry.Value);
++                        }
++                    }
++                }
++            }
++
++            foreach (string target in targets)
++            {
++                if (!System.IO.Directory.Exists(target))
++                {
++                    diagnostics.Add("local_target_missing");
++                    continue;
++                }
++
++                List<string> files = new();
++                bool enumerated = CollectCoverageFiles(target, target, files, skippedPaths, diagnostics);
++                if (!enumerated)
++                {
++                    diagnostics.Add("file_inventory_incomplete");
++                }
++                if (files.Count == 0)
++                {
++                    diagnostics.Add("empty_target");
++                }
++
++                foreach (string file in files)
++                {
++                    string relative = Path.GetRelativePath(target, file)
++                        .Replace(Path.DirectorySeparatorChar, '/')
++                        .Replace(Path.AltDirectorySeparatorChar, '/');
++                    analyses.TryGetValue(file, out AnalyzeResult? analysis);
++                    if (analysis?.Metadata?.TotalFiles == 1)
++                    {
++                        scannedPaths.Add(relative);
++                    }
++                    else
++                    {
++                        diagnostics.Add("analysis_coverage_unverified");
++                        skippedPaths.Add(new CoverageSkippedPath(
++                            relative,
++                            analysis == null ? "analysis_unavailable" : "coverage_unverified"));
++                    }
++                }
++            }
++
++            CoverageReport report = new(1, scannedPaths, skippedPaths, diagnostics);
++            File.WriteAllText(coveragePath, JsonSerializer.Serialize(report));
++        }
++
++        private static string[] ExpandTargets(IList<string> targets)
++        {
++            List<string> expanded = new();
++            foreach (string target in targets)
++            {
++                if (!System.IO.Directory.Exists(target))
++                {
++                    expanded.Add(target);
++                    continue;
++                }
++
++                List<string> files = new();
++                CollectCoverageFiles(target, target, files, new(), new());
++                expanded.AddRange(files);
++            }
++            return expanded.ToArray();
++        }
++
++        private static bool CollectCoverageFiles(
++            string root,
++            string directory,
++            List<string> files,
++            List<CoverageSkippedPath> skippedPaths,
++            List<string> diagnostics)
++        {
++            bool complete = true;
++            try
++            {
++                foreach (string entry in System.IO.Directory.EnumerateFileSystemEntries(directory))
++                {
++                    string relative = Path.GetRelativePath(root, entry)
++                        .Replace(Path.DirectorySeparatorChar, '/')
++                        .Replace(Path.AltDirectorySeparatorChar, '/');
++                    FileAttributes attributes;
++                    try
++                    {
++                        attributes = File.GetAttributes(entry);
++                    }
++                    catch
++                    {
++                        skippedPaths.Add(new CoverageSkippedPath(relative, "metadata_unavailable"));
++                        diagnostics.Add("file_metadata_unavailable");
++                        complete = false;
++                        continue;
++                    }
++
++                    if ((attributes & FileAttributes.ReparsePoint) != 0)
++                    {
++                        skippedPaths.Add(new CoverageSkippedPath(relative, "reparse_point"));
++                        diagnostics.Add("reparse_point_skipped");
++                        complete = false;
++                    }
++                    else if ((attributes & FileAttributes.Directory) != 0)
++                    {
++                        complete &= CollectCoverageFiles(root, entry, files, skippedPaths, diagnostics);
++                    }
++                    else
++                    {
++                        files.Add(entry);
++                    }
++                }
++            }
++            catch
++            {
++                diagnostics.Add("directory_enumeration_failed");
++                complete = false;
++            }
++
++            return complete;
++        }
+         
+         private async Task<List<Dictionary<string, AnalyzeResult?>>> LegacyRunAsync(DetectBackdoorToolOptions options)
+@@ -133,7 +296,7 @@
+                 CharacteristicTool? characteristicTool = new CharacteristicTool(ProjectManagerFactory);
+                 CharacteristicToolOptions cOptions = new CharacteristicToolOptions
+                 {
+-                    Targets = options.Targets,
++                    Targets = ExpandTargets(targetList),
+                     DisableDefaultRules = true,
+                     CustomRuleDirectory = RULE_DIRECTORY,
+                     DownloadDirectory = options.DownloadDirectory,
+@@ -141,7 +304,6 @@
+                     Format = options.Format == "text" ? "none" : options.Format,
+                     OutputFile = options.OutputFile,
+                     AllowTagsInBuildFiles = true,
+-                    FilePathExclusions = ".md,LICENSE,.txt",
+                     AllowDupTags = true,
+                     SarifLevel = CodeAnalysis.Sarif.FailureLevel.Warning,
+                     EnableBacktracking = options.EnableBacktracking,
+diff --git a/src/Shared.CLI/Tools/CharacteristicTool.cs b/src/Shared.CLI/Tools/CharacteristicTool.cs
+--- a/src/Shared.CLI/Tools/CharacteristicTool.cs
++++ b/src/Shared.CLI/Tools/CharacteristicTool.cs
+@@ -59,4 +59,6 @@
+                 AllowAllTagsInBuildFiles = options.AllowTagsInBuildFiles,
+                 SingleThread = options.SingleThread,
+-                FilePathExclusions = options.FilePathExclusions?.Split(',') ?? Array.Empty<string>(),
++                FilePathExclusions = string.IsNullOrEmpty(options.FilePathExclusions)
++                    ? Array.Empty<string>()
++                    : options.FilePathExclusions.Split(','),
+                 EnableNonBacktrackingRegex = !options.EnableBacktracking

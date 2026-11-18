@@ -1,0 +1,4 @@
+exclude_extensions: []
+exclude_paths: []
+max_file_size: 8589934592
+skip_non_executable: false

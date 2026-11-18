@@ -7,13 +7,13 @@ reason, the wrapper:
 1. resolves the exact version document on registry.npmjs.org,
 2. downloads the tarball and verifies it against `dist.integrity` (sha512),
    so the scanner only ever sees bytes the registry vouched for,
-3. runs `supply scan-package npm <archive> --name --version --guarddog ...`,
-4. appends the resulting content findings to a shared JSONL file.
+3. runs `supply scan-package` against the verified staged archive and parses its JSON `ArtifactReport`,
+4. appends findings to a shared JSONL file.
 
-The JSONL file is what `snapshot-npm --findings` (and the field-test policy)
-enforce on later captures. Every candidate is scanned unless `--limit` asks
-for a subset; downloads are cached by name@version; every failure is recorded
-in content-scan.json and exits 1.
+The JSONL file is what `snapshot-npm --findings` enforces on later captures.
+Every candidate is scanned unless `--limit` asks for a subset. Downloads are
+cached by name@version. Incomplete scans remain held for retry; blocks are
+reported as scan outcomes, not process failures.
 """
 import argparse
 import base64
@@ -29,6 +29,7 @@ import time
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 
 REGISTRY = "https://registry.npmjs.org"
@@ -191,18 +192,32 @@ def guarddog_binary(explicit):
     return shutil.which("guarddog") or "guarddog"
 
 
-def guarddog_available(binary):
-    return Path(binary).exists() or shutil.which(binary) is not None
 
-
-def scan_package(binary, archive, name, version, findings_path, guarddog, timeout=600):
+def scan_package(
+    binary,
+    archive,
+    name,
+    version,
+    findings_path,
+    *,
+    scratch_dir=None,
+    guarddog=None,
+    ledger_db=None,
+    timeout=600,
+):
+    ledger_db = ledger_db or Path(
+        os.environ.get(
+            "SUPPLY_LEDGER_PATH",
+            Path.home() / ".local/share/supply-core/ledger.sqlite",
+        )
+    )
     command = [
         binary, "scan-package", "npm", str(archive),
         f"--name={name}", f"--version={version}",
-        f"--findings-out={findings_path}",
+        f"--findings-out={findings_path}", f"--ledger-db={ledger_db}", "--json",
     ]
-    if guarddog:
-        command.append("--guarddog")
+    if scratch_dir is not None:
+        command.append(f"--scratch-dir={scratch_dir}")
     environment = dict(os.environ)
     if guarddog:
         environment["GUARDDOG_BIN"] = guarddog
@@ -211,45 +226,70 @@ def scan_package(binary, archive, name, version, findings_path, guarddog, timeou
     completed = subprocess.run(
         command, capture_output=True, text=True, timeout=timeout, env=environment,
     )
-    if completed.returncode != 0:
+    if completed.returncode not in (0, 2, 3):
         detail = (completed.stderr or completed.stdout).strip()[:2000]
         raise RuntimeError(f"scan-package exited {completed.returncode}: {detail}")
-    output = completed.stdout.strip()
-    if not output.startswith("["):
-        return []
-    findings = json.loads(output)
-    if not isinstance(findings, list):
-        raise RuntimeError("scan-package did not return a finding list")
-    return findings
+    try:
+        report = json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("scan-package did not return a JSON report") from error
+    if not isinstance(report, dict):
+        raise RuntimeError("scan-package did not return an artifact report")
+    expected_exit = {"pass": 0, "review": 0, "block": 2, "incomplete": 3}.get(
+        report.get("decision")
+    )
+    if expected_exit is None or completed.returncode != expected_exit:
+        raise RuntimeError("scan-package exit code does not match its report")
+    if report.get("coverage") not in {"complete", "partial", "unknown"}:
+        raise RuntimeError("scan-package report has invalid coverage")
+    return report
 
 
-def summarize(findings):
+def summarize(report):
+    engines = report.get("engines") or []
+    findings = [
+        (engine.get("source", "unknown"), finding)
+        for engine in engines
+        for finding in engine.get("findings", [])
+    ]
+    policy_scores = [
+        Decimal(str(finding["policy_score"]))
+        for _, finding in findings
+        if finding.get("policy_score") is not None
+    ]
+    score = (
+        max(policy_scores)
+        if policy_scores and all(finding.get("policy_score") is not None for _, finding in findings)
+        else None if findings else Decimal(0)
+    )
+    if score is not None:
+        score = int(score) if score == score.to_integral_value() else float(score)
     return {
+        "decision": report.get("decision"),
+        "coverage": report.get("coverage"),
         "findings": len(findings),
-        "score": max((finding.get("score", 0) for finding in findings), default=0),
-        "rules": sorted({rule for finding in findings for rule in finding.get("rules", [])}),
-        "sources": sorted({finding.get("source", "unknown") for finding in findings}),
+        "score": score,
+        "rules": sorted({finding.get("rule", "unknown") for _, finding in findings}),
+        "sources": sorted({source for source, _ in findings}),
     }
 
 
+
+
 INCOMPLETE_RULE = "scan-incomplete"
-INCOMPLETE_SCORE = 8
 
 
-def incomplete_record(name, version, reason, guarddog):
-    """A block-level record that keeps a version held until a scan completes.
-
-    Fail closed: if a version escapes the quarantine window before any
-    successful content scan, this record is what still blocks it. The engine
-    tag keeps a static-only run from clearing a GuardDog-pending hold.
-    """
+def incomplete_record(name, version, reason, artifact_sha256=None, policy_sha256=None):
+    """Record incomplete scan evidence with its known artifact and policy identity."""
     return {
         "ecosystem": "Npm",
         "package": name,
         "version": version,
         "source": "quarantine-scan",
-        "score": INCOMPLETE_SCORE,
-        "rules": [INCOMPLETE_RULE, "guarddog" if guarddog else "static"],
+        "scan_incomplete": True,
+        "artifact_sha256": artifact_sha256,
+        "policy_sha256": policy_sha256,
+        "rules": [INCOMPLETE_RULE],
         "summary": f"quarantine content scan incomplete ({reason[:200]})",
         "detected_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -267,12 +307,10 @@ def append_record(path, record):
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
-def clear_incomplete(path, name, version, includes_guarddog):
-    """Remove stale scan-incomplete records for one package version.
-
-    A static-only run only clears static-tagged records: a GuardDog-pending
-    hold survives until a scan that actually includes GuardDog succeeds.
-    """
+def clear_incomplete(path, name, version, artifact_sha256, policy_sha256):
+    """Clear only incomplete holds for the exact artifact and policy revision."""
+    if artifact_sha256 is None or policy_sha256 is None:
+        return 0
     with path.with_suffix(".lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
@@ -290,12 +328,12 @@ def clear_incomplete(path, name, version, includes_guarddog):
                     continue
                 rules = record.get("rules") if isinstance(record, dict) else None
                 is_incomplete = isinstance(rules, list) and INCOMPLETE_RULE in rules
-                guarddog_pending = is_incomplete and "guarddog" in rules
                 if (
                     is_incomplete
                     and record.get("package") == name
                     and record.get("version") == version
-                    and (includes_guarddog or not guarddog_pending)
+                    and record.get("artifact_sha256") == artifact_sha256
+                    and record.get("policy_sha256") == policy_sha256
                 ):
                     removed += 1
                 else:
@@ -357,7 +395,20 @@ def main():
     parser.add_argument("--cache", type=Path, default=None, help="tarball cache directory")
     parser.add_argument("--findings", type=Path, default=None, help="shared findings JSONL")
     parser.add_argument("--guarddog-bin", default=None, help="GuardDog executable")
-    parser.add_argument("--no-guarddog", action="store_true", help="static rules only")
+    parser.add_argument(
+        "--scratch-dir",
+        type=Path,
+        default=Path(os.environ["SUPPLY_SCRATCH_DIR"])
+        if os.environ.get("SUPPLY_SCRATCH_DIR")
+        else None,
+        help="dedicated scan scratch directory (default: SUPPLY_SCRATCH_DIR)",
+    )
+    parser.add_argument(
+        "--ledger-db",
+        type=Path,
+        default=Path(os.environ.get("SUPPLY_LEDGER_PATH", Path.home() / ".local/share/supply-core/ledger.sqlite")),
+        help="durable local ledger outbox",
+    )
     args = parser.parse_args()
 
     if not args.day_dir.is_dir():
@@ -389,36 +440,16 @@ def main():
 
     report = {
         "captured_at": datetime.now(timezone.utc).isoformat(),
+        "ledger_status": "ledger_pending",
         "day": args.day_dir.name,
-        "guarddog": None if args.no_guarddog else guarddog,
+        "guarddog": guarddog,
         "candidates": len(packages),
         "scanned": [],
+        "blocked": [],
         "errors": [],
     }
-
-    # Without GuardDog the static rules still run, but the configured scan set
-    # is incomplete: hold every candidate until a full scan succeeds.
-    if not args.no_guarddog and not guarddog_available(guarddog):
-        print(f"scan-quarantine: guarddog not found at {guarddog}", file=sys.stderr)
-        for package in packages:
-            name, version = package["package"], package["version"]
-            report["errors"].append(
-                {"package": name, "version": version, "error": "guarddog unavailable"}
-            )
-            try:
-                append_record(
-                    findings_path,
-                    incomplete_record(name, version, "guarddog unavailable", guarddog=True),
-                )
-            except OSError as error:
-                report["errors"].append(
-                    {"package": name, "version": version, "error": f"could not record: {error}"}
-                )
-        summary_path = write_summary(report, args.day_dir)
-        print(f"content scan: 0 scanned, {len(report['errors'])} errors -> {summary_path}")
-        return 2
-
     for package in packages:
+        scan_report = None
         name, version = package["package"], package["version"]
         try:
             tarball, integrity = parse_version_document(
@@ -426,24 +457,63 @@ def main():
             )
             archive = cache / safe_file_name(name, version)
             ensure_archive(archive, tarball, integrity)
-            findings = scan_package(
-                binary, archive, name, version, findings_path,
-                guarddog=None if args.no_guarddog else guarddog,
+            scan_report = scan_package(
+                binary,
+                archive,
+                name,
+                version,
+                findings_path,
+                scratch_dir=args.scratch_dir,
+                guarddog=guarddog,
+                ledger_db=args.ledger_db,
             )
-            cleared = clear_incomplete(
-                findings_path, name, version, includes_guarddog=not args.no_guarddog
+            summary = summarize(scan_report)
+            report["scanned"].append({"package": name, "version": version, **summary})
+            if summary["decision"] == "block":
+                report["blocked"].append({"package": name, "version": version})
+            if summary["coverage"] != "complete" or summary["decision"] == "incomplete":
+                detail = scan_report.get("reason") or "required scanner coverage incomplete"
+                report["errors"].append(
+                    {"package": name, "version": version, "error": detail}
+                )
+                append_record(
+                    findings_path,
+                    incomplete_record(
+                        name,
+                        version,
+                        detail,
+                        scan_report.get("artifact_sha256"),
+                        scan_report.get("policy_sha256"),
+                    ),
+                )
+            else:
+                cleared = clear_incomplete(
+                    findings_path,
+                    name,
+                    version,
+                    scan_report.get("artifact_sha256"),
+                    scan_report.get("policy_sha256"),
+                )
+                if cleared:
+                    print(f"cleared {cleared} stale scan-incomplete record(s) for {name}@{version}")
+            print(
+                f"{summary['decision'].upper()} {name}@{version} "
+                f"findings={summary['findings']} coverage={summary['coverage']}"
             )
-            if cleared:
-                print(f"cleared {cleared} stale scan-incomplete record(s) for {name}@{version}")
-            report["scanned"].append({"package": name, "version": version, **summarize(findings)})
-            print(f"OK   {name}@{version} findings={len(findings)}")
         except Exception as error:  # noqa: BLE001 - every failure is evidence
             detail = str(error)
             report["errors"].append({"package": name, "version": version, "error": detail})
+            scan_identity = scan_report if isinstance(scan_report, dict) else {}
             try:
                 append_record(
                     findings_path,
-                    incomplete_record(name, version, detail, guarddog=not args.no_guarddog),
+                    incomplete_record(
+                        name,
+                        version,
+                        detail,
+                        scan_identity.get("artifact_sha256"),
+                        scan_identity.get("policy_sha256"),
+                    ),
                 )
             except OSError as record_error:
                 report["errors"].append(

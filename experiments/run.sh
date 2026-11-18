@@ -11,6 +11,7 @@ DIR="$DATA/$DAY"
 OSV_CACHE="$DATA/osv-cache"
 POLICY="$HERE/policy.yml"
 FINDINGS="$DATA/content-findings.jsonl"
+LEDGER_DB="${SUPPLY_LEDGER_PATH:-$DATA/ledger.sqlite}"
 mkdir -p "$DIR"
 rm -f "$DIR"/*
 failed=0
@@ -27,7 +28,7 @@ while IFS=$'\t' read -r name root tracks; do
       if [ -f "$POLICY" ]; then extra+=(--policy "$POLICY"); fi
       if [ -f "$FINDINGS" ]; then extra+=(--findings "$FINDINGS"); fi
       start=$(python3 -c 'import time; print(time.time())')
-      if "$BIN" snapshot-npm "$root" --osv --osv-cache "$OSV_CACHE" ${extra[@]+"${extra[@]}"} > "$out" 2>"$DIR/$name.npm.err"; then
+      if "$BIN" snapshot-npm "$root" --ledger-db "$LEDGER_DB" --osv --osv-cache "$OSV_CACHE" ${extra[@]+"${extra[@]}"} > "$out" 2>"$DIR/$name.npm.err"; then
         if ! python3 - "$out" <<'PY'
 import json, sys
 doc = json.load(open(sys.argv[1]))

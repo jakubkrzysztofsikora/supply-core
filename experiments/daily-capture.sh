@@ -19,6 +19,7 @@ mkdir -p "$HERE/data" || exit 1
 export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+export SUPPLY_LEDGER_PATH="${SUPPLY_LEDGER_PATH:-$HERE/data/ledger.sqlite}"
 
 # This private file supplies SUPPLY_STATUS_URL and SUPPLY_STATUS_AUTH_TOKEN.
 # It stays outside the repository because cron does not inherit shell secrets.
@@ -60,13 +61,14 @@ cd "$ROOT" || exit 1
   if [ "$run_rc" -ne 0 ]; then
     echo "ERROR: run.sh failed (exit $run_rc)"
   else
-    # Content-scan the versions this capture holds in the quarantine window
-    # (GuardDog plus the static AI/agent rules). Runs before publishing so the
-    # snapshot can carry today's suspected findings, and runs even if status
-    # publishing fails. Findings append to the shared JSONL that run.sh
-    # enforces through policy.yml on later captures.
     scan_rc=0
+    scratch_args=()
+    if [ -n "${SUPPLY_SCRATCH_DIR:-}" ]; then
+      scratch_args+=(--scratch-dir "$SUPPLY_SCRATCH_DIR")
+    fi
     python3 "$HERE/scan-quarantine.py" "$HERE/data/$DAY" --bin "$BIN" \
+      "${scratch_args[@]}" \
+      --ledger-db "$SUPPLY_LEDGER_PATH" \
       --findings "$HERE/data/content-findings.jsonl" || scan_rc=$?
     if [ "$scan_rc" -ne 0 ]; then
       echo "ERROR: content scan failed (exit $scan_rc)"

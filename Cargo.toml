@@ -16,19 +16,29 @@ http = "1"
 regex = "1"
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"], default-features = false }
 semver = { version = "1", features = ["serde"] }
+node-semver = "2.2"
+pep440_rs = "0.7"
+quick-xml = "0.42"
+rust_decimal = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_norway = "0.9"
 tar = "0.4"
 sha2 = "0.10"
+getrandom = "0.4"
+rusqlite = { version = "0.42", features = ["bundled"] }
+serde_json_canonicalizer = "0.4"
 tokio = { version = "1", features = ["full"] }
 toml = "0.8"
 tower-http = { version = "0.6", features = ["trace"] }
 urlencoding = "2"
 walkdir = "2"
+zstd = "=0.13.3"
+zip = { version = "=9.2.2", default-features = false, features = ["deflate-flate2"] }
 
 [dev-dependencies]
 tempfile = "3"
+sigstore-merkle = "0.16"
 tower = { version = "0.5", features = ["util"] }
 
 [lints.clippy]

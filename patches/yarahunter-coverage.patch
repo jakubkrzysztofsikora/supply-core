@@ -1,0 +1,94 @@
+diff --git a/pkg/scan/scanner.go b/pkg/scan/scanner.go
+--- a/pkg/scan/scanner.go
++++ b/pkg/scan/scanner.go
+@@ -3,4 +3,5 @@
+ import (
++	"encoding/json"
+ 	"fmt"
+ 	"os"
+ 	"sync"
+@@ -33,7 +34,16 @@
+ type Scanner struct {
+ 	hostMountPath string
+ 	YaraScanner   *yara.Scanner
+ 	ScanID        string
+ 
+ 	Filters cfg.Filters
+ }
++
++type supplyCoreCoverage struct {
++	SchemaVersion  int      `json:"schema_version"`
++	UpstreamCommit string   `json:"upstream_commit"`
++	PatchRevision  string   `json:"patch_revision"`
++	ScannedPaths   []string `json:"scanned_paths"`
++	SkippedPaths   []string `json:"skipped_paths"`
++	Errors         []string `json:"errors"`
++}
+@@ -68,6 +78,10 @@
+ func (s *Scanner) Scan(ctx *tasks.ScanContext, stype ScanType, namespace, id string, scanID string, outputFn func(output.IOCFound, string)) error {
+ 	var (
+ 		extract extractor.FileExtractor
+ 		err     error
+ 		wg      sync.WaitGroup
++		coverageMu   sync.Mutex
++		scannedPaths []string
++		skippedPaths []string
++		scanErrors   []string
+ 	)
+@@ -108,19 +122,29 @@
+ 	genscan.ApplyScan(ctx.Context, extract, func(f extractor.ExtractedFile) {
+ 		if ctx != nil {
+-			err := ctx.Checkpoint("scan_phase")
+-			if err != nil {
++			if checkpointErr := ctx.Checkpoint("scan_phase"); checkpointErr != nil {
++				coverageMu.Lock()
++				scanErrors = append(scanErrors, fmt.Sprintf("%s: checkpoint failed", f.Filename))
++				coverageMu.Unlock()
+ 				return
+ 			}
+ 		}
+ 
+ 		if s.Filters.SkipNonExecutable && !IsExecAll(f.FilePermissions) {
+ 			log.Debug().Str("file", f.Filename).Msg("Skipping non-executable file")
++			coverageMu.Lock()
++			skippedPaths = append(skippedPaths, f.Filename)
++			coverageMu.Unlock()
+ 			return
+ 		}
+ 
+-		err = ScanFile(s, f.Filename, f.Content, f.ContentSize, &m[i], "")
+-		if err != nil {
+-			log.Warn().Err(err).Str("file", f.Filename).Msg("scan file error")
++		fileErr := ScanFile(s, f.Filename, f.Content, f.ContentSize, &m[i], "")
++		coverageMu.Lock()
++		if fileErr != nil {
++			log.Warn().Err(fileErr).Str("file", f.Filename).Msg("scan file error")
++			scanErrors = append(scanErrors, fmt.Sprintf("%s: scan failed", f.Filename))
++		} else {
++			scannedPaths = append(scannedPaths, f.Filename)
+ 		}
++		coverageMu.Unlock()
+ 
+ 		results <- m[i]
+@@ -131,4 +155,21 @@
+ 	close(results)
+ 	wg.Wait()
++	if coveragePath := os.Getenv("SUPPLY_CORE_YARAHUNTER_COVERAGE_PATH"); coveragePath != "" {
++		coverage := supplyCoreCoverage{
++			SchemaVersion:  1,
++			UpstreamCommit: "8cb5a008056a407cf5a273fabb0ecf6626acd50e",
++			PatchRevision:  "supply-core-yarahunter-coverage-v1",
++			ScannedPaths:   scannedPaths,
++			SkippedPaths:   skippedPaths,
++			Errors:         scanErrors,
++		}
++		payload, err := json.Marshal(coverage)
++		if err != nil {
++			return err
++		}
++		if err := os.WriteFile(coveragePath, payload, 0600); err != nil {
++			return err
++		}
++	}
+ 	return nil
+ }
