@@ -246,6 +246,7 @@ server over the compose network. Captures land in `radar/data/`. Without the
 - Local health check: `curl http://localhost:4873/health`
 - Pre-built binary download: `curl -sSL https://supply-core.example.com/api/v1/download/supply-core-linux-x86_64 -o supply-core` (falls back to a redirect to GitHub Releases when the artifact cache is empty)
 - Remote pipeline scan: set `SUPPLY_AUTH_TOKEN` on the server and include a matching bearer token in scan requests.
+- **Server state**: `GET /api/v1/health` returns `status`, `service`, `version`, `features`, `artifacts_dir_configured`, `auth_configured`, and `tailnet` when configured. `GET /api/v1/version` returns `version`, `service`, `repository`, `download_base`, and downloadable `artifacts`.
 - **Status card**: `GET /api/v1/status/card.svg` renders quarantine, confirmed CVEs, suspected scan findings, and incomplete scans. `GET /api/v1/status` returns service metadata, quarantine data, and optional scan details. Both GET endpoints are public and read-only; the SVG card caches for 5 minutes.
 - **Status publishing**: the daily capture publishes package/version results, quarantine records, and sanitized scan details. Incomplete records cap at 1,000, with omitted count reported. No repository paths, file contents, raw scanner errors, or arbitrary tool output leave the publisher. Store publisher settings outside the repository at `~/.config/supply-core/status-publisher.env`:
 

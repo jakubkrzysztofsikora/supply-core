@@ -31,7 +31,7 @@ jobs:
           toolchain: stable
           components: llvm-tools-preview
       - run: cargo install cargo-llvm-cov --version 0.9.1 --locked
-      - run: cargo llvm-cov --locked --lib --fail-under-lines 85 --summary-only
+      - run: cargo llvm-cov --locked --fail-under-lines 85 --summary-only
   registry-e2e:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
