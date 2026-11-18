@@ -101,6 +101,14 @@ impl<'a> PackageEvaluator<'a> {
             ));
         }
         if ecosystem_policy.require_integrity && version.integrity.is_none() {
+            if let Some(query_version_text) = query_version_text {
+                let findings =
+                    self.vulns
+                        .query_version(ecosystem.clone(), name, query_version_text)?;
+                if let Some(reason) = self.vulnerability_reason(&findings) {
+                    return self.fallback_or_block(version, requested, version_text, reason);
+                }
+            }
             return self.fallback_or_block(
                 version,
                 requested,
