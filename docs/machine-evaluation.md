@@ -52,17 +52,16 @@ Each timestamped `runs/<timestamp>/` directory contains:
 - `summary.json`: OSV matches, Action policy findings, coverage gaps and errors.
 - `report.md`: readable findings and coverage report.
 
-`latest.json` points to the latest completed evaluation through its
-`run_directory`. `baseline.json` preserves the first completed run without
-evaluation errors (explicit format coverage gaps remain recorded). Failed runs
-remain in their run directories. Comparisons are disabled if either run has errors or if discovery
-roots, the binary, or runner change. No failed query is treated as a clean
-result. Exit 2 means incomplete evaluation; findings alone do not fail an
-observational run. Repository-level environment anomalies (unreadable or
-mutating checkouts, missing tracked files, unresolved HEAD, slow filesystems)
-are recorded as coverage gaps and do not fail the run. Discovery I/O and
-submodule-inspection problems are recorded as discovery warnings. An
-interrupted run may leave a directory without a summary.
+`latest.json` points to the latest evaluation through its `run_directory`.
+`baseline.json` is written only after a complete run without errors, gaps, or
+discovery warnings. Failed or incomplete runs remain in their run directories.
+Comparisons are disabled if either run is incomplete or discovery roots, the
+binary, or runner change. No failed query is treated as a clean result. Exit 2
+means incomplete evaluation; advisory findings alone do not fail a complete
+observational run. Repository anomalies are recorded and the evaluation keeps
+inspecting remaining inputs, but errors, coverage gaps, discovery warnings, or
+an empty repository set make the final result incomplete. An interrupted run
+may leave a directory without a summary.
 
 Logs append to `launchd.log` and `launchd.err`. The run lock prevents overlaps.
 The installer optionally retires the original `experiments/daily-capture.sh`
@@ -81,16 +80,18 @@ Only the manifest beside a Yarn lockfile is mapped; nested workspace manifests
 remain explicit gaps until workspace mapping is supported.
 Unsupported versions, custom sources, unmapped manifests, and pnpm/bun lockfiles
 remain explicit coverage gaps. Yarn Berry is not supported. Missing tracked
-files and unresolved HEAD are recorded as coverage gaps without aborting other
-inputs.
+files and unresolved HEAD are recorded as gaps; the evaluator continues with
+other inputs but returns an incomplete result.
 
 Python `requirements.txt` exact pins (`==`, `===`) and NuGet `packages.lock.json`
 resolved entries are evaluated too; ranges, environment markers, options and
-URL requirements in requirements files are recorded as gaps. The input
-inventory also lists other common Python, Rust, Go, Ruby and PHP
-manifests/lockfiles for adapter prioritization; inventory of those does not mean
-they have been checked against advisories. Summary counts exclude paths pruned
-by directory policy; the detailed inventory retains them as excluded.
+URL requirements in requirements files are recorded as gaps. The input inventory
+also lists other common Python, Rust, Go, Ruby and PHP manifests/lockfiles for
+adapter prioritization; inventory of those does not mean they have been checked
+against advisories. Tracked .NET project files require a sibling tracked
+`packages.lock.json`; an untracked or missing lock is a coverage gap. Summary
+counts exclude paths pruned by directory policy; the detailed inventory retains
+them as excluded.
 
 Unique package/version pairs are queried against OSV's fixed public batch API,
 100 per request, with a shared 24-hour cache in trusted local state. Only npm,
@@ -102,6 +103,7 @@ evaluations.
 The Rust scanner evaluates working-tree GitHub workflows, including untracked
 ones. Findings are file-level because the parser does not retain source spans.
 Workflow inputs have per-file and aggregate size limits and a process timeout.
+Workflow symlinks are reported as coverage gaps.
 
 This run does not measure package age/quarantine, installed-byte integrity,
 actual exploitability, or RubyGems/Cargo/Maven/Go ecosystems. Lockfiles describe
@@ -112,9 +114,7 @@ runner is archived before a successful run establishes a usable baseline.
 
 ## Verification
 
-```bash
-python3 -m unittest discover -s experiments -p test_machine_eval.py
-```
+python3 -m unittest discover -s experiments -p 'test_*.py'
 
 Use `--inventory-only` on the installed runner to inspect scope without OSV
 requests. Stop scheduling with:

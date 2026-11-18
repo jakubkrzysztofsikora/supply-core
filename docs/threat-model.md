@@ -14,17 +14,28 @@ trust model.
 2. **Trusted transport.** TLS to the upstream registry is assumed intact
    (CA-pinned system roots, `rustls`). An attacker who breaks TLS
    controls both metadata and tarballs.
-3. **Integrity strings are authoritative.** `dist.integrity` (npm),
-   `digests.sha256` (PyPI JSON API), and the NuGet registration `packageHash`
-   are treated as ground truth. `requirements.txt --hash` values and
-   `packages.lock.json contentHash` fields are treated as the caller's pinned
-   expectations and are verified against the registry before acceptance; a
-   mismatch fails closed. A registry that lies consistently (matching bytes +
-   matching hash) is out of scope until signed provenance/attestation checks
-   exist. Docker images are content-addressed: a `@sha256:` digest is
-   immutable by construction, but the digest's provenance is not verified.
-4. **Source inputs are read-only.** Lockfiles, manifests, and Dockerfiles are
-   parsed, never executed; the scanners do not run package managers.
+3. **Integrity strings are authoritative.** npm lock SRI selects its strongest
+   supported algorithm and requires every locked digest for that algorithm to
+   match registry `dist.integrity`; historical SHA-1 pins use `dist.shasum`.
+   A missing matching algorithm fails closed. Full configured npm registry URL
+   paths and NuGet feed URLs remain separate source identities, including feeds
+   on the same host; report `source` strips credentials, queries, and fragments
+   only. PyPI `digests.sha256` and the NuGet registration `packageHash` identify
+   published archive bytes. NuGet `packages.lock.json contentHash` excludes the
+   `.signature.p7s` entry. `scan-packages` recomputes that signature-independent
+   hash from restored package bytes, then checks archive SHA-512 against both
+   the cache sidecar and each full NuGet feed identity's registry `packageHash`;
+   when a feed's `catalogEntry` is unfetchable (Azure Artifacts commitLog URLs
+   404 under basic auth), assessment continues from the same authenticated
+   registration leaf, and packages without registry archive metadata fail closed.
+   `snapshot-nuget` has no restored archive and does not verify lock
+   `contentHash`. A registry that lies consistently (matching bytes + matching
+   hash) is out of scope until signed provenance/attestation checks exist.
+   Docker images are content-addressed: a `@sha256:` digest is immutable by
+   construction, but the digest's provenance is not verified.
+4. **Source code is not executed.** Lockfiles, manifests, and Dockerfiles are
+   parsed; `scan-packages` invokes npm only to query exact-version metadata and
+   does not install packages or execute their contents.
 
 ## Controls
 
@@ -36,7 +47,7 @@ trust model.
 | Denylisted package | Unconditional Block; frozen fallback can never serve a denied package |
 | Known vulnerable version | Every active OSV advisory blocks regardless of severity, then range-aware fallback. Other sources use the configured severity policy |
 | Malicious pip artifact swapping (sdist vs wheel) | `--hash`-pinned requirement sets filter candidate artifacts before selection; the newest hash-authorized artifact drives the age check; unpinned or non-sha256 hashes are explicit gaps/errors |
-| NuGet lockfile edit or stale resolution | Every resolved lock entry requires a `contentHash`; conflicting hashes across targets are gaps; the lock hash must equal the registry `packageHash` or evaluation fails closed |
+| NuGet lockfile edit or stale resolution | Every resolved lock entry requires a `contentHash`; `scan-packages` recomputes the signature-excluded NuGet content hash from cached `.nupkg` bytes, then checks archive SHA-512 against the cache sidecar and that full feed's registry `packageHash`; same-host feeds are assessed independently |
 | Floating container tag silently replaced | `scan-docker` blocks `FROM`/compose `image:` references without a valid 64-hex `@sha256:` digest; unresolved variable references are blocked too |
 | Frozen fallback crossing ecosystems | Frozen-artifact lookups are scoped by ecosystem; an npm artifact can never satisfy a pip/NuGet fallback |
 | False-positive approval abuse | Local approval requires matching real/effective Unix UIDs and a private, owner-owned ledger; it binds to one artifact digest, finding ID, engine-policy revision, and expiry |
@@ -59,5 +70,7 @@ trust model.
   local archive, but only on Linux, where its sandboxed scanners run.
 - The Linux sandbox mounts a private scratch directory over `/tmp`, so scanner
   binaries installed under `/tmp` are unreachable; install them elsewhere.
+- NuGet integrity ends at the verified `.nupkg` archive; extracted
+  global-packages files are not compared byte-for-byte against it.
 - `ArtifactStore::get` still takes caller-supplied paths; constrained
   before the HTTP serve endpoint lands.

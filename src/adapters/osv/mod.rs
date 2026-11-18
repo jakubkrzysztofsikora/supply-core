@@ -17,6 +17,9 @@ impl VulnerabilitySource for NoopVulnerabilitySource {
     ) -> Result<Vec<VulnerabilityFinding>> {
         Ok(vec![])
     }
+    fn query_version(&self, _: Ecosystem, _: &str, _: &str) -> Result<Vec<VulnerabilityFinding>> {
+        Ok(vec![])
+    }
 }
 
 /// HTTP POST contract used by [`OsvVulnerabilitySource`]. Isolated as a
@@ -144,15 +147,22 @@ impl VulnerabilitySource for OsvVulnerabilitySource {
         name: &str,
         version: &PackageVersionId,
     ) -> Result<Vec<VulnerabilityFinding>> {
+        self.query_version(ecosystem, name, version.upstream())
+    }
+    fn query_version(
+        &self,
+        ecosystem: Ecosystem,
+        name: &str,
+        version: &str,
+    ) -> Result<Vec<VulnerabilityFinding>> {
         if matches!(
             ecosystem,
             Ecosystem::GitHubActions | Ecosystem::AzurePipelines | Ecosystem::DockerImage
         ) {
-            // OSV does not index Actions or Pipelines; the firewall does not act on
-            // them. Return empty rather than spending a request.
             return Ok(vec![]);
         }
-        let path = self.cache_path(&ecosystem, name, version);
+        let version_id = PackageVersionId::parse(&ecosystem, version)?;
+        let path = self.cache_path(&ecosystem, name, &version_id);
         if let Some(p) = path.as_ref() {
             if fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
                 anyhow::bail!("OSV cache entry must not be a symlink");
@@ -172,7 +182,7 @@ impl VulnerabilitySource for OsvVulnerabilitySource {
 
         let body = serde_json::json!({
             "package": {"name": name, "ecosystem": ecosystem_label(&ecosystem)},
-            "version": version.upstream(),
+            "version": version,
         });
         let raw = self.transport.post_json(&self.url, &body)?;
         anyhow::ensure!(raw.is_object(), "invalid OSV response");
@@ -193,7 +203,6 @@ impl VulnerabilitySource for OsvVulnerabilitySource {
                 fetched_at: chrono::Utc::now(),
                 findings: findings.clone(),
             };
-            // Replace atomically; never truncate a caller-planted destination.
             let temporary = p.with_extension(format!("{}.tmp", std::process::id()));
             if let Ok(mut f) = fs::OpenOptions::new()
                 .write(true)
@@ -424,6 +433,26 @@ mod tests {
         assert_eq!(score_to_severity(6.9), Severity::Medium);
         assert_eq!(score_to_severity(4.0), Severity::Medium);
         assert_eq!(score_to_severity(3.9), Severity::Low);
+    }
+
+    #[test]
+    fn nuget_four_part_version_is_forwarded_unmodified_to_osv() {
+        let request = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured = request.clone();
+        let transport = move |_: &str, body: &serde_json::Value| -> Result<serde_json::Value> {
+            *captured.lock().unwrap() = Some(body.clone());
+            Ok(serde_json::json!({}))
+        };
+        let source = OsvVulnerabilitySource::new(Box::new(transport));
+
+        source
+            .query_version(Ecosystem::NuGet, "Example", "1.2.3.4")
+            .unwrap();
+
+        assert_eq!(
+            request.lock().unwrap().as_ref().unwrap()["version"],
+            "1.2.3.4"
+        );
     }
 
     #[test]

@@ -15,6 +15,15 @@ pub trait VulnerabilitySource: Send + Sync {
         name: &str,
         version: &PackageVersionId,
     ) -> Result<Vec<VulnerabilityFinding>>;
+    fn query_version(
+        &self,
+        ecosystem: Ecosystem,
+        name: &str,
+        version: &str,
+    ) -> Result<Vec<VulnerabilityFinding>> {
+        let version = PackageVersionId::parse(&ecosystem, version)?;
+        self.query(ecosystem, name, &version)
+    }
 }
 pub trait MetadataStore: Send + Sync {
     fn save_decision(&self, decision: &Decision) -> Result<()>;

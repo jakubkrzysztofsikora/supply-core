@@ -10,6 +10,7 @@ use std::path::Path;
 pub mod ai_scanner;
 pub mod image_scanner;
 pub mod ledger;
+pub mod packages;
 pub mod scanner;
 
 #[derive(Debug, Clone, Copy)]
@@ -71,13 +72,31 @@ impl<'a> PackageEvaluator<'a> {
         version: &PackageVersion,
         requested: VersionSelection<'_>,
     ) -> Result<Decision> {
+        let version_text = version.version.to_string();
+        self.evaluate_with_version(version, requested, &version_text, None)
+    }
+    pub(crate) fn evaluate_with_version_string(
+        &self,
+        version: &PackageVersion,
+        requested: VersionSelection<'_>,
+        version_text: &str,
+    ) -> Result<Decision> {
+        self.evaluate_with_version(version, requested, version_text, Some(version_text))
+    }
+    fn evaluate_with_version(
+        &self,
+        version: &PackageVersion,
+        requested: VersionSelection<'_>,
+        version_text: &str,
+        query_version_text: Option<&str>,
+    ) -> Result<Decision> {
         let name = &version.package.name;
         let ecosystem = version.package.ecosystem.clone();
         let ecosystem_policy = self.ecosystem_policy(&ecosystem);
         if ecosystem_policy.deny.contains(name) {
             return Ok(Decision::block(
                 name,
-                Some(version.version.to_string()),
+                Some(version_text.to_string()),
                 "package is denylisted",
             ));
         }
@@ -85,6 +104,7 @@ impl<'a> PackageEvaluator<'a> {
             return self.fallback_or_block(
                 version,
                 requested,
+                version_text,
                 "package version is missing integrity",
             );
         }
@@ -98,6 +118,7 @@ impl<'a> PackageEvaluator<'a> {
                     return self.fallback_or_block(
                         version,
                         requested,
+                        version_text,
                         format!("content scan incomplete: {}", finding.summary),
                     );
                 };
@@ -105,6 +126,7 @@ impl<'a> PackageEvaluator<'a> {
                     return self.fallback_or_block(
                         version,
                         requested,
+                        version_text,
                         format!(
                             "content scan: {} [{}]",
                             finding.summary,
@@ -121,11 +143,14 @@ impl<'a> PackageEvaluator<'a> {
                 }
             }
         }
-        let findings = self
-            .vulns
-            .query(ecosystem.clone(), name, &version.version)?;
+        let findings = if let Some(query_version_text) = query_version_text {
+            self.vulns
+                .query_version(ecosystem.clone(), name, query_version_text)?
+        } else {
+            self.vulns.query(ecosystem.clone(), name, &version.version)?
+        };
         if let Some(reason) = self.vulnerability_reason(&findings) {
-            return self.fallback_or_block(version, requested, reason);
+            return self.fallback_or_block(version, requested, version_text, reason);
         }
         if is_version_quarantined(
             version.published_at,
@@ -135,10 +160,11 @@ impl<'a> PackageEvaluator<'a> {
             return self.fallback_or_block(
                 version,
                 requested,
+                version_text,
                 "package version is inside quarantine window",
             );
         }
-        let mut decision = Decision::allow(name.clone(), version.version.to_string());
+        let mut decision = Decision::allow(name.clone(), version_text.to_string());
         if let Some(warning) = review_warning {
             decision.warnings.push(warning);
         }
@@ -157,18 +183,18 @@ impl<'a> PackageEvaluator<'a> {
         &self,
         version: &PackageVersion,
         requested: VersionSelection<'_>,
+        requested_version_text: &str,
         reason: impl Into<String>,
     ) -> Result<Decision> {
         let name = &version.package.name;
         let ecosystem = &version.package.ecosystem;
-        let requested_version = &version.version;
         let reason = reason.into();
         let ecosystem_policy = self.ecosystem_policy(ecosystem);
         let requested_range = match requested {
             VersionSelection::Exact => {
                 return Ok(Decision::block(
                     name,
-                    Some(requested_version.to_string()),
+                    Some(requested_version_text.to_string()),
                     reason,
                 ));
             }
@@ -178,7 +204,7 @@ impl<'a> PackageEvaluator<'a> {
             let Some(tarball_url) = version.tarball_url.as_deref() else {
                 return Ok(Decision::block(
                     name,
-                    Some(requested_version.to_string()),
+                    Some(requested_version_text.to_string()),
                     format!("{reason}; registry source cannot be derived for frozen fallback"),
                 ));
             };
@@ -187,7 +213,7 @@ impl<'a> PackageEvaluator<'a> {
                 Err(_) => {
                     return Ok(Decision::block(
                         name,
-                        Some(requested_version.to_string()),
+                        Some(requested_version_text.to_string()),
                         format!("{reason}; registry source cannot be derived for frozen fallback"),
                     ));
                 }
@@ -202,7 +228,7 @@ impl<'a> PackageEvaluator<'a> {
                 if let Some(fallback_reason) = self.vulnerability_reason(&findings) {
                     return Ok(Decision::block(
                         name,
-                        Some(requested_version.to_string()),
+                        Some(requested_version_text.to_string()),
                         format!(
                             "{reason}; frozen fallback {} blocked: {fallback_reason}",
                             frozen.version
@@ -217,7 +243,7 @@ impl<'a> PackageEvaluator<'a> {
                         if finding.scan_incomplete || finding.score.is_none() {
                             return Ok(Decision::block(
                                 name,
-                                Some(requested_version.to_string()),
+                                Some(requested_version_text.to_string()),
                                 format!(
                                     "{reason}; frozen fallback {} blocked: content scan incomplete: {}",
                                     frozen.version, finding.summary
@@ -229,7 +255,7 @@ impl<'a> PackageEvaluator<'a> {
                         }) {
                             return Ok(Decision::block(
                                 name,
-                                Some(requested_version.to_string()),
+                                Some(requested_version_text.to_string()),
                                 format!(
                                     "{reason}; frozen fallback {} blocked: content scan {}",
                                     frozen.version, finding.summary
@@ -240,7 +266,7 @@ impl<'a> PackageEvaluator<'a> {
                 }
                 return Ok(Decision::fallback(
                     name,
-                    requested_version.to_string(),
+                    requested_version_text.to_string(),
                     frozen.version.to_string(),
                     reason,
                 ));
@@ -248,7 +274,7 @@ impl<'a> PackageEvaluator<'a> {
         }
         Ok(Decision::block(
             name,
-            Some(requested_version.to_string()),
+            Some(requested_version_text.to_string()),
             reason,
         ))
     }
@@ -609,6 +635,7 @@ fn walk_value(v: &serde_norway::Value, out: &mut Vec<String>) {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineScanReport {
+    pub files: Vec<String>,
     pub findings: Vec<Decision>,
     pub references: Vec<PipelineReference>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -632,11 +659,15 @@ impl<'a> AzurePipelinesScanner<'a> {
         let mut findings = vec![];
         let mut finding_locations = vec![];
         let mut extracted = vec![];
+        let mut files = Vec::new();
         for (file, body) in self.reader.read(root)? {
             let file_refs = extract_pipeline_references(&body)
                 .map_err(|error| anyhow::anyhow!("invalid pipeline {file}: {error}"))?;
+            files.push(file.clone());
             extracted.push((file, file_refs));
         }
+        files.sort();
+        files.dedup();
         let pinned_aliases = sha_pinned_repository_aliases(&extracted);
         for (file, file_refs) in extracted {
             for (raw, kind, line) in file_refs {
@@ -775,6 +806,7 @@ impl<'a> AzurePipelinesScanner<'a> {
             }
         }
         Ok(PipelineScanReport {
+            files,
             findings,
             references: refs,
             finding_locations,
@@ -2330,6 +2362,51 @@ steps:
         let report = scanner.scan(Path::new("."))?;
         assert!(!report.is_blocking());
         assert_eq!(report.references.len(), 5);
+        Ok(())
+    }
+
+    #[test]
+    fn azure_scan_reports_root_entrypoint_and_empty_pipeline_files() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let pipelines = root.path().join("pipelines");
+        std::fs::create_dir_all(&pipelines)?;
+        std::fs::write(pipelines.join("empty.yml"), "steps: []\n")?;
+        let entrypoint = root.path().join("ai-orchestrator-ci.yml");
+        std::fs::write(
+            &entrypoint,
+            "steps:\n  - checkout: git://example/repository\n",
+        )?;
+        let policy = Policy::default();
+        let reader = crate::adapters::azure_devops::FsAzurePipelineReader;
+
+        let blocked = AzurePipelinesScanner {
+            policy: &policy,
+            reader: &reader,
+        }
+        .scan(root.path())?;
+        assert!(blocked.is_blocking());
+        assert!(blocked
+            .references
+            .iter()
+            .any(|reference| reference.file == "ai-orchestrator-ci.yml"));
+        assert_eq!(
+            serde_json::to_value(&blocked)?["files"],
+            serde_json::json!(["ai-orchestrator-ci.yml", "pipelines/empty.yml"])
+        );
+
+        let pinned = "steps:\n  - checkout: git://example/repository@0000000000000000000000000000000000000000\n";
+        std::fs::write(entrypoint, pinned)?;
+        let allowed = AzurePipelinesScanner {
+            policy: &policy,
+            reader: &reader,
+        }
+        .scan(root.path())?;
+        assert!(!allowed.is_blocking());
+        assert_eq!(allowed.references.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&allowed)?["files"],
+            serde_json::json!(["ai-orchestrator-ci.yml", "pipelines/empty.yml"])
+        );
         Ok(())
     }
 
