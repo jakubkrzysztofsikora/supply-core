@@ -16,7 +16,12 @@ spec:
         app: supply-core-official
     spec:
       nodeSelector:
-        kubernetes.io/hostname: k3s-cp-1
+        kubernetes.io/hostname: k3s-node-1
+      tolerations:
+      - key: lustro.io/pool
+        operator: Equal
+        value: worker
+        effect: NoExecute
       containers:
       - name: app
         image: ghcr.io/jakubkrzysztofsikora/supply-core:v0.3.2

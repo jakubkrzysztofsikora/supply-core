@@ -700,6 +700,7 @@ fn default_scan_incomplete() -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "ContentFindingWire")]
 pub struct ContentFinding {
     pub ecosystem: Ecosystem,
     pub package: String,
@@ -713,6 +714,55 @@ pub struct ContentFinding {
     pub summary: String,
     #[serde(default = "default_detected_at")]
     pub detected_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum FindingVersionWire {
+    Legacy(String),
+    Identified(PackageVersionId),
+}
+
+#[derive(Deserialize)]
+struct ContentFindingWire {
+    ecosystem: Ecosystem,
+    package: String,
+    version: FindingVersionWire,
+    source: String,
+    #[serde(default)]
+    score: Option<Decimal>,
+    #[serde(default = "default_scan_incomplete")]
+    scan_incomplete: bool,
+    rules: Vec<String>,
+    summary: String,
+    #[serde(default = "default_detected_at")]
+    detected_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl TryFrom<ContentFindingWire> for ContentFinding {
+    type Error = anyhow::Error;
+
+    fn try_from(wire: ContentFindingWire) -> anyhow::Result<Self> {
+        let version = match wire.version {
+            FindingVersionWire::Legacy(raw) => PackageVersionId::parse(&wire.ecosystem, &raw)?,
+            FindingVersionWire::Identified(version) => version,
+        };
+        anyhow::ensure!(
+            version.ecosystem == wire.ecosystem,
+            "content finding version ecosystem does not match finding ecosystem"
+        );
+        Ok(Self {
+            ecosystem: wire.ecosystem,
+            package: wire.package,
+            version,
+            source: wire.source,
+            score: wire.score,
+            scan_incomplete: wire.scan_incomplete,
+            rules: wire.rules,
+            summary: wire.summary,
+            detected_at: wire.detected_at,
+        })
+    }
 }
 impl ContentFinding {
     /// OSV-shaped record, ready to attach to an `ossf/malicious-packages`
@@ -1227,6 +1277,36 @@ mod tests {
         assert!(record["details"]
             .as_str()
             .is_some_and(|details| details.contains("install-script-network")));
+    }
+    #[test]
+    fn content_finding_reads_legacy_string_versions_and_rejects_ecosystem_mismatch(
+    ) -> anyhow::Result<()> {
+        let legacy = r#"{"ecosystem":"Npm","package":"zod","version":"4.6.4","source":"static-heuristics","score":1,"rules":["obfuscation"],"summary":"s","detected_at":"2026-09-13T20:53:48.517256Z"}"#;
+        let finding: ContentFinding = serde_json::from_str(legacy)?;
+        assert_eq!(
+            finding.version,
+            PackageVersionId::parse(&Ecosystem::Npm, "4.6.4")?
+        );
+        assert_eq!(finding.score, Some(Decimal::from(1)));
+        assert!(finding.scan_incomplete);
+
+        let round_trip: ContentFinding = serde_json::from_str(&serde_json::to_string(&finding)?)?;
+        assert_eq!(round_trip, finding);
+
+        let mismatched = serde_json::json!({
+            "ecosystem": "PyPi",
+            "package": "zod",
+            "version": PackageVersionId::parse(&Ecosystem::Npm, "4.6.4")?,
+            "source": "static-heuristics",
+            "rules": [],
+            "summary": "s"
+        });
+        assert!(serde_json::from_value::<ContentFinding>(mismatched).is_err());
+        assert!(serde_json::from_str::<ContentFinding>(
+            &legacy.replace("\"4.6.4\"", "\"not a version\"")
+        )
+        .is_err());
+        Ok(())
     }
     #[test]
     fn scanner_policy_defaults_are_disabled() {

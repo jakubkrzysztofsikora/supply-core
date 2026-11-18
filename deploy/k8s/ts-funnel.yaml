@@ -18,7 +18,7 @@ metadata:
   namespace: supply-core
 spec:
   accessModes: [ReadWriteOnce]
-  # storageClassName: <your-storage-class>  # defaults to the cluster default
+  storageClassName: nfs-studio
   resources:
     requests:
       storage: 128Mi

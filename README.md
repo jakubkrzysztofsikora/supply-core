@@ -347,7 +347,8 @@ server over the compose network. Captures land in `radar/data/`. Without the
 kubectl create namespace supply-core
 kubectl -n supply-core create secret generic ts-sidecar-auth --from-literal=TS_AUTHKEY=<tailscale-auth-key>
 kubectl -n supply-core create secret generic supply-core-auth --from-literal=SUPPLY_AUTH_TOKEN=<long-random-token>
-# Then deploy the manifests (adjust storageClassName and sizing in deploy/k8s/*.yaml to your cluster):
+# The manifests match the official homelab: storageClassName nfs-studio and a
+# nodeSelector/toleration for k3s-node-1. Adjust both, plus sizing, for your cluster.
 kubectl apply -k deploy/k8s
 ```
 
