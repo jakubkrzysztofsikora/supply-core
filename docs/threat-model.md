@@ -72,5 +72,11 @@ trust model.
   binaries installed under `/tmp` are unreachable; install them elsewhere.
 - NuGet integrity ends at the verified `.nupkg` archive; extracted
   global-packages files are not compared byte-for-byte against it.
+- OSSGadget runs with .NET write-xor-execute disabled: the runtime's
+  double-mapped JIT file exceeds the scanner file-size limit. The process stays
+  in the no-network bubblewrap sandbox with a 4 GiB address-space cap and never
+  executes package code.
+- GuardDog attestation covers its console script and installed `guarddog`
+  package bytes, not the rest of its pinned Python dependency tree.
 - `ArtifactStore::get` still takes caller-supplied paths; constrained
   before the HTTP serve endpoint lands.

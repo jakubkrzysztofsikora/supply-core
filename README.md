@@ -177,34 +177,45 @@ archive bytes, not the extracted package tree or package malware.
 ### 5. Quarantine Content Scanning (0-day and AI-agent threats)
 
 Inspect package bytes **while a version sits in the quarantine window** — before
-any advisory exists. The built-in static scanner always runs; GuardDog adds the
-external malware engine:
+any advisory exists. npm and PyPI scans need three engines for complete
+coverage: the built-in static scanner, GuardDog and OSSGadget (NuGet: static and
+OSSGadget). External engines run only on Linux, inside bubblewrap with
+address-space, CPU and file-size limits, and count as complete only when an
+install manifest attests their version and rule bytes. Anything else reports
+`partial` with a reason, for example `scanner_memory_limit_unavailable` on macOS
+or `engine_revision_unavailable` for an unattested GuardDog.
+
+Install pinned, attested engines on Linux x86-64 (GuardDog needs Python 3 with
+`venv`; OSSGadget needs .NET 8, Git and Python 3):
 
 ```bash
-# Install the external engine once (requires Python >= 3.10)
-uv tool install guarddog        # or: pipx install guarddog
-# If the default Python has no pygit2 wheel yet: uv tool install --python 3.13 guarddog
+scripts/install-guarddog.sh "$HOME/.local/lib/supply-core/guarddog"
+export GUARDDOG_BIN="$HOME/.local/lib/supply-core/guarddog/venv/bin/guarddog"
+export GUARDDOG_MANIFEST="$HOME/.local/lib/supply-core/guarddog/supply-guarddog-manifest.json"
+
+scripts/install-ossgadget.sh "$HOME/.local/lib/supply-core/ossgadget"
+export OSSGADGET_BIN="$HOME/.local/lib/supply-core/ossgadget/ossgadget"
+export OSSGADGET_MANIFEST="$HOME/.local/lib/supply-core/ossgadget/supply-ossgadget-manifest.json"
 
 # Large scans need separate Unix scratch, 10 GiB free, one job per directory.
-# External scanners stay incomplete until per-scan scratch quotas are enforced.
+# External scanners stay incomplete for large archives until per-scan scratch quotas exist.
 export SUPPLY_SCRATCH_DIR=/path/to/dedicated-scratch
 cargo run -- scan-package npm ./evil.tgz --name evil --version 1.2.3 \
   --scratch-dir "$SUPPLY_SCRATCH_DIR" --json --findings-out findings.jsonl
 ```
 
+The GuardDog manifest binds the console script and every file of the installed
+`guarddog` package; its other Python dependencies are pinned by the install but
+not re-verified per scan. OSSGadget never executes package files. Its .NET runtime
+gets a 4 GiB address-space cap with a bounded GC region and heap, and 480 s per
+scan; other engines keep 2 GiB. Each sandbox mounts the public system CA bundle
+read-only, because GuardDog's `pygit2` aborts at import without it. The static
+scanner rejects text members above 4 MiB, so packages bundling larger
+JavaScript files stay incomplete.
 
-OSSGadget is an optional static scanner. It does not execute package files.
-Build its pinned Linux x86-64 binary with .NET 8, Git, Python 3, and bubblewrap:
-
-```bash
-scripts/install-ossgadget.sh "$HOME/.local/lib/supply-core/ossgadget"
-export OSSGADGET_BIN="$HOME/.local/lib/supply-core/ossgadget/ossgadget"
-export OSSGADGET_MANIFEST="$HOME/.local/lib/supply-core/ossgadget/supply-ossgadget-manifest.json"
-```
-
-The first install fetches pinned source and restores public NuGet dependencies from nuget.org.
-The scanner fails incomplete when isolation or coverage cannot be verified.
-This integration currently reports OSSGadget unavailable on macOS.
+The `scanner` Docker target (`ghcr.io/jakubkrzysztofsikora/supply-core:<tag>-scanner`,
+built by `.github/workflows/scanner-image.yml`) contains all three attested
+engines.
 
 The daily capture wires this automatically: every version held by the
 quarantine window is downloaded from the registry, verified against
@@ -217,6 +228,14 @@ decisions on the next capture:
 python3 experiments/scan-quarantine.py experiments/data/2026-09-13 \
   --bin target/release/supply-core    # one capture; the cron wrapper does this daily
 ```
+
+On a macOS capture host, set `SUPPLY_SCAN_IMAGE` to a scanner image in the
+publisher env file. `experiments/remote-scan.sh` then runs the scan in a
+short-lived pod (`SUPPLY_SCAN_NAMESPACE`, default `supply-core`; `SUPPLY_SCAN_NODE`,
+default `k3s-node-1`). It copies in that day's snapshots, the findings file and
+the ledger, and copies them back only after a completed scan. The capture host
+stays the single writer. If the pod cannot run, the capture scans locally and
+the results stay incomplete.
 
 Verify local ledger consistency:
 
@@ -311,7 +330,7 @@ server over the compose network. Captures land in `radar/data/`. Without the
   }
   ```
 
-  Each scan row has only `name`, `version`, `decision`, `coverage`, `findings`, `score`, `rules`, and `sources`. Decisions are `pass`, `review`, `block`, or `incomplete`. Coverage is `complete`, `partial`, or `unknown`. `score` is `null` or an exact decimal string from 0 through 10. `error_count` counts failures; it never includes error text. The upload does not accept a `blocked` list.
+  Each scan row has only `name`, `version`, `decision`, `coverage`, `findings`, `score`, `rules`, `sources`, and optional `reasons`. Decisions are `pass`, `review`, `block`, or `incomplete`. Coverage is `complete`, `partial`, or `unknown`. `score` is `null` or an exact decimal string from 0 through 10. `reasons` lists `engine:reason` identifiers for engines that did not finish, such as `ossgadget:scanner_execution_failed`. It uses the same limits as `rules` and defaults to `[]`, which the status endpoint also returns for older uploads. `error_count` counts failures; it never includes error text. The upload does not accept a `blocked` list.
 
   `GET /api/v1/status` is public and returns `200` with `generated_at`, `service`, `version`, `health`, existing `quarantine` data, and top-level `scan`. `scan` is `null` when no scan summary exists. Otherwise it contains `captured_at`, `candidate_count`, `scanned_count`, `blocked_count`, `error_count`, `scanned`, and `blocked`. `blocked` contains full scanned rows whose decision is `block`; the server derives this list from `scanned`. The public page shows confirmed OSV blocks separately; scan-block counts do not include OSV rows. The quarantine table shows each package's `Block` or `Fallback` status.
 
@@ -346,7 +365,8 @@ server over the compose network. Captures land in `radar/data/`. Without the
           "findings": 1,
           "score": "8.25",
           "rules": ["nuget-init-ps1"],
-          "sources": ["static-heuristics"]
+          "sources": ["static-heuristics"],
+          "reasons": []
         }
       ],
       "blocked": [
@@ -358,7 +378,8 @@ server over the compose network. Captures land in `radar/data/`. Without the
           "findings": 1,
           "score": "8.25",
           "rules": ["nuget-init-ps1"],
-          "sources": ["static-heuristics"]
+          "sources": ["static-heuristics"],
+          "reasons": []
         }
       ]
     }

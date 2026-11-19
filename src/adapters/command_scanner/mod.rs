@@ -1970,6 +1970,8 @@ fn linux_ossgadget_sandbox_command(
             "DOTNET_GCHeapHardLimit",
             OSSGADGET_GC_HEAP_HARD_LIMIT,
         ])
+        // W^X double-maps JIT code through a growing file that RLIMIT_FSIZE kills.
+        .args(["--setenv", "DOTNET_EnableWriteXorExecute", "0"])
         .arg("--setenv")
         .arg("PATH")
         .arg(scanner_path_environment(scanner, &runtime)?)
