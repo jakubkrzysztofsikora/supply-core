@@ -193,6 +193,7 @@ struct SarifRule {
 #[serde(rename_all = "camelCase")]
 struct SarifResult {
     rule_id: Option<String>,
+    rule: Option<SarifRule>,
     #[serde(default)]
     locations: Vec<SarifLocation>,
 }
@@ -271,7 +272,11 @@ fn parse_ossgadget_sarif(payload: &str) -> Result<OssGadgetSarif> {
             }
         }
         for result in run.results {
-            let Some(rule_id) = result.rule_id.filter(|rule_id| !rule_id.trim().is_empty()) else {
+            let Some(rule_id) = result
+                .rule_id
+                .or_else(|| result.rule.and_then(|rule| rule.id))
+                .filter(|rule_id| !rule_id.trim().is_empty())
+            else {
                 parsed.malformed_results += 1;
                 continue;
             };
@@ -350,8 +355,32 @@ struct OssGadgetInstallManifest {
 pub struct OssGadgetScanner {
     command: PathBuf,
     rule_bundle_sha256: String,
+    bundle_rules: std::collections::BTreeSet<String>,
     timeout: Duration,
     max_output_bytes: usize,
+}
+
+/// Rule IDs declared by the attested rule files; OSSGadget's SARIF names rules
+/// per result without listing them in the driver.
+fn ossgadget_rule_ids(rules: &Path) -> Result<std::collections::BTreeSet<String>> {
+    #[derive(serde::Deserialize)]
+    struct RuleFileEntry {
+        id: String,
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(rules)? {
+        let path = entry?.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let (bytes, truncated) = read_capped(File::open(&path)?, 16 * 1024 * 1024);
+        anyhow::ensure!(!truncated, "OSSGadget rule file exceeds size limit");
+        let entries: Vec<RuleFileEntry> =
+            serde_json::from_slice(&bytes).context("invalid OSSGadget rule file")?;
+        ids.extend(entries.into_iter().map(|entry| entry.id));
+    }
+    anyhow::ensure!(!ids.is_empty(), "OSSGadget rule bundle declares no rules");
+    Ok(ids)
 }
 
 impl OssGadgetScanner {
@@ -371,9 +400,11 @@ impl OssGadgetScanner {
             .context("invalid OSSGadget install manifest")?;
         let rules = install_root.join("Resources/BackdoorRules");
         verify_ossgadget_installation(&command, &rules, &manifest)?;
+        let bundle_rules = ossgadget_rule_ids(&rules)?;
         Ok(Self {
             command,
             rule_bundle_sha256: manifest.rule_bundle_sha256,
+            bundle_rules,
             timeout: OSSGADGET_TIMEOUT,
             max_output_bytes: DEFAULT_MAX_OUTPUT,
         })
@@ -525,6 +556,7 @@ impl OssGadgetScanner {
             OssGadgetReportContext {
                 input_sha256,
                 rule_bundle_sha256: &self.rule_bundle_sha256,
+                bundle_rules: &self.bundle_rules,
                 package_root: &package_root,
                 guest_root,
                 expected_paths,
@@ -692,7 +724,12 @@ fn normalize_sarif_path(path: &str, root: &Path, guest_root: &Path) -> Option<St
             .or_else(|_| path.strip_prefix(guest_root))
             .ok()?
     } else {
-        path
+        // OSSGadget reports the guest root without its leading slash.
+        guest_root
+            .strip_prefix("/")
+            .ok()
+            .and_then(|guest| path.strip_prefix(guest).ok())
+            .unwrap_or(path)
     };
     normalize_relative_path(relative.to_str()?)
 }
@@ -700,6 +737,7 @@ fn normalize_sarif_path(path: &str, root: &Path, guest_root: &Path) -> Option<St
 struct OssGadgetReportContext<'a> {
     input_sha256: &'a str,
     rule_bundle_sha256: &'a str,
+    bundle_rules: &'a std::collections::BTreeSet<String>,
     package_root: &'a Path,
     guest_root: &'a Path,
     expected_paths: &'a std::collections::BTreeSet<String>,
@@ -716,6 +754,7 @@ fn ossgadget_engine_report(
     let OssGadgetReportContext {
         input_sha256,
         rule_bundle_sha256,
+        bundle_rules,
         package_root,
         guest_root,
         expected_paths,
@@ -729,10 +768,9 @@ fn ossgadget_engine_report(
     let mut location_outside_inventory = false;
     let rules_complete = sarif.as_ref().is_some_and(|sarif| {
         sarif.malformed_results == 0
-            && sarif
-                .findings
-                .iter()
-                .all(|finding| sarif.rules.contains(&finding.rule_id))
+            && sarif.findings.iter().all(|finding| {
+                sarif.rules.contains(&finding.rule_id) || bundle_rules.contains(&finding.rule_id)
+            })
     });
     if let Some(sarif) = &sarif {
         for finding in &sarif.findings {
@@ -2874,6 +2912,7 @@ mod tests {
             OssGadgetReportContext {
                 input_sha256: &"a".repeat(64),
                 rule_bundle_sha256: &"b".repeat(64),
+                bundle_rules: &std::collections::BTreeSet::new(),
                 package_root: Path::new("/tmp/package"),
                 guest_root: Path::new("/tmp/package"),
                 expected_paths: &expected,
@@ -2896,6 +2935,57 @@ mod tests {
     }
 
     #[test]
+    fn scanner_adapter_accepts_real_ossgadget_rule_references_from_attested_bundle() {
+        let expected = std::collections::BTreeSet::from(["README.md".to_string()]);
+        let real_shape = r#"{
+          "version":"2.1.0",
+          "runs":[{
+            "tool":{"driver":{"name":"ossgadget","version":"0.2.0"}},
+            "results":[{
+              "rule":{"id":"BD000610"},
+              "message":{"text":"private match text"},
+              "locations":[{"physicalLocation":{"address":{"relativeAddress":-1,"fullyQualifiedName":"scan/package/README.md"},"region":{"startLine":217,"startColumn":33}}}]
+            }]
+          }]
+        }"#;
+        let coverage = || -> OssGadgetCoverage {
+            serde_json::from_str(
+                r#"{"version":1,"scanned_paths":["README.md"],"skipped_paths":[],"diagnostics":[]}"#,
+            )
+            .unwrap()
+        };
+        let report_with = |bundle_rules: &std::collections::BTreeSet<String>| {
+            ossgadget_engine_report(
+                OssGadgetReportContext {
+                    input_sha256: &"a".repeat(64),
+                    rule_bundle_sha256: &"b".repeat(64),
+                    bundle_rules,
+                    package_root: Path::new("/work/package"),
+                    guest_root: Path::new("/scan/package"),
+                    expected_paths: &expected,
+                    inventory_complete: true,
+                    execution_succeeded: true,
+                    output_complete: true,
+                },
+                Some(parse_ossgadget_sarif(real_shape).unwrap()),
+                Some(coverage()),
+            )
+            .unwrap()
+        };
+
+        let attested = report_with(&std::collections::BTreeSet::from(["BD000610".to_string()]));
+        assert_eq!(attested.coverage, Coverage::Complete);
+        assert_eq!(attested.reason, None);
+        assert_eq!(attested.findings.len(), 1);
+        assert_eq!(attested.findings[0].rule, "BD000610");
+        attested.validate().unwrap();
+
+        let unknown_rule = report_with(&std::collections::BTreeSet::from(["BD000200".to_string()]));
+        assert_eq!(unknown_rule.coverage, Coverage::Partial);
+        assert_eq!(unknown_rule.reason.as_deref(), Some("missing_rules"));
+    }
+
+    #[test]
     fn scanner_adapter_accepts_empty_sarif_rules_after_verified_scan() {
         let expected = std::collections::BTreeSet::from(["lib/safe.js".to_string()]);
         let sarif = parse_ossgadget_sarif(
@@ -2911,6 +3001,7 @@ mod tests {
             OssGadgetReportContext {
                 input_sha256: &"a".repeat(64),
                 rule_bundle_sha256: &"b".repeat(64),
+                bundle_rules: &std::collections::BTreeSet::new(),
                 package_root: Path::new("/tmp/package"),
                 guest_root: Path::new("/tmp/package"),
                 expected_paths: &expected,
@@ -2944,6 +3035,7 @@ mod tests {
             OssGadgetReportContext {
                 input_sha256: &"a".repeat(64),
                 rule_bundle_sha256: &"b".repeat(64),
+                bundle_rules: &std::collections::BTreeSet::new(),
                 package_root: Path::new("/tmp/package"),
                 guest_root: Path::new("/tmp/package"),
                 expected_paths: &expected,
