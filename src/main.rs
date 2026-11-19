@@ -7,7 +7,7 @@ use supply_core::{
         azure_devops::{pipeline_annotations, FsAzurePipelineReader},
         config::load_policy,
         github::{workflow_annotations, FsWorkflowReader},
-        http::app_with_config,
+        http::app_with_policy,
         npm::HttpNpmRegistry,
         nuget::{package_version_from_nuget, parse_packages_lock, HttpNuGetRegistry},
         osv::{NoopVulnerabilitySource, OsvVulnerabilitySource, ReqwestOsvTransport},
@@ -51,6 +51,9 @@ enum Command {
         status_file: Option<PathBuf>,
         #[arg(long, env = "SUPPLY_AUTH_TOKEN")]
         auth_token: Option<String>,
+        /// Supply Core policy for Docker Hub mirror quarantine and CVEs.
+        #[arg(long, env = "SUPPLY_DOCKER_MIRROR_POLICY")]
+        policy: Option<PathBuf>,
     },
     ScanActions {
         #[arg(default_value = ".")]
@@ -292,6 +295,7 @@ async fn main() -> Result<()> {
             artifacts_dir,
             status_file,
             auth_token,
+            policy,
         } => {
             let config = supply_core::adapters::http::ServerConfig {
                 service_name,
@@ -305,7 +309,11 @@ async fn main() -> Result<()> {
                 config.service_name, addr
             );
             let listener = tokio::net::TcpListener::bind(addr).await?;
-            axum::serve(listener, app_with_config(config)).await?;
+            axum::serve(
+                listener,
+                app_with_policy(config, load_policy(policy.as_deref())?)?,
+            )
+            .await?;
         }
         Command::ScanActions {
             root,

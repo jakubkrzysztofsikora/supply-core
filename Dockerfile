@@ -93,5 +93,15 @@ ENV SUPPLY_BIN=/usr/local/bin/supply-core \
 ENV SUPPLY_SCRATCH_DIR=/scratch
 ENTRYPOINT ["python3", "/radar/scan-quarantine.py"]
 
+# Trivy executes offline against one verified local image at a time.
+FROM ghcr.io/aquasecurity/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969 AS trivy
+
 # Keep the server image as the default (last) stage for plain `docker build`.
 FROM runner AS server
+USER root
+RUN apk add --no-cache bubblewrap && \
+    mkdir -p /app/docker-mirror && chown supply:supply /app/docker-mirror
+COPY --from=trivy /usr/local/bin/trivy /usr/local/bin/trivy
+USER supply
+ENV SUPPLY_DOCKER_MIRROR_DIR=/app/docker-mirror \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt

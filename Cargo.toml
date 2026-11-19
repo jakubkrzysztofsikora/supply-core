@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 flate2 = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 axum = "0.7"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde", "clock"] }
@@ -24,11 +25,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_norway = "0.9"
 tar = "0.4"
+tempfile = "3"
 sha2 = "0.10"
 getrandom = "0.4"
 rusqlite = { version = "0.42", features = ["bundled"] }
 serde_json_canonicalizer = "0.4"
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
 toml = "0.8"
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 urlencoding = "2"
@@ -40,7 +43,6 @@ zip = { version = "=9.2.2", default-features = false, features = ["deflate-flate
 reqwest = { version = "0.12", features = ["rustls-tls-native-roots"], default-features = false }
 
 [dev-dependencies]
-tempfile = "3"
 sigstore-merkle = "0.16"
 tower = { version = "0.5", features = ["util"] }
 

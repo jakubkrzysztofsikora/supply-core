@@ -1078,6 +1078,8 @@ struct ToolRunOptions<'a> {
     environment: &'a [(std::ffi::OsString, std::ffi::OsString)],
     timeout: Duration,
     output_limit: usize,
+    file_size_limit: u64,
+    memory_limit: u64,
     allow_network: bool,
 }
 
@@ -1099,6 +1101,37 @@ pub(crate) fn run_isolated_tool_with_env(
             environment,
             timeout,
             output_limit,
+            file_size_limit: output_limit as u64,
+            memory_limit: SCANNER_MEMORY_LIMIT_BYTES,
+            allow_network: false,
+        },
+    )
+}
+
+pub(crate) fn run_isolated_image_tool(
+    scanner_path: &Path,
+    arguments: &[std::ffi::OsString],
+    mounts: &[SandboxMount],
+    scratch_path: &Path,
+    timeout: Duration,
+    output_limit: usize,
+) -> Result<BoundedCommandOutput> {
+    run_isolated_tool_with_network_and_env(
+        scanner_path,
+        arguments,
+        mounts,
+        scratch_path,
+        ToolRunOptions {
+            environment: &[
+                ("GOMEMLIMIT".into(), "384MiB".into()),
+                ("GOMAXPROCS".into(), "2".into()),
+            ],
+            timeout,
+            output_limit,
+            file_size_limit: 2 * 1024 * 1024 * 1024,
+            // Trivy mmaps the CVE and Java databases. Leave room in the
+            // address space for the mappings without growing the Go heap.
+            memory_limit: 16 * 1024 * 1024 * 1024,
             allow_network: false,
         },
     )
@@ -1120,6 +1153,8 @@ pub(crate) fn run_networked_isolated_tool(
             environment: &[],
             timeout,
             output_limit,
+            file_size_limit: output_limit as u64,
+            memory_limit: SCANNER_MEMORY_LIMIT_BYTES,
             allow_network: true,
         },
     )
@@ -1136,6 +1171,8 @@ fn run_isolated_tool_with_network_and_env(
         environment,
         timeout,
         output_limit,
+        file_size_limit,
+        memory_limit,
         allow_network,
     } = options;
     if !scanner_memory_limit_supported() {
@@ -1166,8 +1203,8 @@ fn run_isolated_tool_with_network_and_env(
         None,
         timeout,
         output_limit,
-        output_limit as u64,
-        SCANNER_MEMORY_LIMIT_BYTES,
+        file_size_limit,
+        memory_limit,
         &scanner.display().to_string(),
     )
 }
