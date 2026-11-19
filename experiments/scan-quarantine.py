@@ -147,19 +147,19 @@ def record_version(value):
 def is_incomplete_hold(record, name=None, version=None):
     """Whether a finding record is an incomplete-scan hold for name@version.
 
-    Two shapes exist: the quarantine marker, which names the rule, and the
-    engine records, which keep their engine rule ids and carry
-    `scan_incomplete: true` instead. The evaluator enforces both, so both
-    must be retried and cleared.
+    Mirrors how the evaluator reads the file: `scan_incomplete` defaults to
+    true when the key is absent, so records written before that field existed
+    are holds, and a finding with no score is one too. Such a record keeps a
+    version blocked and published as incomplete until a verified complete
+    scan clears it, so both shapes must be retried and cleared.
     """
     if not isinstance(record, dict):
         return False
     if record.get("ecosystem") != ECOSYSTEM:
         return False
     rules = record.get("rules")
-    if record.get("scan_incomplete") is not True and not (
-        isinstance(rules, list) and INCOMPLETE_RULE in rules
-    ):
+    complete = record.get("scan_incomplete") is False and record.get("score") is not None
+    if complete and not (isinstance(rules, list) and INCOMPLETE_RULE in rules):
         return False
     if name is None:
         return True

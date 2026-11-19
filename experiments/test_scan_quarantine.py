@@ -292,7 +292,7 @@ class IncompleteRecordTest(unittest.TestCase):
                 ),
             )
             scan_quarantine.append_record(path, {
-                "ecosystem": "Npm", "package": "b", "version": "2.0.0",
+                "ecosystem": "Npm", "package": "b", "version": "2.0.0", "scan_incomplete": False,
                 "source": "guarddog", "score": 9, "rules": ["threat-x"], "summary": "real",
             })
             self.assertEqual(scan_quarantine.clear_incomplete(path, "a", "1.0.0"), 1)
@@ -317,7 +317,7 @@ class IncompleteRecordTest(unittest.TestCase):
                 scan_quarantine.incomplete_record("sql.js", "1.15.0", "boom", "a" * 64, "b" * 64),
             )
             scan_quarantine.append_record(path, {
-                "ecosystem": "Npm", "package": "sql.js", "version": "1.15.0",
+                "ecosystem": "Npm", "package": "sql.js", "version": "1.15.0", "scan_incomplete": False,
                 "source": "guarddog", "score": 9, "rules": ["threat-x"], "summary": "real",
             })
             scan_quarantine.append_record(
@@ -392,7 +392,7 @@ class IncompleteRecordTest(unittest.TestCase):
                 path, scan_quarantine.incomplete_record("a", "1.0.0", "boom")
             )
             scan_quarantine.append_record(path, {
-                "ecosystem": "Npm", "package": "b", "version": "2.0.0",
+                "ecosystem": "Npm", "package": "b", "version": "2.0.0", "scan_incomplete": False,
                 "source": "guarddog", "score": 9, "rules": ["threat-x"], "summary": "real",
             })
             pending = scan_quarantine.incomplete_candidates(path)
@@ -408,6 +408,25 @@ class IncompleteRecordTest(unittest.TestCase):
         self.assertEqual(
             scan_quarantine.incomplete_candidates(Path(directory) / "gone.jsonl"), []
         )
+
+    def test_records_without_the_flag_are_holds_like_the_evaluator_reads_them(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "findings.jsonl"
+            legacy = {
+                "ecosystem": "Npm", "package": "pg", "version": "8.23.1",
+                "source": "static-heuristics", "score": 4, "rules": ["obfuscation"],
+                "summary": "lib/crypto/sasl.js: correlated capability",
+            }
+            scan_quarantine.append_record(path, legacy)
+            self.assertTrue(scan_quarantine.is_incomplete_hold(legacy))
+            self.assertEqual(
+                scan_quarantine.incomplete_candidates(path),
+                [{"package": "pg", "version": "8.23.1"}],
+            )
+            self.assertEqual(scan_quarantine.clear_incomplete(path, "pg", "8.23.1"), 1)
+            self.assertEqual(path.read_text().strip(), "")
 
 
 class ScanPackageTest(unittest.TestCase):
