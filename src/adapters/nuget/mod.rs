@@ -82,6 +82,61 @@ pub fn release_from_source(
     release_from_source_with_client(&client, source, package, version, token)
 }
 
+/// True when the source lists any version of the package id, false when its registration
+/// index is 404. A failing service index or any other status is an error, never "absent".
+pub fn package_id_exists_on_source(source: &str, package: &str) -> Result<bool> {
+    let source_url = reqwest::Url::parse(source).context("invalid NuGet source URL")?;
+    if source_url.scheme() != "https" {
+        anyhow::bail!("NuGet source must use HTTPS");
+    }
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    package_id_exists_via_index(&client, &source_url, package)
+}
+
+fn package_id_exists_via_index(
+    client: &reqwest::blocking::Client,
+    index_url: &reqwest::Url,
+    package: &str,
+) -> Result<bool> {
+    let index: serde_json::Value = client
+        .get(index_url.clone())
+        .send()
+        .context("NuGet service index request failed")?
+        .error_for_status()
+        .context("NuGet service index rejected request")?
+        .json()
+        .context("NuGet service index response was invalid")?;
+    let resources = index
+        .get("resources")
+        .and_then(|v| v.as_array())
+        .context("NuGet source index lacks resources")?;
+    let registration = select_registration_resource(resources)
+        .context("NuGet source has no registration resource")?;
+    let base = reqwest::Url::parse(registration).context("invalid NuGet registration URL")?;
+    if base.host_str() != index_url.host_str() {
+        anyhow::bail!("NuGet source redirected across hosts");
+    }
+    let url = reqwest::Url::parse(&format!(
+        "{}/{}/index.json",
+        base.as_str().trim_end_matches('/'),
+        package.to_ascii_lowercase()
+    ))
+    .context("invalid NuGet registration index URL")?;
+    let status = client
+        .get(url)
+        .send()
+        .context("NuGet registration index request failed")?
+        .status();
+    match status {
+        reqwest::StatusCode::OK => Ok(true),
+        reqwest::StatusCode::NOT_FOUND => Ok(false),
+        other => anyhow::bail!("NuGet registration index returned HTTP {other}"),
+    }
+}
+
 fn release_from_source_with_client(
     client: &reqwest::blocking::Client,
     source: &str,
@@ -891,6 +946,58 @@ mod tests {
         assert!(rendered.contains("403"));
         assert!(!rendered.contains("SENTINEL-SIGNATURE"), "{rendered}");
         let _ = (feed.join(), denied.join());
+        Ok(())
+    }
+
+    fn id_exists_against(registration_status: &str) -> Result<std::result::Result<bool, String>> {
+        let (registration_url, registration) = serve_once(
+            format!(
+                "HTTP/1.1 {registration_status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .into_bytes(),
+        )?;
+        let base = registration_url.trim_end_matches("pkg.nupkg");
+        let index = json!({
+            "resources": [{ "@id": base, "@type": "RegistrationsBaseUrl/3.6.0" }]
+        });
+        let (index_url, index_server) = serve_once(ok_response(index.to_string().as_bytes()))?;
+        let result = package_id_exists_via_index(
+            &plain_client()?,
+            &reqwest::Url::parse(&index_url)?,
+            "Circit.Evidence",
+        );
+        let request = registration
+            .join()
+            .map_err(|_| anyhow::anyhow!("registration"))?;
+        let _ = index_server.join();
+        if result.is_ok() {
+            assert!(request.contains("/circit.evidence/index.json"));
+        }
+        Ok(result.map_err(|error| format!("{error:#}")))
+    }
+
+    #[test]
+    fn package_id_absence_requires_a_404_registration_index() -> Result<()> {
+        assert_eq!(id_exists_against("404 Not Found")?, Ok(false));
+        assert_eq!(id_exists_against("200 OK")?, Ok(true));
+        let error = id_exists_against("500 Internal Server Error")?.unwrap_err();
+        assert!(error.contains("HTTP 500"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn package_id_absence_is_not_inferred_from_a_failing_service_index() -> Result<()> {
+        let (index_url, index_server) = serve_once(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        )?;
+        let error = package_id_exists_via_index(
+            &plain_client()?,
+            &reqwest::Url::parse(&index_url)?,
+            "Circit.Evidence",
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("service index rejected"));
+        let _ = index_server.join();
         Ok(())
     }
 }

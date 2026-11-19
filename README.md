@@ -342,7 +342,7 @@ server over the compose network. Captures land in `radar/data/`. Without the
   {
     "generated_at": "2026-11-15T08:32:00Z",
     "service": "supply-core",
-    "version": "0.4.3",
+    "version": "0.4.4",
     "health": {"status": "ok"},
     "quarantine": {
       "enabled": true,
@@ -588,6 +588,7 @@ pip:
 nuget:
   require_integrity: true
   fallback_to_frozen: true
+  first_party_package_prefixes: []   # e.g. ["Circit."]; ids that must not exist on nuget.org
 
 docker:
   require_digest_pin: true

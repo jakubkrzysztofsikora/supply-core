@@ -85,3 +85,12 @@ trust model.
   incomplete. Contents of nested archives are covered by OSSGadget only.
 - `ArtifactStore::get` still takes caller-supplied paths; constrained
   before the HTTP serve endpoint lands.
+- Azure Artifacts feeds publish no NuGet catalog, so the registry cannot attest a
+  package hash. Mirrored packages are attested against nuget.org's catalog hash.
+  Packages matching `nuget.first_party_package_prefixes` have no independent
+  attestation: the scanner requires that no version of the id exists on nuget.org
+  (dependency confusion) and verifies the restored archive against the lockfile
+  `contentHash` and the bytes the feed serves. A feed that serves consistent but
+  altered first-party bytes, paired with a matching lockfile edit, is not detected until
+  publish-time digests are verified. The report marks these packages
+  `hash_attestation: first-party-feed-bytes`.
