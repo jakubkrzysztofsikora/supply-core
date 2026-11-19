@@ -140,30 +140,21 @@ fn release_from_source_with_client(
         None => serde_json::Value::Null,
     };
     let mut metadata = release_metadata(&leaf_value, &catalog);
-    if metadata["packageHash"].is_null() {
+    if is_circit && metadata["packageHash"].is_null() {
         if let Some(content) = leaf_value.get("packageContent").and_then(|v| v.as_str()) {
             let content_url =
                 reqwest::Url::parse(content).context("invalid NuGet package content URL")?;
             if content_url.host_str() != Some(host) {
                 anyhow::bail!("NuGet source redirected across hosts");
             }
-            let destination_allowed: DestinationPolicy = if is_circit {
-                trusted_azure_destination
-            } else {
-                same_origin_only
-            };
-            let credential = if is_circit {
-                Some(token.context("SUPPLY_NUGET_TOKEN is required for Circit feed metadata")?)
-            } else {
-                None
-            };
-            metadata["packageHash"] = serde_json::Value::String(registry_package_hash(
+            let credential =
+                token.context("SUPPLY_NUGET_TOKEN is required for Circit feed metadata")?;
+            metadata["feedContentHash"] = serde_json::Value::String(registry_package_hash(
                 client,
                 &content_url,
-                credential,
-                destination_allowed,
+                Some(credential),
+                trusted_azure_destination,
             )?);
-            metadata["packageHashAlgorithm"] = serde_json::Value::String("SHA512".into());
         }
     }
     Ok(metadata)
@@ -179,10 +170,6 @@ fn plain_https(url: &reqwest::Url) -> bool {
         && url.username().is_empty()
         && url.password().is_none()
         && matches!(url.port(), None | Some(443))
-}
-
-fn same_origin_only(url: &reqwest::Url, is_redirect: bool) -> bool {
-    !is_redirect && plain_https(url)
 }
 
 fn trusted_azure_destination(url: &reqwest::Url, is_redirect: bool) -> bool {
@@ -846,10 +833,6 @@ mod tests {
         ] {
             assert!(!allowed(rejected, true)?, "{rejected} must be rejected");
         }
-        assert!(!same_origin_only(
-            &reqwest::Url::parse("https://s83.blob.core.windows.net/b/x")?,
-            true
-        ));
         Ok(())
     }
 
