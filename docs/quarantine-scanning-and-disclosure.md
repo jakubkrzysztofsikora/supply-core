@@ -283,6 +283,21 @@ Guardrails before any automated submission:
     until a matching scan succeeds — even after the version leaves the
     quarantine window — and a static-only run cannot clear a GuardDog-pending
     hold.
+    Versions the capture already blocks on a critical or high advisory are
+    scanned every day as *verification only*: their findings are not written,
+    because the evaluator weighs a content-scan hold before the OSV query and
+    a hold would displace the advisory reason, hiding the confirmed row from
+    the published status. A verified complete scan clears every
+    `scan-incomplete` record for that version — including digestless ones
+    left by fetch failures — since npm tarballs are immutable and a later
+    complete scan supersedes them.
+11a. **Attested scan runner** — the daily pipeline copies the capture into a
+    short-lived pod on the `scanner` image (`SUPPLY_SCAN_IMAGE`, Dockerfile
+    stage `scanner`, which sets `SUPPLY_SCRATCH_DIR=/scratch`) through
+    `experiments/remote-scan.sh`, runs `scan-quarantine.py` there, and copies
+    the scan report, findings file and ledger back. The capture host rebuilds
+    only the binary it uses for capture, so scanner-image changes reach
+    production through this pod rather than `cargo build`.
 12. **Public status surface** — `experiments/publish-status.py` builds the
     snapshot from the day's capture plus `content-scan.json`: quarantine holds,
     confirmed OSV advisories (parsed from evaluator reasons), suspected scan
