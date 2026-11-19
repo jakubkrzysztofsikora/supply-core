@@ -69,6 +69,8 @@ if [ -f "$findings" ]; then
   "${kube[@]}" cp "$findings" "$pod:/work/content-findings.jsonl" >/dev/null \
     || infra_fail "cannot copy findings"
 fi
+# A run with nothing to enforce legitimately leaves this file empty.
+"${kube[@]}" exec "$pod" -- sh -c 'touch /work/content-findings.jsonl' >/dev/null 2>&1 || true
 if [ -f "$ledger" ]; then
   "${kube[@]}" cp "$ledger" "$pod:/work/ledger.sqlite" >/dev/null || infra_fail "cannot copy ledger"
 fi
@@ -94,9 +96,10 @@ trap 'rm -rf -- "$stage"; cleanup' EXIT
   || infra_fail "cannot copy findings back"
 "${kube[@]}" cp "$pod:/work/ledger.sqlite" "$stage/ledger.sqlite" >/dev/null \
   || infra_fail "cannot copy ledger back"
-for copied in content-scan.json content-findings.jsonl ledger.sqlite; do
+for copied in content-scan.json ledger.sqlite; do
   [ -s "$stage/$copied" ] || infra_fail "copied $copied is empty"
 done
+[ -f "$stage/content-findings.jsonl" ] || infra_fail "copied findings file is missing"
 python3 - "$stage/content-scan.json" <<'PY' || infra_fail "scan summary is not a completed scan report"
 import json, sys
 report = json.load(open(sys.argv[1], encoding="utf-8"))

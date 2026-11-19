@@ -343,6 +343,46 @@ class IncompleteRecordTest(unittest.TestCase):
                 scan_quarantine.clear_incomplete(path, "a", "1.0.0"), 0
             )
 
+    def test_clear_removes_engine_schema_holds_and_keeps_scored_findings(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "findings.jsonl"
+            scan_quarantine.append_record(path, {
+                "ecosystem": "Npm", "package": "dompurify",
+                "version": {"ecosystem": "Npm", "upstream": "3.4.18", "canonical": "3.4.18"},
+                "source": "ossgadget", "score": "4", "scan_incomplete": True,
+                "rules": ["bd000702"], "summary": "external scanner reported a finding",
+            })
+            scan_quarantine.append_record(path, {
+                "ecosystem": "Npm", "package": "dompurify",
+                "version": {"ecosystem": "Npm", "upstream": "3.4.18", "canonical": "3.4.18"},
+                "source": "static-heuristics", "score": 1, "scan_incomplete": False,
+                "rules": ["obfuscation"], "summary": "real finding",
+            })
+            self.assertEqual(
+                scan_quarantine.incomplete_candidates(path),
+                [{"package": "dompurify", "version": "3.4.18"}],
+            )
+            self.assertEqual(scan_quarantine.clear_incomplete(path, "dompurify", "3.4.18"), 1)
+            remaining = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual([r["source"] for r in remaining], ["static-heuristics"])
+
+    def test_clear_does_not_cross_ecosystems(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "findings.jsonl"
+            scan_quarantine.append_record(path, {
+                "ecosystem": "PyPi", "package": "requests", "version": "2.0.0",
+                "source": "quarantine-scan", "scan_incomplete": True,
+                "rules": ["scan-incomplete"], "summary": "other ecosystem",
+            })
+            self.assertEqual(scan_quarantine.incomplete_candidates(path), [])
+            self.assertEqual(scan_quarantine.clear_incomplete(path, "requests", "2.0.0"), 0)
+            remaining = path.read_text().splitlines()
+        self.assertEqual(len(remaining), 1)
+
     def test_incomplete_candidates_are_retried_and_merged(self):
         import tempfile
 

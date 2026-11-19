@@ -43,6 +43,7 @@ from pathlib import Path
 
 REGISTRY = "https://registry.npmjs.org"
 MAX_TARBALL_BYTES = 64 * 1024 * 1024
+ECOSYSTEM = "Npm"
 QUARANTINE_REASON = "inside quarantine window"
 ADVISORY_REASON_RE = re.compile(
     r"^(critical|high) vulnerability \S+ from .+$", re.IGNORECASE
@@ -130,6 +131,41 @@ def limited(packages, limit):
     return packages if limit <= 0 else packages[:limit]
 
 
+def record_version(value):
+    """Canonical version text from either findings-file record shape.
+
+    Quarantine markers store a plain string; records written by
+    `scan-package --findings-out` store an object with the canonical version
+    under `canonical`.
+    """
+    if isinstance(value, dict):
+        canonical = value.get("canonical")
+        return canonical if isinstance(canonical, str) else None
+    return value if isinstance(value, str) else None
+
+
+def is_incomplete_hold(record, name=None, version=None):
+    """Whether a finding record is an incomplete-scan hold for name@version.
+
+    Two shapes exist: the quarantine marker, which names the rule, and the
+    engine records, which keep their engine rule ids and carry
+    `scan_incomplete: true` instead. The evaluator enforces both, so both
+    must be retried and cleared.
+    """
+    if not isinstance(record, dict):
+        return False
+    if record.get("ecosystem") != ECOSYSTEM:
+        return False
+    rules = record.get("rules")
+    if record.get("scan_incomplete") is not True and not (
+        isinstance(rules, list) and INCOMPLETE_RULE in rules
+    ):
+        return False
+    if name is None:
+        return True
+    return record.get("package") == name and record_version(record.get("version")) == version
+
+
 def incomplete_candidates(path):
     """(package, version) pairs that still carry a scan-incomplete record.
 
@@ -149,16 +185,16 @@ def incomplete_candidates(path):
             record = json.loads(stripped)
         except json.JSONDecodeError:
             continue
-        if (
-            isinstance(record, dict)
-            and INCOMPLETE_RULE in (record.get("rules") or [])
-            and isinstance(record.get("package"), str)
-            and isinstance(record.get("version"), str)
-        ):
-            key = (record["package"], record["version"])
-            if key not in seen:
-                seen.add(key)
-                candidates.append({"package": record["package"], "version": record["version"]})
+        if not is_incomplete_hold(record):
+            continue
+        name = record.get("package")
+        version = record_version(record.get("version"))
+        if not isinstance(name, str) or not isinstance(version, str):
+            continue
+        key = (name, version)
+        if key not in seen:
+            seen.add(key)
+            candidates.append({"package": name, "version": version})
     return candidates
 
 
@@ -375,9 +411,10 @@ def clear_incomplete(path, name, version):
     """Clear every incomplete hold for a version a scan just covered completely.
 
     npm tarballs are immutable, so a verified complete scan of a version
-    supersedes every earlier hold for it, including the ones written by a
-    fetch or registry failure. Those carry no artifact identity, so an
-    identity-matched clear would leave them blocking the version forever.
+    supersedes every earlier hold for it: the quarantine markers written by a
+    fetch or registry failure, which carry no artifact identity, and the
+    engine records that flagged the scan incomplete. Scored findings from a
+    complete scan are kept.
     """
     with path.with_suffix(".lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -394,13 +431,7 @@ def clear_incomplete(path, name, version):
                 except json.JSONDecodeError:
                     kept.append(stripped)
                     continue
-                rules = record.get("rules") if isinstance(record, dict) else None
-                is_incomplete = isinstance(rules, list) and INCOMPLETE_RULE in rules
-                if (
-                    is_incomplete
-                    and record.get("package") == name
-                    and record.get("version") == version
-                ):
+                if is_incomplete_hold(record, name, version):
                     removed += 1
                 else:
                     kept.append(stripped)

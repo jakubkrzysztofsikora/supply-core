@@ -288,9 +288,10 @@ Guardrails before any automated submission:
     because the evaluator weighs a content-scan hold before the OSV query and
     a hold would displace the advisory reason, hiding the confirmed row from
     the published status. A verified complete scan clears every
-    `scan-incomplete` record for that version — including digestless ones
-    left by fetch failures — since npm tarballs are immutable and a later
-    complete scan supersedes them.
+    `scan-incomplete` record for that version — the quarantine markers
+    (including digestless ones left by fetch failures) and the engine records
+    that flagged the scan incomplete — since npm tarballs are immutable and a
+    later complete scan supersedes them. Scored findings are never removed.
 11a. **Attested scan runner** — the daily pipeline copies the capture into a
     short-lived pod on the `scanner` image (`SUPPLY_SCAN_IMAGE`, Dockerfile
     stage `scanner`, which sets `SUPPLY_SCRATCH_DIR=/scratch`) through
