@@ -14,7 +14,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 const MAX_FILES: usize = 10_000;
-const MAX_FILE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_LARGE_COMPRESSED_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_LARGE_EXPANDED_ARCHIVE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
@@ -3110,6 +3110,32 @@ mod tests {
             .find(|member| member.normalized_path == "opaque.bin")
             .ok_or_else(|| anyhow::anyhow!("binary member missing"))?;
         assert_eq!(binary_member.member_type, ArchiveMemberType::Binary);
+        Ok(())
+    }
+
+    #[test]
+    fn text_member_over_four_mib_is_scanned() -> Result<()> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        let payload = "var a = 1;\n".repeat(6 * 1024 * 1024 / 11);
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(payload.len() as u64);
+        header.set_mode(0o644);
+        header.set_mtime(0);
+        header.set_cksum();
+        builder.append_data(&mut header, "package/dist/debug.js", payload.as_bytes())?;
+        let bytes = builder.into_inner()?.finish()?;
+        let scratch = tempfile::tempdir()?;
+        let inventory = extract_archive(&Ecosystem::Npm, &bytes, scratch.path())?;
+        let member = inventory
+            .members
+            .iter()
+            .find(|member| member.normalized_path == "dist/debug.js")
+            .ok_or_else(|| anyhow::anyhow!("text member missing"))?;
+        assert_eq!(member.member_type, ArchiveMemberType::Text);
+        assert_eq!(member.text.as_deref().map(str::len), Some(payload.len()));
         Ok(())
     }
 

@@ -137,10 +137,6 @@ fn first_message(hits: &serde_json::Value) -> Option<&str> {
 #[derive(Debug)]
 struct OssGadgetLocation {
     path: Option<String>,
-    start_line: Option<u64>,
-    start_column: Option<u64>,
-    end_line: Option<u64>,
-    end_column: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -208,22 +204,12 @@ struct SarifLocation {
 #[serde(rename_all = "camelCase")]
 struct SarifPhysicalLocation {
     address: Option<SarifAddress>,
-    region: Option<SarifRegion>,
 }
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SarifAddress {
     fully_qualified_name: Option<String>,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SarifRegion {
-    start_line: Option<u64>,
-    start_column: Option<u64>,
-    end_line: Option<u64>,
-    end_column: Option<u64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -282,16 +268,11 @@ fn parse_ossgadget_sarif(payload: &str) -> Result<OssGadgetSarif> {
             };
             let location = result.locations.iter().find_map(|location| {
                 let physical = location.physical_location.as_ref()?;
-                let region = physical.region.as_ref();
                 Some(OssGadgetLocation {
                     path: physical
                         .address
                         .as_ref()
                         .and_then(|address| address.fully_qualified_name.clone()),
-                    start_line: region.and_then(|region| region.start_line),
-                    start_column: region.and_then(|region| region.start_column),
-                    end_line: region.and_then(|region| region.end_line),
-                    end_column: region.and_then(|region| region.end_column),
                 })
             });
             parsed
@@ -792,23 +773,7 @@ fn ossgadget_engine_report(
                 .and_then(|path| path.as_deref())
                 .unwrap_or("unknown");
             let rule = safe_code(&finding.rule_id);
-            let location = finding.location.as_ref();
-            let fingerprint = format!(
-                "{member}:{}:{}:{}:{}",
-                location
-                    .and_then(|location| location.start_line)
-                    .unwrap_or_default(),
-                location
-                    .and_then(|location| location.start_column)
-                    .unwrap_or_default(),
-                location
-                    .and_then(|location| location.end_line)
-                    .unwrap_or_default(),
-                location
-                    .and_then(|location| location.end_column)
-                    .unwrap_or_default()
-            );
-            let id = engine_finding_id("ossgadget", &rule, member, &fingerprint)?;
+            let id = engine_finding_id("ossgadget", &rule, member, "all-matches")?;
             if !finding_ids.insert(id.clone()) {
                 continue;
             }
@@ -825,7 +790,6 @@ fn ossgadget_engine_report(
                 policy_score: Some(Decimal::from(4)),
             });
         }
-        finding_limit_exceeded |= sarif.findings.len() > 256;
     }
     let scanned_count = coverage
         .as_ref()
@@ -2854,10 +2818,6 @@ mod tests {
         assert_eq!(sarif.findings[0].rule_id, "Backdoor.Exec");
         let location = sarif.findings[0].location.as_ref().unwrap();
         assert_eq!(location.path.as_deref(), Some("lib/install.js"));
-        assert_eq!(location.start_line, Some(4));
-        assert_eq!(location.start_column, Some(7));
-        assert_eq!(location.end_line, Some(4));
-        assert_eq!(location.end_column, Some(20));
         assert!(sarif.rules.contains("Backdoor.Exec"));
         assert_eq!(sarif.diagnostics, 2);
     }
@@ -2983,6 +2943,73 @@ mod tests {
         let unknown_rule = report_with(&std::collections::BTreeSet::from(["BD000200".to_string()]));
         assert_eq!(unknown_rule.coverage, Coverage::Partial);
         assert_eq!(unknown_rule.reason.as_deref(), Some("missing_rules"));
+    }
+
+    fn ossgadget_report_for(
+        files: &[String],
+        occurrences: impl Iterator<Item = (String, u32)>,
+    ) -> EngineReport {
+        let expected = files
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let results = occurrences
+            .map(|(file, line)| {
+                serde_json::json!({
+                    "rule": {"id": "BD000610"},
+                    "message": {"text": "match"},
+                    "locations": [{"physicalLocation": {
+                        "address": {"relativeAddress": -1, "fullyQualifiedName": format!("scan/package/{file}")},
+                        "region": {"startLine": line, "startColumn": 1}
+                    }}]
+                })
+            })
+            .collect::<Vec<_>>();
+        let sarif = serde_json::json!({"version": "2.1.0", "runs": [{"results": results}]});
+        let coverage = serde_json::json!({
+            "version": 1, "scanned_paths": files, "skipped_paths": [], "diagnostics": []
+        });
+        ossgadget_engine_report(
+            OssGadgetReportContext {
+                input_sha256: &"a".repeat(64),
+                rule_bundle_sha256: &"b".repeat(64),
+                bundle_rules: &std::collections::BTreeSet::from(["BD000610".to_string()]),
+                package_root: Path::new("/work/package"),
+                guest_root: Path::new("/scan/package"),
+                expected_paths: &expected,
+                inventory_complete: true,
+                execution_succeeded: true,
+                output_complete: true,
+            },
+            Some(parse_ossgadget_sarif(&sarif.to_string()).unwrap()),
+            Some(serde_json::from_value(coverage).unwrap()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ossgadget_repeated_rule_matches_in_one_file_are_one_finding() {
+        let files = vec!["dist/bundle.js".to_string(), "README.md".to_string()];
+        let occurrences = (1..=300)
+            .map(|line| ("dist/bundle.js".to_string(), line))
+            .chain([("README.md".to_string(), 7)]);
+        let report = ossgadget_report_for(&files, occurrences);
+        assert_eq!(report.coverage, Coverage::Complete);
+        assert_eq!(report.reason, None);
+        assert_eq!(report.findings.len(), 2);
+        report.validate().unwrap();
+    }
+
+    #[test]
+    fn ossgadget_distinct_rule_file_pairs_over_limit_stay_partial() {
+        let files = (0..257)
+            .map(|index| format!("lib/f{index}.js"))
+            .collect::<Vec<_>>();
+        let occurrences = files.clone().into_iter().map(|file| (file, 1));
+        let report = ossgadget_report_for(&files, occurrences);
+        assert_eq!(report.coverage, Coverage::Partial);
+        assert_eq!(report.reason.as_deref(), Some("finding_limit"));
+        assert_eq!(report.findings.len(), 256);
     }
 
     #[test]

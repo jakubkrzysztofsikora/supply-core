@@ -210,8 +210,9 @@ not re-verified per scan. OSSGadget never executes package files. Its .NET runti
 gets a 4 GiB address-space cap with a bounded GC region and heap, and 480 s per
 scan; other engines keep 2 GiB. Each sandbox mounts the public system CA bundle
 read-only, because GuardDog's `pygit2` aborts at import without it. The static
-scanner rejects text members above 4 MiB, so packages bundling larger
-JavaScript files stay incomplete.
+scanner rejects text members above 16 MiB. OSSGadget reports one finding per
+rule and file, so repeated matches in minified bundles stay under the 256-finding
+limit.
 
 The `scanner` Docker target (`ghcr.io/jakubkrzysztofsikora/supply-core:<tag>-scanner`,
 built by `.github/workflows/scanner-image.yml`) contains all three attested
