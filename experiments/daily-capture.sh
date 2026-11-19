@@ -62,14 +62,27 @@ cd "$ROOT" || exit 1
     echo "ERROR: run.sh failed (exit $run_rc)"
   else
     scan_rc=0
-    scratch_args=()
-    if [ -n "${SUPPLY_SCRATCH_DIR:-}" ]; then
-      scratch_args+=(--scratch-dir "$SUPPLY_SCRATCH_DIR")
+    scan_locally=1
+    if [ -n "${SUPPLY_SCAN_IMAGE:-}" ]; then
+      scan_locally=0
+      "$HERE/remote-scan.sh" "$HERE/data/$DAY" "$HERE/data/content-findings.jsonl" \
+        "$SUPPLY_LEDGER_PATH" || scan_rc=$?
+      if [ "$scan_rc" -eq 3 ]; then
+        echo "WARN: remote Linux scan unavailable; scanning locally (external engines stay incomplete)"
+        scan_rc=0
+        scan_locally=1
+      fi
     fi
-    python3 "$HERE/scan-quarantine.py" "$HERE/data/$DAY" --bin "$BIN" \
-      "${scratch_args[@]}" \
-      --ledger-db "$SUPPLY_LEDGER_PATH" \
-      --findings "$HERE/data/content-findings.jsonl" || scan_rc=$?
+    if [ "$scan_locally" -eq 1 ]; then
+      scratch_args=()
+      if [ -n "${SUPPLY_SCRATCH_DIR:-}" ]; then
+        scratch_args+=(--scratch-dir "$SUPPLY_SCRATCH_DIR")
+      fi
+      python3 "$HERE/scan-quarantine.py" "$HERE/data/$DAY" --bin "$BIN" \
+        "${scratch_args[@]}" \
+        --ledger-db "$SUPPLY_LEDGER_PATH" \
+        --findings "$HERE/data/content-findings.jsonl" || scan_rc=$?
+    fi
     if [ "$scan_rc" -ne 0 ]; then
       echo "ERROR: content scan failed (exit $scan_rc)"
       capture_rc=1

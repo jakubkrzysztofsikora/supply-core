@@ -19,8 +19,14 @@ const DRAIN_GRACE: Duration = Duration::from_secs(2);
 const OSSGADGET_UPSTREAM_COMMIT: &str = "4063457b40211c25b41d56465d41783f2d42c5c1";
 const OSSGADGET_MANIFEST: &str = "supply-ossgadget-manifest.json";
 const OSSGADGET_COVERAGE_ENV: &str = "SUPPLY_OSSGADGET_COVERAGE_PATH";
-#[cfg(target_os = "linux")]
 const SCANNER_MEMORY_LIMIT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// .NET reserves its GC region range up front; with the region range and heap
+/// bounded below, OSSGadget starts and scans within this address space.
+const OSSGADGET_MEMORY_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const OSSGADGET_GC_REGION_RANGE: &str = "40000000";
+#[cfg(target_os = "linux")]
+const OSSGADGET_GC_HEAP_HARD_LIMIT: &str = "30000000";
 
 fn scanner_memory_limit_supported() -> bool {
     cfg!(target_os = "linux")
@@ -490,6 +496,7 @@ impl OssGadgetScanner {
             None,
             self.timeout,
             self.max_output_bytes,
+            OSSGADGET_MEMORY_LIMIT_BYTES,
             "ossgadget",
         )
         .ok();
@@ -1017,6 +1024,7 @@ impl CommandScanner {
             Some(archive_fd),
             self.timeout,
             self.max_output_bytes,
+            SCANNER_MEMORY_LIMIT_BYTES,
             &self.command.display().to_string(),
         )?;
         if !output.complete {
@@ -1142,6 +1150,7 @@ fn run_isolated_tool_with_network_and_env(
         None,
         timeout,
         output_limit,
+        SCANNER_MEMORY_LIMIT_BYTES,
         &scanner.display().to_string(),
     )
 }
@@ -1240,9 +1249,10 @@ fn run_bounded_command(
     stdin: Option<File>,
     timeout: Duration,
     output_limit: usize,
+    memory_limit: u64,
     label: &str,
 ) -> Result<BoundedCommandOutput> {
-    install_resource_limits(&mut command, timeout, output_limit)?;
+    install_resource_limits(&mut command, timeout, output_limit, memory_limit)?;
     let mut child = command
         .stdin(stdin.map(Stdio::from).unwrap_or_else(Stdio::null))
         .stdout(Stdio::piped())
@@ -1301,6 +1311,7 @@ fn install_resource_limits(
     command: &mut Command,
     timeout: Duration,
     output_limit: usize,
+    memory_limit: u64,
 ) -> Result<()> {
     if !scanner_memory_limit_supported() {
         anyhow::bail!("scanner_memory_limit_unavailable");
@@ -1312,7 +1323,7 @@ fn install_resource_limits(
             .as_secs()
             .saturating_add(u64::from(timeout.subsec_nanos() > 0))
             .max(1) as libc::rlim_t;
-        let memory_limit = SCANNER_MEMORY_LIMIT_BYTES as libc::rlim_t;
+        let memory_limit = memory_limit as libc::rlim_t;
         let file_size_limit = output_limit as libc::rlim_t;
         command.process_group(0);
         unsafe {
@@ -1336,7 +1347,7 @@ fn install_resource_limits(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (command, timeout, output_limit);
+        let _ = (command, timeout, output_limit, memory_limit);
     }
     Ok(())
 }
@@ -1947,6 +1958,16 @@ fn linux_ossgadget_sandbox_command(
         .arg("--setenv")
         .arg(OSSGADGET_COVERAGE_ENV)
         .arg(coverage_path)
+        .args([
+            "--setenv",
+            "DOTNET_GCRegionRange",
+            OSSGADGET_GC_REGION_RANGE,
+        ])
+        .args([
+            "--setenv",
+            "DOTNET_GCHeapHardLimit",
+            OSSGADGET_GC_HEAP_HARD_LIMIT,
+        ])
         .arg("--setenv")
         .arg("PATH")
         .arg(scanner_path_environment(scanner, &runtime)?)
@@ -2049,11 +2070,29 @@ fn linux_sandbox_command(
         .args(["--proc", "/proc", "--dev", "/dev", "--bind"])
         .arg(scratch)
         .args(["/tmp", "--dir", "/scan", "--ro-bind", "/proc/self/fd/0"])
-        .arg(archive)
-        .args(["--remount-ro", "/", "--chdir", "/tmp", "--clearenv"]);
+        .arg(archive);
+    // GuardDog's pygit2 dependency aborts at import when OpenSSL's default CA
+    // paths are unreadable, so a public bundle is mounted even without network.
+    let ca_bundle = linux_system_ca_bundle()
+        .ok()
+        .filter(|bundle| !paths_overlap(bundle, scratch));
+    if let Some(ca_bundle) = &ca_bundle {
+        command
+            .arg("--ro-bind")
+            .arg(ca_bundle)
+            .arg("/tmp/.supply-core-ca-bundle.pem");
+    }
+    command.args(["--remount-ro", "/", "--chdir", "/tmp", "--clearenv"]);
     command
         .args(["--setenv", "HOME", "/tmp", "--setenv", "TMPDIR", "/tmp"])
         .args(["--setenv", "TMP", "/tmp", "--setenv", "TEMP", "/tmp"]);
+    if ca_bundle.is_some() {
+        command.args([
+            "--setenv",
+            "SSL_CERT_FILE",
+            "/tmp/.supply-core-ca-bundle.pem",
+        ]);
+    }
     command
         .arg("--setenv")
         .arg("PATH")
