@@ -1,0 +1,13 @@
+{
+  "name": "supply-core-known-vulnerable-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pins package versions with published critical advisories so the daily capture proves detection end to end. Never installed.",
+  "dependencies": {
+    "handlebars": "4.7.6",
+    "json-schema": "0.2.3",
+    "lodash": "4.17.11",
+    "minimist": "1.2.5",
+    "shell-quote": "1.7.2"
+  }
+}
