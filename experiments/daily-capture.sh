@@ -82,7 +82,7 @@ cd "$ROOT" || exit 1
         scratch_args+=(--scratch-dir "$SUPPLY_SCRATCH_DIR")
       fi
       python3 "$HERE/scan-quarantine.py" "$HERE/data/$DAY" --bin "$BIN" \
-        "${scratch_args[@]}" \
+        ${scratch_args[@]+"${scratch_args[@]}"} \
         --ledger-db "$SUPPLY_LEDGER_PATH" \
         --findings "$HERE/data/content-findings.jsonl" || scan_rc=$?
     fi
