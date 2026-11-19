@@ -520,7 +520,7 @@ class MainFlowTest(unittest.TestCase):
             self.assertEqual(len(report["scanned"]), 2)
             self.assertEqual(report["errors"], [])
 
-    def test_incomplete_advisory_scan_never_holds_or_fails_the_run(self):
+    def test_incomplete_advisory_scan_never_holds_but_fails_the_run(self):
         import tempfile
 
         def outcome(name):
@@ -531,12 +531,12 @@ class MainFlowTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             rc, _calls, findings, report = self._run_main(directory, outcome)
             self.assertFalse(findings.exists())
-            self.assertEqual(rc, 0)
             self.assertEqual(
                 [(e["package"], e["error"]) for e in report["verification_errors"]],
                 [("handlebars", "scanner_reported_errors")],
             )
             self.assertEqual(report["errors"], [])
+            self.assertEqual(rc, 1)
             self.assertEqual(
                 [row["decision"] for row in report["scanned"]], ["pass", "incomplete"]
             )

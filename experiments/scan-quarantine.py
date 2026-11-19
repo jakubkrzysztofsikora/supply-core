@@ -119,18 +119,6 @@ def scan_plan(window, advisory, pending):
     return plan
 
 
-def merge_candidates(*groups):
-    merged, seen = [], set()
-    for group in groups:
-        for item in group:
-            key = (item["package"], item["version"])
-            if key in seen:
-                continue
-            seen.add(key)
-            merged.append(item)
-    return merged
-
-
 def safe_file_name(name, version):
     slug = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_")
     digest = hashlib.sha256(name.encode()).hexdigest()[:12]
@@ -614,7 +602,7 @@ def main():
         f"{len(report['errors'])} errors, "
         f"{len(report['verification_errors'])} verification errors -> {summary_path}"
     )
-    return 1 if report["errors"] else 0
+    return 1 if report["errors"] or report["verification_errors"] else 0
 
 
 if __name__ == "__main__":
