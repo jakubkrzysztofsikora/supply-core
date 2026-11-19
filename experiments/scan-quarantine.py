@@ -271,6 +271,11 @@ def summarize(report):
         "score": score,
         "rules": sorted({finding.get("rule", "unknown") for _, finding in findings}),
         "sources": sorted({source for source, _ in findings}),
+        "reasons": sorted({
+            f"{engine.get('source', 'unknown')}:{engine['reason']}"
+            for engine in engines
+            if isinstance(engine.get("reason"), str) and engine["reason"]
+        }),
     }
 
 

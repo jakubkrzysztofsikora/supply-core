@@ -160,6 +160,8 @@ struct ScannedPackageSummary {
     score: Option<String>,
     rules: Vec<String>,
     sources: Vec<String>,
+    #[serde(default)]
+    reasons: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
@@ -663,6 +665,11 @@ fn valid_scan_summary(scan: &ScanSummary) -> bool {
                     .sources
                     .iter()
                     .all(|source| valid_scan_identifier(source))
+                && row.reasons.len() <= MAX_SCAN_IDENTIFIERS
+                && row
+                    .reasons
+                    .iter()
+                    .all(|reason| valid_scan_identifier(reason))
         })
 }
 
@@ -1283,7 +1290,8 @@ mod tests {
             "findings": 2,
             "score": "8.1234567890123456789012345678",
             "rules": ["install-script-pipe"],
-            "sources": ["static-heuristics"]
+            "sources": ["static-heuristics"],
+            "reasons": ["guarddog:engine_revision_unverified"]
         });
         let passed = json!({
             "name": "clean",
@@ -1341,9 +1349,46 @@ mod tests {
         assert_eq!(status["scan"]["scanned_count"], 2);
         assert_eq!(status["scan"]["blocked_count"], 1);
         assert_eq!(status["scan"]["error_count"], 1);
-        assert_eq!(status["scan"]["scanned"], json!([blocked.clone(), passed]));
-        assert_eq!(status["scan"]["blocked"], json!([blocked]));
+        let mut legacy_passed = passed.clone();
+        legacy_passed["reasons"] = json!([]);
+        assert_eq!(
+            status["scan"]["scanned"],
+            json!([blocked.clone(), legacy_passed])
+        );
+        assert_eq!(status["scan"]["blocked"], json!([blocked.clone()]));
         assert!(status["scan"].get("errors").is_none());
+
+        let mut leaking = blocked;
+        leaking["reasons"] = json!(["guarddog:/Users/private/secret.log"]);
+        let response = app_with_config(ServerConfig {
+            auth_token: Some("test-token".into()),
+            status_file: Some(directory.path().join("quarantine-status.json")),
+            ..ServerConfig::default()
+        })
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/status/quarantine")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer test-token")
+                .body(axum::body::Body::from(
+                    json!({
+                        "captured_at": "2026-11-15T08:30:00Z",
+                        "packages": [],
+                        "scan": {
+                            "captured_at": "2026-11-15T08:31:00Z",
+                            "candidate_count": 1,
+                            "scanned": [leaking],
+                            "error_count": 0
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap_or_else(|_| panic!("valid request")),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("request succeeds"));
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

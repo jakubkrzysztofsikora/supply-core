@@ -180,7 +180,7 @@
         <div class="section-head">
           <div>
             <h2 id="scanned-heading">Scanned package details</h2>
-            <p>Latest published decisions, coverage, findings, scores, rules, and sources.</p>
+            <p>Latest published decisions, coverage, findings, scores, rules, sources, and incomplete-engine reasons.</p>
           </div>
         </div>
         <div class="table-wrap">
@@ -189,11 +189,11 @@
               <tr>
                 <th scope="col">Package</th><th scope="col">Version</th><th scope="col">Decision</th>
                 <th scope="col">Coverage</th><th scope="col">Findings</th><th scope="col">Score</th>
-                <th scope="col">Rules</th><th scope="col">Sources</th>
+                <th scope="col">Rules</th><th scope="col">Sources</th><th scope="col">Reasons</th>
               </tr>
             </thead>
             <tbody id="scanned-list">
-              <tr><td colspan="8" class="empty">Loading scan details…</td></tr>
+              <tr><td colspan="9" class="empty">Loading scan details…</td></tr>
             </tbody>
           </table>
         </div>
@@ -211,11 +211,11 @@
               <tr>
                 <th scope="col">Package</th><th scope="col">Version</th><th scope="col">Decision</th>
                 <th scope="col">Coverage</th><th scope="col">Findings</th><th scope="col">Score</th>
-                <th scope="col">Rules</th><th scope="col">Sources</th>
+                <th scope="col">Rules</th><th scope="col">Sources</th><th scope="col">Reasons</th>
               </tr>
             </thead>
             <tbody id="blocked-list">
-              <tr><td colspan="8" class="empty">Loading blocked packages…</td></tr>
+              <tr><td colspan="9" class="empty">Loading blocked packages…</td></tr>
             </tbody>
           </table>
         </div>
@@ -333,18 +333,19 @@
         row.score,
         Array.isArray(row.rules) ? row.rules.join(", ") : "—",
         Array.isArray(row.sources) ? row.sources.join(", ") : "—",
+        Array.isArray(row.reasons) && row.reasons.length ? row.reasons.join(", ") : "—",
       ];
       renderRows(
         "scanned-list",
         scan ? scan.scanned : [],
-        8,
+        9,
         "No scanned package details were published.",
         scanCells,
       );
       renderRows(
         "blocked-list",
         scan ? scan.blocked : [],
-        8,
+        9,
         "No blocked packages were reported.",
         scanCells,
       );
@@ -421,8 +422,8 @@
         text("service-status", "Unavailable");
         text("health-value", "Error");
         showMessage("quarantine-list", 4, "Diagnostics are temporarily unavailable.");
-        showMessage("scanned-list", 8, "Scan details are temporarily unavailable.");
-        showMessage("blocked-list", 8, "Scan-derived block details are temporarily unavailable.");
+        showMessage("scanned-list", 9, "Scan details are temporarily unavailable.");
+        showMessage("blocked-list", 9, "Scan-derived block details are temporarily unavailable.");
         showMessage("confirmed-list", 4, "Confirmed OSV details are temporarily unavailable.");
         showMessage("incomplete-list", 3, "Incomplete scan details are temporarily unavailable.");
       });

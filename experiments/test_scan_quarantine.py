@@ -179,7 +179,9 @@ class SummaryTest(unittest.TestCase):
                         {"policy_score": "5", "rule": "slopsquat-name"},
                         {"policy_score": "9", "rule": "ai-prompt-injection"},
                     ],
-                }
+                },
+                {"source": "guarddog", "findings": [], "reason": "scanner_memory_limit_unavailable"},
+                {"source": "ossgadget", "findings": [], "reason": None},
             ],
         }
         self.assertEqual(
@@ -191,6 +193,7 @@ class SummaryTest(unittest.TestCase):
                 "score": 9,
                 "rules": ["ai-prompt-injection", "slopsquat-name"],
                 "sources": ["static-heuristics"],
+                "reasons": ["guarddog:scanner_memory_limit_unavailable"],
             },
         )
         self.assertEqual(
@@ -204,6 +207,7 @@ class SummaryTest(unittest.TestCase):
                 "score": 0,
                 "rules": [],
                 "sources": [],
+                "reasons": [],
             },
         )
 

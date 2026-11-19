@@ -358,6 +358,7 @@ def public_scan_summary(report):
             "score": scan_score(entry.get("score")),
             "rules": scan_identifiers(entry.get("rules")),
             "sources": scan_identifiers(entry.get("sources")),
+            "reasons": scan_identifiers(entry.get("reasons", [])),
         })
     for entry in errors:
         if not isinstance(entry, dict):

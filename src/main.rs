@@ -885,10 +885,12 @@ fn scan_package(
     let mut external_scanners = Vec::new();
     if matches!(ecosystem, Ecosystem::Npm | Ecosystem::PyPi) {
         let command = std::env::var("GUARDDOG_BIN").unwrap_or_else(|_| "guarddog".to_string());
-        external_scanners.push(
-            supply_core::adapters::command_scanner::CommandScanner::guarddog(command)
-                .with_limits(std::time::Duration::from_secs(180), 8 * 1024 * 1024),
-        );
+        let guarddog = supply_core::adapters::command_scanner::CommandScanner::guarddog(command)
+            .with_limits(std::time::Duration::from_secs(180), 8 * 1024 * 1024);
+        external_scanners.push(match std::env::var_os("GUARDDOG_MANIFEST") {
+            Some(manifest) => guarddog.with_guarddog_manifest(Path::new(&manifest)),
+            None => guarddog,
+        });
     }
     if let Some(command) = external {
         external_scanners.push(supply_core::adapters::command_scanner::CommandScanner::new(

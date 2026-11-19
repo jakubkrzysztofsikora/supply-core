@@ -213,6 +213,7 @@ class SnapshotTest(unittest.TestCase):
                 '"coverage":"partial","findings":2,'
                 '"score":8.1234567890123456789012345678,'
                 '"rules":["install-script-pipe"],"sources":["static-heuristics"],'
+                '"reasons":["guarddog:engine_revision_unverified"],'
                 '"location":"/Users/private/source.tar"},'
                 '{"package":"clean","version":"2.0.0","decision":"pass",'
                 '"coverage":"complete","findings":0,"score":0,'
@@ -239,6 +240,7 @@ class SnapshotTest(unittest.TestCase):
                         "score": "8.1234567890123456789012345678",
                         "rules": ["install-script-pipe"],
                         "sources": ["static-heuristics"],
+                        "reasons": ["guarddog:engine_revision_unverified"],
                     },
                     {
                         "name": "clean",
@@ -249,6 +251,7 @@ class SnapshotTest(unittest.TestCase):
                         "score": "0",
                         "rules": [],
                         "sources": [],
+                        "reasons": [],
                     },
                 ],
                 "error_count": 1,

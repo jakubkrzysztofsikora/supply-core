@@ -562,12 +562,9 @@ fn sha256_directory(root: &Path) -> Result<String> {
                 collect(root, &entry.path(), files)?;
             } else if file_type.is_file() {
                 files.push(entry.path());
-                anyhow::ensure!(
-                    files.len() <= 10_000,
-                    "OSSGadget rule bundle has too many files"
-                );
+                anyhow::ensure!(files.len() <= 10_000, "rule bundle has too many files");
             } else {
-                anyhow::bail!("OSSGadget rule bundle contains a non-regular file");
+                anyhow::bail!("rule bundle contains a non-regular file");
             }
         }
         let _ = root;
@@ -576,21 +573,26 @@ fn sha256_directory(root: &Path) -> Result<String> {
 
     anyhow::ensure!(
         std::fs::symlink_metadata(root)?.file_type().is_dir(),
-        "OSSGadget rule bundle is not a real directory"
+        "rule bundle is not a real directory"
     );
     let mut files = Vec::new();
     collect(root, root, &mut files)?;
-    files.sort();
+    let mut entries = files
+        .into_iter()
+        .map(|path| {
+            let relative = path
+                .strip_prefix(root)?
+                .to_str()
+                .context("rule path is not UTF-8")?
+                .replace('\\', "/");
+            let normalized = normalize_relative_path(&relative).context("rule path is invalid")?;
+            Ok((normalized, path))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    entries.sort_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()));
     let mut bundle_hasher = Sha256::new();
     let mut total_bytes = 0_u64;
-    for path in files {
-        let relative = path
-            .strip_prefix(root)?
-            .to_str()
-            .context("OSSGadget rule path is not UTF-8")?
-            .replace('\\', "/");
-        let normalized =
-            normalize_ossgadget_path(&relative).context("OSSGadget rule path is invalid")?;
+    for (normalized, path) in entries {
         let mut file = File::open(&path)?;
         let mut content_hasher = Sha256::new();
         let mut size = 0_u64;
@@ -604,7 +606,7 @@ fn sha256_directory(root: &Path) -> Result<String> {
             total_bytes = total_bytes.saturating_add(count as u64);
             anyhow::ensure!(
                 total_bytes <= 64 * 1024 * 1024,
-                "OSSGadget rule bundle exceeds size limit"
+                "rule bundle exceeds size limit"
             );
             content_hasher.update(&buffer[..count]);
         }
@@ -616,7 +618,7 @@ fn sha256_directory(root: &Path) -> Result<String> {
     Ok(hex::encode(bundle_hasher.finalize()))
 }
 
-fn normalize_ossgadget_path(path: &str) -> Option<String> {
+fn normalize_relative_path(path: &str) -> Option<String> {
     if path.is_empty() || path.starts_with('/') || path.contains('\\') {
         return None;
     }
@@ -641,7 +643,7 @@ fn ossgadget_coverage_matches(
     }
     let mut scanned = std::collections::BTreeSet::new();
     for path in &coverage.scanned_paths {
-        let Some(path) = normalize_ossgadget_path(path) else {
+        let Some(path) = normalize_relative_path(path) else {
             return false;
         };
         if !scanned.insert(path) {
@@ -649,7 +651,7 @@ fn ossgadget_coverage_matches(
         }
     }
     for entry in &coverage.skipped_paths {
-        let Some(path) = normalize_ossgadget_path(&entry.path) else {
+        let Some(path) = normalize_relative_path(&entry.path) else {
             return false;
         };
         if !expected_paths.contains(&path) || entry.reason.is_empty() {
@@ -664,7 +666,7 @@ fn ossgadget_scanned_paths(
 ) -> Option<std::collections::BTreeSet<String>> {
     let mut scanned = std::collections::BTreeSet::new();
     for path in &coverage.scanned_paths {
-        if !scanned.insert(normalize_ossgadget_path(path)?) {
+        if !scanned.insert(normalize_relative_path(path)?) {
             return None;
         }
     }
@@ -683,7 +685,7 @@ fn normalize_sarif_path(path: &str, root: &Path, guest_root: &Path) -> Option<St
     } else {
         path
     };
-    normalize_ossgadget_path(relative.to_str()?)
+    normalize_relative_path(relative.to_str()?)
 }
 
 struct OssGadgetReportContext<'a> {
@@ -850,6 +852,77 @@ pub struct CommandScanner {
     pub timeout: Duration,
     pub max_output_bytes: usize,
     pub format: ReportFormat,
+    pub revision: EngineRevision,
+}
+
+/// Whether a scanner's engine version and rule bundle were verified for this run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineRevision {
+    Unknown,
+    Unverified,
+    Attested {
+        version: String,
+        rule_bundle_sha256: String,
+    },
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GuardDogInstallManifest {
+    format_version: u32,
+    guarddog_version: String,
+    executable_sha256: String,
+    package_dir: String,
+    package_sha256: String,
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn verify_guarddog_installation(command: &Path, manifest_path: &Path) -> Result<EngineRevision> {
+    let (manifest_bytes, truncated) = read_capped(File::open(manifest_path)?, 16 * 1024);
+    anyhow::ensure!(!truncated, "GuardDog install manifest exceeds size limit");
+    let manifest: GuardDogInstallManifest =
+        serde_json::from_slice(&manifest_bytes).context("invalid GuardDog install manifest")?;
+    anyhow::ensure!(
+        manifest.format_version == 1,
+        "unsupported GuardDog manifest format"
+    );
+    anyhow::ensure!(
+        !manifest.guarddog_version.is_empty()
+            && manifest.guarddog_version.len() <= 64
+            && manifest
+                .guarddog_version
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._+-".contains(&byte)),
+        "GuardDog manifest version is invalid"
+    );
+    anyhow::ensure!(
+        is_sha256_hex(&manifest.executable_sha256) && is_sha256_hex(&manifest.package_sha256),
+        "GuardDog manifest digests are invalid"
+    );
+    anyhow::ensure!(
+        sha256_path(command)? == manifest.executable_sha256,
+        "GuardDog executable digest does not match its manifest"
+    );
+    let package_dir = normalize_relative_path(&manifest.package_dir)
+        .context("GuardDog manifest package_dir is invalid")?;
+    let package_root = manifest_path
+        .parent()
+        .context("GuardDog manifest has no parent directory")?
+        .join(package_dir);
+    anyhow::ensure!(
+        sha256_directory(&package_root)? == manifest.package_sha256,
+        "GuardDog package digest does not match its manifest"
+    );
+    Ok(EngineRevision::Attested {
+        version: manifest.guarddog_version,
+        rule_bundle_sha256: manifest.package_sha256,
+    })
 }
 
 impl CommandScanner {
@@ -860,6 +933,7 @@ impl CommandScanner {
             timeout: DEFAULT_TIMEOUT,
             max_output_bytes: DEFAULT_MAX_OUTPUT,
             format: ReportFormat::Normalized,
+            revision: EngineRevision::Unknown,
         }
     }
 
@@ -870,7 +944,17 @@ impl CommandScanner {
             timeout: DEFAULT_TIMEOUT,
             max_output_bytes: DEFAULT_MAX_OUTPUT,
             format: ReportFormat::GuardDog,
+            revision: EngineRevision::Unknown,
         }
+    }
+
+    /// Attests the engine revision from an install manifest; any mismatch leaves
+    /// the scanner `Unverified`, so its reports stay partial.
+    pub fn with_guarddog_manifest(mut self, manifest_path: &Path) -> Self {
+        self.revision = resolve_executable(&self.command)
+            .and_then(|command| verify_guarddog_installation(&command, manifest_path))
+            .unwrap_or(EngineRevision::Unverified);
+        self
     }
 
     pub fn with_format(mut self, format: ReportFormat) -> Self {
@@ -2355,18 +2439,33 @@ impl ContentScanner for CommandScanner {
         )?;
         let reason = error_reason
             .or_else(|| findings_truncated.then_some("finding_limit"))
-            .unwrap_or("engine_revision_unavailable");
+            .or(match &self.revision {
+                EngineRevision::Unknown => Some("engine_revision_unavailable"),
+                EngineRevision::Unverified => Some("engine_revision_unverified"),
+                EngineRevision::Attested { .. } => None,
+            });
+        let (version, rule_bundle_sha256) = match &self.revision {
+            EngineRevision::Attested {
+                version,
+                rule_bundle_sha256,
+            } => (Some(version.clone()), Some(rule_bundle_sha256.clone())),
+            _ => (None, None),
+        };
         let engine_report = EngineReport {
             source: self.source.clone(),
-            version: None,
-            rule_bundle_sha256: None,
+            version,
+            rule_bundle_sha256,
             database_sha256: None,
             input_sha256: Some(input_sha256),
             expected_inputs: 1,
             processed_inputs: 1,
-            coverage: Coverage::Partial,
+            coverage: if reason.is_none() {
+                Coverage::Complete
+            } else {
+                Coverage::Partial
+            },
             findings,
-            reason: Some(reason.to_string()),
+            reason: reason.map(str::to_string),
         };
         engine_report.validate()?;
         Ok(engine_report)
@@ -2895,6 +2994,109 @@ mod tests {
         let payload = serde_json::json!({"score": 42, "rules": ["x"]});
         let (score, _, _, _) = parse_report(&payload, ReportFormat::Normalized).unwrap();
         assert_eq!(score, Decimal::TEN);
+    }
+
+    fn guarddog_install(root: &Path) -> PathBuf {
+        let site = root.join("venv/lib/python3.11/site-packages");
+        std::fs::create_dir_all(root.join("venv/bin")).unwrap();
+        std::fs::create_dir_all(site.join("guarddog/analyzer")).unwrap();
+        std::fs::create_dir_all(site.join("guarddog-3.2.0.dist-info")).unwrap();
+        std::fs::write(root.join("venv/bin/guarddog"), "#!/bin/sh\n").unwrap();
+        std::fs::write(site.join("guarddog/analyzer.py"), "rules = 1\n").unwrap();
+        std::fs::write(site.join("guarddog/analyzer/rule.yml"), "id: x\n").unwrap();
+        std::fs::write(
+            site.join("guarddog-3.2.0.dist-info/METADATA"),
+            "Name: guarddog\nVersion: 3.2.0\n",
+        )
+        .unwrap();
+        let status = Command::new("python3")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/scripts/write-guarddog-manifest.py"
+            ))
+            .arg("--install-root")
+            .arg(root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        root.join("supply-guarddog-manifest.json")
+    }
+
+    #[test]
+    fn guarddog_manifest_written_by_installer_attests_revision_until_tampered() {
+        let directory = tempfile::tempdir().unwrap();
+        let manifest = guarddog_install(directory.path());
+        let executable = directory.path().join("venv/bin/guarddog");
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+
+        let attested = CommandScanner::guarddog(&executable).with_guarddog_manifest(&manifest);
+        assert_eq!(
+            attested.revision,
+            EngineRevision::Attested {
+                version: "3.2.0".to_string(),
+                rule_bundle_sha256: written["package_sha256"].as_str().unwrap().to_string(),
+            }
+        );
+
+        std::fs::write(
+            directory
+                .path()
+                .join("venv/lib/python3.11/site-packages/guarddog/analyzer/rule.yml"),
+            "id: tampered\n",
+        )
+        .unwrap();
+        let tampered = CommandScanner::guarddog(&executable).with_guarddog_manifest(&manifest);
+        assert_eq!(tampered.revision, EngineRevision::Unverified);
+    }
+
+    #[test]
+    fn guarddog_manifest_rejects_escaping_package_dir_and_foreign_executable() {
+        let directory = tempfile::tempdir().unwrap();
+        let manifest = guarddog_install(directory.path());
+        let executable = directory.path().join("venv/bin/guarddog");
+        let mut written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+
+        let other = directory.path().join("other");
+        std::fs::write(&other, "#!/bin/sh\necho other\n").unwrap();
+        let foreign = CommandScanner::guarddog(&other).with_guarddog_manifest(&manifest);
+        assert_eq!(foreign.revision, EngineRevision::Unverified);
+
+        written["package_dir"] = serde_json::json!("../venv/lib/python3.11/site-packages/guarddog");
+        std::fs::write(&manifest, serde_json::to_vec(&written).unwrap()).unwrap();
+        let escaping = CommandScanner::guarddog(&executable).with_guarddog_manifest(&manifest);
+        assert_eq!(escaping.revision, EngineRevision::Unverified);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn guarddog_report_is_complete_only_with_attested_revision() {
+        let (_directory, path) = script(
+            r#"cat <<'EOF'
+{"results": {"capability-network-download": {}}, "risk_score": {"score": 0.0, "label": "no_risks_detected"}, "errors": {}}
+EOF"#,
+        );
+        let mut scanner = CommandScanner::guarddog(dispatcher());
+        scanner.revision = EngineRevision::Attested {
+            version: "3.2.0".to_string(),
+            rule_bundle_sha256: "a".repeat(64),
+        };
+        let attested = scan_path(&scanner, &path, "clean");
+        assert_eq!(attested.coverage, Coverage::Complete);
+        assert_eq!(attested.reason, None);
+        assert_eq!(attested.version.as_deref(), Some("3.2.0"));
+        assert_eq!(attested.rule_bundle_sha256, Some("a".repeat(64)));
+        attested.validate().unwrap();
+
+        scanner.revision = EngineRevision::Unverified;
+        let unverified = scan_path(&scanner, &path, "clean");
+        assert_eq!(unverified.coverage, Coverage::Partial);
+        assert_eq!(
+            unverified.reason.as_deref(),
+            Some("engine_revision_unverified")
+        );
+        assert_eq!(unverified.version, None);
     }
 
     #[cfg(target_os = "linux")]
