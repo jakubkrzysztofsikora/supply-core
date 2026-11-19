@@ -147,6 +147,11 @@ fn release_from_source_with_client(
             if content_url.host_str() != Some(host) {
                 anyhow::bail!("NuGet source redirected across hosts");
             }
+            let destination_allowed: DestinationPolicy = if is_circit {
+                trusted_azure_destination
+            } else {
+                same_origin_only
+            };
             let credential = if is_circit {
                 Some(token.context("SUPPLY_NUGET_TOKEN is required for Circit feed metadata")?)
             } else {
@@ -156,7 +161,7 @@ fn release_from_source_with_client(
                 client,
                 &content_url,
                 credential,
-                is_https,
+                destination_allowed,
             )?);
             metadata["packageHashAlgorithm"] = serde_json::Value::String("SHA512".into());
         }
@@ -165,26 +170,51 @@ fn release_from_source_with_client(
 }
 
 const MAX_PACKAGE_CONTENT_BYTES: u64 = 512 * 1024 * 1024;
+const AZURE_BLOB_SUFFIX: &str = ".blob.core.windows.net";
 
-fn is_https(url: &reqwest::Url) -> bool {
+type DestinationPolicy = fn(&reqwest::Url, bool) -> bool;
+
+fn plain_https(url: &reqwest::Url) -> bool {
     url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && matches!(url.port(), None | Some(443))
+}
+
+fn same_origin_only(url: &reqwest::Url, is_redirect: bool) -> bool {
+    !is_redirect && plain_https(url)
+}
+
+fn trusted_azure_destination(url: &reqwest::Url, is_redirect: bool) -> bool {
+    plain_https(url)
+        && (!is_redirect
+            || url
+                .host_str()
+                .and_then(|host| host.strip_suffix(AZURE_BLOB_SUFFIX))
+                .is_some_and(|account| !account.is_empty()))
+}
+
+// The redirect target carries a signed SAS URL: reqwest errors embed request URLs, so every
+// failure on this path is rebuilt without them.
+fn redacted(context: &str, error: reqwest::Error) -> anyhow::Error {
+    anyhow::anyhow!("{context}: {}", error.without_url())
 }
 
 // Azure Artifacts registration leaves point catalogEntry at a URL that always 404s, so no
 // packageHash is attested. Credentials go to the feed host only; the blob redirect is
-// followed once without them.
+// followed once, without them, and only to an Azure Blob Storage host.
 fn registry_package_hash(
     client: &reqwest::blocking::Client,
     content_url: &reqwest::Url,
     credential: Option<&str>,
-    scheme_allowed: fn(&reqwest::Url) -> bool,
+    destination_allowed: DestinationPolicy,
 ) -> Result<String> {
     use base64::Engine as _;
     use sha2::{Digest, Sha512};
     use std::io::Read;
 
-    if !scheme_allowed(content_url) {
-        anyhow::bail!("NuGet package content must use HTTPS");
+    if !destination_allowed(content_url, false) {
+        anyhow::bail!("NuGet package content must be fetched over plain HTTPS");
     }
     let mut request = client.get(content_url.clone());
     if let Some(credential) = credential {
@@ -192,7 +222,7 @@ fn registry_package_hash(
     }
     let mut response = request
         .send()
-        .context("NuGet package content request failed")?;
+        .map_err(|error| redacted("NuGet package content request failed", error))?;
     if response.status().is_redirection() {
         let location = response
             .headers()
@@ -201,29 +231,30 @@ fn registry_package_hash(
             .context("NuGet package content redirect has no location")?;
         let target = content_url
             .join(location)
-            .context("invalid NuGet package content redirect")?;
-        if !scheme_allowed(&target) {
-            anyhow::bail!("NuGet package content redirect must use HTTPS");
+            .map_err(|_| anyhow::anyhow!("invalid NuGet package content redirect"))?;
+        if !destination_allowed(&target, true) {
+            anyhow::bail!("NuGet package content redirect to an untrusted destination");
         }
         response = client
             .get(target)
             .send()
-            .context("NuGet package content redirect request failed")?;
+            .map_err(|error| redacted("NuGet package content redirect request failed", error))?;
     }
-    if response.status().is_redirection() {
+    let status = response.status();
+    if status.is_redirection() {
         anyhow::bail!("NuGet package content redirected more than once");
     }
-    let mut reader = response
-        .error_for_status()
-        .context("NuGet package content source rejected request")?
-        .take(MAX_PACKAGE_CONTENT_BYTES + 1);
+    if !status.is_success() {
+        anyhow::bail!("NuGet package content source returned HTTP {status}");
+    }
+    let mut reader = response.take(MAX_PACKAGE_CONTENT_BYTES + 1);
     let mut digest = Sha512::new();
     let mut buffer = [0u8; 64 * 1024];
     let mut total = 0u64;
     loop {
-        let read = reader
-            .read(&mut buffer)
-            .context("NuGet package content download failed")?;
+        let read = reader.read(&mut buffer).map_err(|error| {
+            anyhow::anyhow!("NuGet package content download failed: {}", error.kind())
+        })?;
         if read == 0 {
             break;
         }
@@ -672,8 +703,12 @@ mod tests {
         Ok(())
     }
 
-    fn http_allowed(_: &reqwest::Url) -> bool {
+    fn http_allowed(_: &reqwest::Url, _: bool) -> bool {
         true
+    }
+
+    fn local_feed_azure_redirect(url: &reqwest::Url, is_redirect: bool) -> bool {
+        !is_redirect || trusted_azure_destination(url, true)
     }
 
     fn serve_once(response: Vec<u8>) -> Result<(String, std::thread::JoinHandle<String>)> {
@@ -779,10 +814,100 @@ mod tests {
             &plain_client()?,
             &reqwest::Url::parse("http://feed.test/pkg.nupkg")?,
             None,
-            is_https,
+            trusted_azure_destination,
         )
         .unwrap_err();
-        assert!(format!("{error:#}").contains("must use HTTPS"));
+        assert!(format!("{error:#}").contains("plain HTTPS"));
+        Ok(())
+    }
+
+    #[test]
+    fn azure_destination_policy_pins_redirects_to_blob_storage_hosts() -> Result<()> {
+        let allowed = |url: &str, redirect: bool| -> Result<bool> {
+            Ok(trusted_azure_destination(
+                &reqwest::Url::parse(url)?,
+                redirect,
+            ))
+        };
+        assert!(allowed("https://pkgs.dev.azure.com/Circit/x.nupkg", false)?);
+        assert!(allowed(
+            "https://s83vsblobprodsu6weus72.blob.core.windows.net/b/x.blob?sig=a",
+            true
+        )?);
+        for rejected in [
+            "http://s83.blob.core.windows.net/b/x",
+            "https://evil.example/b/x",
+            "https://blob.core.windows.net.evil.example/b/x",
+            "https://evilblob.core.windows.net/b/x",
+            "https://blob.core.windows.net/b/x",
+            "https://s83.blob.core.windows.net:8443/b/x",
+            "https://user:pw@s83.blob.core.windows.net/b/x",
+            "https://169.254.169.254/latest/meta-data",
+        ] {
+            assert!(!allowed(rejected, true)?, "{rejected} must be rejected");
+        }
+        assert!(!same_origin_only(
+            &reqwest::Url::parse("https://s83.blob.core.windows.net/b/x")?,
+            true
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn registry_package_hash_refuses_redirect_to_untrusted_host_without_leaking_signature(
+    ) -> Result<()> {
+        let (feed_url, feed) = serve_once(redirect_response(
+            "https://evil.example/pkg?sig=SENTINEL-SIGNATURE",
+        ))?;
+        let error = registry_package_hash(
+            &plain_client()?,
+            &reqwest::Url::parse(&feed_url)?,
+            Some("secret-token"),
+            local_feed_azure_redirect,
+        )
+        .unwrap_err();
+        let rendered = format!("{error:?} {error:#}");
+        assert!(rendered.contains("untrusted destination"));
+        assert!(!rendered.contains("SENTINEL-SIGNATURE"));
+        assert!(!rendered.contains("secret-token"));
+        let _ = feed.join();
+        Ok(())
+    }
+
+    #[test]
+    fn registry_package_hash_errors_do_not_carry_the_signed_blob_url() -> Result<()> {
+        let (dropped_url, dropped) = serve_once(Vec::new())?;
+        let signed_dropped = format!("{dropped_url}?sig=SENTINEL-SIGNATURE");
+        let (feed_url, feed) = serve_once(redirect_response(&signed_dropped))?;
+        let error = registry_package_hash(
+            &plain_client()?,
+            &reqwest::Url::parse(&feed_url)?,
+            None,
+            http_allowed,
+        )
+        .unwrap_err();
+        let rendered = format!("{error:?} {error:#}");
+        assert!(rendered.contains("redirect request failed"));
+        assert!(!rendered.contains("SENTINEL-SIGNATURE"), "{rendered}");
+        let _ = (feed.join(), dropped.join());
+
+        let (denied_url, denied) = serve_once(
+            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        )?;
+        let (feed_url, feed) = serve_once(redirect_response(&format!(
+            "{denied_url}?sig=SENTINEL-SIGNATURE"
+        )))?;
+        let error = registry_package_hash(
+            &plain_client()?,
+            &reqwest::Url::parse(&feed_url)?,
+            None,
+            http_allowed,
+        )
+        .unwrap_err();
+        let rendered = format!("{error:?} {error:#}");
+        assert!(rendered.contains("403"));
+        assert!(!rendered.contains("SENTINEL-SIGNATURE"), "{rendered}");
+        let _ = (feed.join(), denied.join());
         Ok(())
     }
 }
