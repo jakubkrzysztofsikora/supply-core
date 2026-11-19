@@ -12,7 +12,7 @@ diff --git a/src/Shared.CLI/Tools/DetectBackdoorTool.cs b/src/Shared.CLI/Tools/D
 +            WriteCoverageReport(options, detectionResults);
  
              foreach (Dictionary<string, AnalyzeResult?>? result in detectionResults)
-@@ -123,7 +125,168 @@
+@@ -123,7 +125,172 @@
                  }
              }
  
@@ -91,7 +91,11 @@ diff --git a/src/Shared.CLI/Tools/DetectBackdoorTool.cs b/src/Shared.CLI/Tools/D
 +                        .Replace(Path.DirectorySeparatorChar, '/')
 +                        .Replace(Path.AltDirectorySeparatorChar, '/');
 +                    analyses.TryGetValue(file, out AnalyzeResult? analysis);
-+                    if (analysis?.Metadata?.TotalFiles == 1)
++                    var metadata = analysis?.Metadata;
++                    bool archiveAnalyzed = metadata != null && metadata.TotalFiles > 1
++                        && !metadata.TimedOut && metadata.FilesTimedOut == 0
++                        && metadata.FilesTimeOutSkipped == 0 && metadata.FileErrored == 0;
++                    if (metadata?.TotalFiles == 1 || archiveAnalyzed)
 +                    {
 +                        scannedPaths.Add(relative);
 +                    }

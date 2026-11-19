@@ -727,6 +727,13 @@ struct OssGadgetReportContext<'a> {
     output_complete: bool,
 }
 
+fn path_within_inventory(path: &str, expected_paths: &std::collections::BTreeSet<String>) -> bool {
+    expected_paths.contains(path)
+        || path
+            .match_indices('/')
+            .any(|(index, _)| expected_paths.contains(&path[..index]))
+}
+
 fn ossgadget_engine_report(
     context: OssGadgetReportContext<'_>,
     sarif: Option<OssGadgetSarif>,
@@ -763,7 +770,7 @@ fn ossgadget_engine_report(
             if let Some(path) = &path {
                 if path
                     .as_ref()
-                    .is_none_or(|path| !expected_paths.contains(path))
+                    .is_none_or(|path| !path_within_inventory(path, expected_paths))
                 {
                     location_outside_inventory = true;
                 }
@@ -3010,6 +3017,23 @@ mod tests {
         assert_eq!(report.coverage, Coverage::Partial);
         assert_eq!(report.reason.as_deref(), Some("finding_limit"));
         assert_eq!(report.findings.len(), 256);
+    }
+
+    #[test]
+    fn ossgadget_matches_inside_a_nested_archive_belong_to_that_member() {
+        let files = vec!["dist/all.zip".to_string()];
+        let inside = [
+            ("dist/all.zip/a.js".to_string(), 1),
+            ("dist/all.zip/b.js".to_string(), 1),
+        ];
+        let report = ossgadget_report_for(&files, inside.into_iter());
+        assert_eq!(report.coverage, Coverage::Complete);
+        assert_eq!(report.reason, None);
+        assert_eq!(report.findings.len(), 2);
+
+        let lookalike = [("dist/all.zipx/a.js".to_string(), 1)];
+        let report = ossgadget_report_for(&files, lookalike.into_iter());
+        assert_eq!(report.reason.as_deref(), Some("input_coverage_mismatch"));
     }
 
     #[test]

@@ -78,5 +78,10 @@ trust model.
   executes package code.
 - GuardDog attestation covers its console script and installed `guarddog`
   package bytes, not the rest of its pinned Python dependency tree.
+- Binary members with a wasm, zip, gzip, PNG, JPEG or TrueType header count as
+  covered without static content rules. Only headers that are a JavaScript
+  syntax error at byte 0 qualify, because Node runs unknown extensions as
+  JavaScript; GIF, WOFF and OTF headers parse as identifiers and stay
+  incomplete. Contents of nested archives are covered by OSSGadget only.
 - `ArtifactStore::get` still takes caller-supplied paths; constrained
   before the HTTP serve endpoint lands.

@@ -212,7 +212,9 @@ scan; other engines keep 2 GiB. Each sandbox mounts the public system CA bundle
 read-only, because GuardDog's `pygit2` aborts at import without it. The static
 scanner rejects text members above 16 MiB. OSSGadget reports one finding per
 rule and file, so repeated matches in minified bundles stay under the 256-finding
-limit.
+limit. OSSGadget also scans inside nested archives; their matches count against
+the archive member. Binary members keep a scan incomplete unless their header is
+wasm, zip, gzip, PNG, JPEG or TrueType.
 
 The `scanner` Docker target (`ghcr.io/jakubkrzysztofsikora/supply-core:<tag>-scanner`,
 built by `.github/workflows/scanner-image.yml`) contains all three attested

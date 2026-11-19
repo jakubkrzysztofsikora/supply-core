@@ -622,6 +622,36 @@ fn file_is_utf8_text(path: &Path) -> Result<bool> {
     }
 }
 
+// Node runs unknown extensions as JavaScript, so only magics that are a JS
+// syntax error at byte 0 qualify; GIF/WOFF/OTF headers parse as identifiers.
+const DATA_FORMAT_MAGICS: &[&[u8]] = &[
+    b"\0asm",
+    b"PK\x03\x04",
+    b"PK\x05\x06",
+    b"\x1f\x8b",
+    b"\x89PNG\r\n\x1a\n",
+    b"\xff\xd8\xff",
+    b"\0\x01\0\0",
+];
+
+fn is_identified_data_member(member: &ArchiveMember) -> bool {
+    let Ok(mut file) = File::open(&member.staged_path) else {
+        return false;
+    };
+    let mut header = [0u8; 8];
+    let mut read = 0;
+    while read < header.len() {
+        match file.read(&mut header[read..]) {
+            Ok(0) => break,
+            Ok(count) => read += count,
+            Err(_) => return false,
+        }
+    }
+    DATA_FORMAT_MAGICS
+        .iter()
+        .any(|magic| header[..read].starts_with(magic))
+}
+
 fn classify_file(path: &Path, size: u64) -> Result<(ArchiveMemberType, Option<String>)> {
     if size > u64::try_from(MAX_FILE_BYTES)? {
         anyhow::ensure!(
@@ -662,11 +692,10 @@ fn finish_inventory(
     }
     let incomplete_members = members
         .iter()
-        .filter(|member| {
-            matches!(
-                member.member_type,
-                ArchiveMemberType::Binary | ArchiveMemberType::Unsupported
-            )
+        .filter(|member| match member.member_type {
+            ArchiveMemberType::Binary => !is_identified_data_member(member),
+            ArchiveMemberType::Unsupported => true,
+            _ => false,
         })
         .map(|member| member.normalized_path.clone())
         .collect::<Vec<_>>();
@@ -1265,7 +1294,16 @@ fn scan_archive_inventory_with_completion(
                 .map(|content| (member.normalized_path.as_str(), content))
         })
         .collect();
-    let static_scan = scan_package_files_detailed(ecosystem, name, version, &borrowed);
+    let mut static_scan = scan_package_files_detailed(ecosystem, name, version, &borrowed);
+    static_scan.processed_paths.extend(
+        inventory
+            .members
+            .iter()
+            .filter(|member| {
+                member.member_type == ArchiveMemberType::Binary && is_identified_data_member(member)
+            })
+            .map(|member| member.normalized_path.clone()),
+    );
     let mut finding = static_scan.finding;
     if let Some(finding) = &mut finding {
         finding.scan_incomplete = !inventory.complete;
@@ -3671,6 +3709,45 @@ mod tests {
         assert_eq!(report.expected_inputs, 2);
         assert_eq!(report.processed_inputs, 1);
         assert_eq!(body.evidence.coverage, Some(Coverage::Partial));
+        Ok(())
+    }
+
+    #[test]
+    fn identified_data_formats_complete_static_scan_coverage() -> Result<()> {
+        use crate::adapters::storage::MemoryMetadataStore;
+
+        let store = MemoryMetadataStore::default();
+        let recorder = LedgerRecorder::open_in_memory()?;
+        let bytes = zip_archive(&[
+            ("index.js", b"module.exports = 1;"),
+            ("dist/sql.wasm", b"\0asm\x01\0\0\0\xff"),
+            ("dist/bundle.zip", b"PK\x03\x04\x14\0\0\0\xff"),
+            ("logo.png", b"\x89PNG\r\n\x1a\n\xff"),
+        ]);
+        let scratch = tempfile::tempdir()?;
+        scan_archive_bytes(
+            &store,
+            &recorder,
+            &Ecosystem::Npm,
+            "lib",
+            &version(),
+            &bytes,
+            scratch.path(),
+        )?;
+
+        let mut events = recorder.events_from(0, 1)?;
+        let LedgerEventDetails::ScanCompleted(body) = events.remove(0).body.details else {
+            panic!("expected scan_completed event");
+        };
+        let report = body
+            .evidence
+            .engine_reports
+            .iter()
+            .find(|report| report.source == "static-heuristics")
+            .unwrap();
+        assert_eq!(report.coverage, Coverage::Complete);
+        assert_eq!(report.expected_inputs, 4);
+        assert_eq!(report.processed_inputs, 4);
         Ok(())
     }
 
