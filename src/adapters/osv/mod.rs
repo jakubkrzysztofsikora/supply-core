@@ -45,9 +45,13 @@ pub struct ReqwestOsvTransport {
 }
 impl ReqwestOsvTransport {
     pub fn new() -> Result<Self> {
+        Self::with_timeout(std::time::Duration::from_secs(8))
+    }
+
+    fn with_timeout(timeout: std::time::Duration) -> Result<Self> {
         Ok(Self {
             client: reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(8))
+                .timeout(timeout)
                 .build()
                 .context("create OSV client")?,
         })
@@ -74,10 +78,13 @@ impl ReqwestOsvTransport {
             return Err((anyhow::anyhow!("OSV returned non-2xx: {status}"), retryable));
         }
         resp.json().map_err(|error| {
-            (
-                anyhow::Error::new(error).context("OSV returned non-JSON"),
-                false,
-            )
+            let retryable = error.is_timeout();
+            let context = if error.is_timeout() {
+                "OSV response body timed out"
+            } else {
+                "OSV returned non-JSON"
+            };
+            (anyhow::Error::new(error).context(context), retryable)
         })
     }
 }
@@ -594,6 +601,41 @@ mod tests {
         let value = ReqwestOsvTransport::new()?.post_json(&url, &serde_json::json!({}))?;
         assert_eq!(value, serde_json::json!({}));
         assert_eq!(server.join().map_err(|_| anyhow::anyhow!("server"))?, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn transport_retries_a_response_body_that_stalls() -> Result<()> {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+        let url = format!("http://{}/v1/query", listener.local_addr()?);
+        let server = std::thread::spawn(move || {
+            let mut stalled = Vec::new();
+            for attempt in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buffer = [0u8; 4096];
+                let _ = stream.read(&mut buffer);
+                if attempt == 0 {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{",
+                    );
+                    let _ = stream.flush();
+                    stalled.push(stream);
+                } else {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    );
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            stalled.len()
+        });
+        let transport = ReqwestOsvTransport::with_timeout(std::time::Duration::from_millis(400))?;
+        let value = transport.post_json(&url, &serde_json::json!({}))?;
+        assert_eq!(value, serde_json::json!({}));
+        assert_eq!(server.join().map_err(|_| anyhow::anyhow!("server"))?, 1);
         Ok(())
     }
 

@@ -71,6 +71,10 @@ pub fn scan(
         errors: Vec::new(),
         complete: false,
     };
+    if let Err(error) = validate_first_party_policy(&policy.nuget.first_party_packages) {
+        report.errors.push(format!("{error:#}"));
+        return Ok((report, 1));
+    }
     if npm_locks.is_empty() && nuget_locks.is_empty() {
         report
             .errors
@@ -609,14 +613,16 @@ fn attest_nuget_hash(
     if lock.ecosystem != Ecosystem::NuGet {
         return Ok(None);
     }
-    let (name, version) = (lock.name.clone(), lock.version.clone());
+    let (name, version, source) = (lock.name.clone(), lock.version.clone(), lock.source.clone());
+    let token = std::env::var("SUPPLY_NUGET_TOKEN").ok();
     let (metadata, attestation) = attested_nuget_metadata(
         &lock.metadata,
         &name,
-        &lock.source,
+        &source,
         first_party,
         &|| nuget::release_from_source(NUGET_ORG_INDEX, &name, &version, None),
         &|| nuget::package_id_exists_on_source(NUGET_ORG_INDEX, &name),
+        &|content| nuget::feed_package_hash(&source, content, token.as_deref()),
     )?;
     lock.metadata = metadata;
     Ok(Some(attestation))
@@ -629,12 +635,29 @@ fn same_source(left: &str, right: &str) -> bool {
     }
 }
 
-// Azure Artifacts attests no package hash. Mirrored packages take nuget.org's catalog hash,
-// so the feed cannot vouch for itself. A first-party package is one whose id matches a
-// policy prefix AND was restored from that entry's exact feed; a prefixed id from any
-// other source is refused outright. No version of a first-party id may exist on nuget.org
-// (dependency confusion), and it is held to the lockfile contentHash plus the bytes the
-// feed serves.
+fn validate_first_party_policy(
+    first_party: &[crate::domain::FirstPartyNuGetPackages],
+) -> Result<()> {
+    for entry in first_party {
+        anyhow::ensure!(
+            !entry.prefix.is_empty(),
+            "nuget.first_party_packages prefix must not be empty"
+        );
+        anyhow::ensure!(
+            nuget::is_circit_feed(&entry.source),
+            "nuget.first_party_packages source {} must be an HTTPS Azure Artifacts feed in the Circit organization",
+            entry.source
+        );
+    }
+    Ok(())
+}
+
+// Azure Artifacts attests no package hash. Mirrored packages take nuget.org's catalog hash
+// and publish/listed state, so the feed cannot vouch for itself. A first-party package is one
+// whose id matches a policy prefix AND was restored from that entry's exact feed; a prefixed
+// id from any other source is refused outright. No version of a first-party id may exist on
+// nuget.org (dependency confusion) whatever hash the feed offers, and without a catalog hash
+// it is held to the lockfile contentHash plus the bytes the feed serves.
 fn attested_nuget_metadata(
     metadata: &serde_json::Value,
     name: &str,
@@ -642,6 +665,7 @@ fn attested_nuget_metadata(
     first_party: &[crate::domain::FirstPartyNuGetPackages],
     upstream: &dyn Fn() -> Result<serde_json::Value>,
     id_exists_upstream: &dyn Fn() -> Result<bool>,
+    feed_hash: &dyn Fn(&str) -> Result<String>,
 ) -> Result<(serde_json::Value, &'static str)> {
     let lowered = name.to_ascii_lowercase();
     let claimed: Vec<_> = first_party
@@ -658,35 +682,41 @@ fn attested_nuget_metadata(
             "package {name} uses a first-party prefix but was restored from {source}, not a trusted first-party feed"
         );
     }
-    if !metadata["packageHash"].is_null() {
-        return Ok((metadata.clone(), "registry-catalog"));
-    }
-    let Some(feed_hash) = metadata["feedContentHash"].as_str() else {
-        return Ok((metadata.clone(), "none"));
-    };
-    let mut attested = metadata.clone();
     if trusted {
         let exists = id_exists_upstream()
             .context("cannot confirm first-party package id is absent from nuget.org")?;
         if exists {
             anyhow::bail!(
-                "first-party package id {name} exists on nuget.org; refusing feed-only attestation"
+                "first-party package id {name} exists on nuget.org; refusing to attest it"
             );
         }
-        attested["packageHash"] = serde_json::Value::String(feed_hash.to_string());
+        if !metadata["packageHash"].is_null() {
+            return Ok((metadata.clone(), "registry-catalog"));
+        }
+        let content = metadata["packageContent"]
+            .as_str()
+            .context("registration leaf of first-party package lacks packageContent")?;
+        let mut attested = metadata.clone();
+        attested["packageHash"] = serde_json::Value::String(feed_hash(content)?);
         attested["packageHashAlgorithm"] = serde_json::Value::String("SHA512".into());
         return Ok((attested, "first-party-feed-bytes"));
+    }
+    if !metadata["packageHash"].is_null() {
+        return Ok((metadata.clone(), "registry-catalog"));
+    }
+    if !nuget::is_circit_feed(source) {
+        return Ok((metadata.clone(), "none"));
     }
     let upstream_metadata =
         upstream().context("cannot attest mirrored package against nuget.org")?;
     let Some(upstream_hash) = upstream_metadata["packageHash"].as_str() else {
         anyhow::bail!("mirrored package {name} has no nuget.org catalog hash; cannot attest");
     };
+    let mut attested = metadata.clone();
     attested["packageHash"] = serde_json::Value::String(upstream_hash.to_string());
     attested["packageHashAlgorithm"] = upstream_metadata["packageHashAlgorithm"].clone();
-    if !upstream_metadata["published"].is_null() {
-        attested["published"] = upstream_metadata["published"].clone();
-    }
+    attested["published"] = upstream_metadata["published"].clone();
+    attested["listed"] = upstream_metadata["listed"].clone();
     Ok((attested, "upstream-catalog"))
 }
 
@@ -1320,16 +1350,29 @@ mod tests {
         anyhow::bail!("id lookup must not be consulted")
     }
 
+    fn no_feed_hash(_: &str) -> Result<String> {
+        anyhow::bail!("feed bytes must not be downloaded")
+    }
+
+    fn leaf(hash: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "packageHash": hash,
+            "packageContent": "https://pkgs.dev.azure.com/Circit/x/flat2/circit.evidence/1.0.0/circit.evidence.1.0.0.nupkg",
+            "published": "2026-11-19T16:00:00Z",
+            "listed": true
+        })
+    }
+
     #[test]
-    fn catalog_hash_is_used_as_is() -> Result<()> {
-        let metadata = serde_json::json!({ "packageHash": "CATALOG", "feedContentHash": "FEED" });
+    fn catalog_hash_is_used_as_is_for_unclaimed_packages() -> Result<()> {
         let (attested, label) = attested_nuget_metadata(
-            &metadata,
+            &leaf(Some("CATALOG")),
             "Any.Package",
             NUGET_ORG,
             &first_party(),
             &no_upstream_release,
             &no_id_lookup,
+            &no_feed_hash,
         )?;
         assert_eq!(attested["packageHash"], "CATALOG");
         assert_eq!(label, "registry-catalog");
@@ -1337,11 +1380,10 @@ mod tests {
     }
 
     #[test]
-    fn mirrored_package_takes_hash_and_age_from_nuget_org_not_the_feed() -> Result<()> {
-        let metadata =
-            serde_json::json!({ "feedContentHash": "FEED", "published": "2026-11-19T16:00:00Z" });
+    fn mirrored_package_takes_hash_age_and_listing_from_nuget_org_without_downloading() -> Result<()>
+    {
         let (attested, label) = attested_nuget_metadata(
-            &metadata,
+            &leaf(None),
             "Microsoft.Extensions.Http",
             BACKEND,
             &first_party(),
@@ -1349,88 +1391,144 @@ mod tests {
                 Ok(serde_json::json!({
                     "packageHash": "UPSTREAM",
                     "packageHashAlgorithm": "SHA512",
-                    "published": "2026-02-10T18:55:00Z"
+                    "published": "2026-02-10T18:55:00Z",
+                    "listed": false
                 }))
             },
             &no_id_lookup,
+            &no_feed_hash,
         )?;
         assert_eq!(attested["packageHash"], "UPSTREAM");
         assert_eq!(attested["published"], "2026-02-10T18:55:00Z");
+        assert_eq!(attested["listed"], false);
         assert_eq!(label, "upstream-catalog");
         Ok(())
     }
 
     #[test]
-    fn mirrored_package_without_an_upstream_hash_is_an_error() {
-        let metadata = serde_json::json!({ "feedContentHash": "FEED" });
-        assert!(attested_nuget_metadata(
-            &metadata,
-            "Some.Mirrored",
+    fn mirrored_package_never_keeps_the_mirrors_age_when_nuget_org_has_none() -> Result<()> {
+        let (attested, _) = attested_nuget_metadata(
+            &leaf(None),
+            "Microsoft.Extensions.Http",
             BACKEND,
             &first_party(),
-            &|| Ok(serde_json::json!({ "packageHash": null })),
+            &|| Ok(serde_json::json!({ "packageHash": "UPSTREAM" })),
             &no_id_lookup,
-        )
-        .is_err());
-        assert!(attested_nuget_metadata(
-            &metadata,
-            "Some.Mirrored",
-            BACKEND,
-            &first_party(),
-            &|| anyhow::bail!("HTTP 404"),
-            &no_id_lookup,
-        )
-        .is_err());
+            &no_feed_hash,
+        )?;
+        assert!(attested["published"].is_null());
+        Ok(())
     }
 
     #[test]
-    fn first_party_package_needs_id_absence_from_nuget_org() -> Result<()> {
-        let metadata = serde_json::json!({ "feedContentHash": "FEED" });
+    fn mirrored_package_without_an_upstream_hash_is_an_error() {
+        for upstream in [
+            Ok(serde_json::json!({ "packageHash": null })),
+            Err(anyhow::anyhow!("HTTP 404")),
+        ] {
+            let upstream = std::cell::RefCell::new(Some(upstream));
+            assert!(attested_nuget_metadata(
+                &leaf(None),
+                "Some.Mirrored",
+                BACKEND,
+                &first_party(),
+                &|| upstream.borrow_mut().take().unwrap(),
+                &no_id_lookup,
+                &no_feed_hash,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn first_party_package_needs_id_absence_and_hashes_the_feed_bytes_on_demand() -> Result<()> {
+        let requested = std::cell::RefCell::new(Vec::new());
         let (attested, label) = attested_nuget_metadata(
-            &metadata,
+            &leaf(None),
             "circit.evidence",
             BACKEND,
             &first_party(),
             &no_upstream_release,
             &|| Ok(false),
+            &|content| {
+                requested.borrow_mut().push(content.to_string());
+                Ok("FEEDHASH".to_string())
+            },
         )?;
-        assert_eq!(attested["packageHash"], "FEED");
+        assert_eq!(attested["packageHash"], "FEEDHASH");
+        assert_eq!(attested["packageHashAlgorithm"], "SHA512");
         assert_eq!(label, "first-party-feed-bytes");
+        assert_eq!(requested.borrow().len(), 1);
+        assert!(requested.borrow()[0].ends_with("circit.evidence.1.0.0.nupkg"));
+        Ok(())
+    }
 
-        let confused = attested_nuget_metadata(
-            &metadata,
-            "Circit.Evidence",
-            BACKEND,
-            &first_party(),
-            &no_upstream_release,
-            &|| Ok(true),
-        );
-        assert!(format!("{:#}", confused.unwrap_err()).contains("exists on nuget.org"));
+    #[test]
+    fn first_party_id_on_nuget_org_is_refused_even_with_a_catalog_hash() {
+        for metadata in [leaf(Some("CATALOG")), leaf(None)] {
+            let error = attested_nuget_metadata(
+                &metadata,
+                "Circit.Evidence",
+                BACKEND,
+                &first_party(),
+                &no_upstream_release,
+                &|| Ok(true),
+                &no_feed_hash,
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("exists on nuget.org"));
+        }
+    }
 
+    #[test]
+    fn first_party_attestation_fails_closed_when_checks_cannot_run() {
         let unreachable = attested_nuget_metadata(
-            &metadata,
+            &leaf(None),
             "Circit.Evidence",
             BACKEND,
             &first_party(),
             &no_upstream_release,
             &|| anyhow::bail!("service index rejected request"),
+            &no_feed_hash,
         );
         assert!(format!("{:#}", unreachable.unwrap_err()).contains("cannot confirm"));
-        Ok(())
+
+        let download_failed = attested_nuget_metadata(
+            &leaf(None),
+            "Circit.Evidence",
+            BACKEND,
+            &first_party(),
+            &no_upstream_release,
+            &|| Ok(false),
+            &|_| anyhow::bail!("download timed out"),
+        );
+        assert!(format!("{:#}", download_failed.unwrap_err()).contains("download timed out"));
+
+        let mut without_content = leaf(None);
+        without_content["packageContent"] = serde_json::Value::Null;
+        assert!(attested_nuget_metadata(
+            &without_content,
+            "Circit.Evidence",
+            BACKEND,
+            &first_party(),
+            &no_upstream_release,
+            &|| Ok(false),
+            &no_feed_hash,
+        )
+        .is_err());
     }
 
     #[test]
     fn first_party_prefix_from_any_other_source_is_refused() {
-        let feed_only = serde_json::json!({ "feedContentHash": "FEED" });
-        let with_catalog = serde_json::json!({ "packageHash": "CATALOG" });
-        for (metadata, source) in [(&feed_only, OTHER_FEED), (&with_catalog, NUGET_ORG)] {
+        for (metadata, source) in [(leaf(None), OTHER_FEED), (leaf(Some("CATALOG")), NUGET_ORG)] {
             let error = attested_nuget_metadata(
-                metadata,
+                &metadata,
                 "Circit.Evidence",
                 source,
                 &first_party(),
                 &no_upstream_release,
                 &|| Ok(false),
+                &no_feed_hash,
             )
             .unwrap_err();
             assert!(
@@ -1442,7 +1540,6 @@ mod tests {
 
     #[test]
     fn feed_identity_is_compared_exactly_not_by_host_or_prefix() {
-        let feed_only = serde_json::json!({ "feedContentHash": "FEED" });
         for lookalike in [
             "https://pkgs.dev.azure.com/Circit/Circit/_packaging/Backend2/nuget/v3/index.json",
             "https://pkgs.dev.azure.com/Circit/Other/_packaging/Backend/nuget/v3/index.json",
@@ -1451,12 +1548,13 @@ mod tests {
         ] {
             assert!(
                 attested_nuget_metadata(
-                    &feed_only,
+                    &leaf(None),
                     "Circit.Evidence",
                     lookalike,
                     &first_party(),
                     &no_upstream_release,
                     &|| Ok(false),
+                    &|_| Ok("FEEDHASH".to_string()),
                 )
                 .is_err(),
                 "{lookalike} must not be trusted"
@@ -1465,16 +1563,48 @@ mod tests {
     }
 
     #[test]
-    fn no_first_party_entries_means_nothing_is_first_party() {
-        let metadata = serde_json::json!({ "feedContentHash": "FEED" });
-        let result = attested_nuget_metadata(
-            &metadata,
+    fn no_first_party_entries_means_nothing_is_first_party() -> Result<()> {
+        let (attested, label) = attested_nuget_metadata(
+            &leaf(None),
             "Circit.Evidence",
             BACKEND,
             &[],
             &|| Ok(serde_json::json!({ "packageHash": "UPSTREAM" })),
             &no_id_lookup,
-        );
-        assert_eq!(result.unwrap().0["packageHash"], "UPSTREAM");
+            &no_feed_hash,
+        )?;
+        assert_eq!(attested["packageHash"], "UPSTREAM");
+        assert_eq!(label, "upstream-catalog");
+        Ok(())
+    }
+
+    #[test]
+    fn first_party_policy_must_name_a_circit_azure_artifacts_feed() {
+        assert!(validate_first_party_policy(&first_party()).is_ok());
+        let entry = |prefix: &str, source: &str| {
+            vec![crate::domain::FirstPartyNuGetPackages {
+                prefix: prefix.to_string(),
+                source: source.to_string(),
+            }]
+        };
+        for bad in [
+            entry("Circit.", "https://api.nuget.org/v3/index.json"),
+            entry(
+                "Circit.",
+                "https://pkgs.dev.azure.com/Other/Feed/_packaging/F/nuget/v3/index.json",
+            ),
+            entry(
+                "Circit.",
+                "http://pkgs.dev.azure.com/Circit/Circit/_packaging/Backend/nuget/v3/index.json",
+            ),
+            entry("", BACKEND),
+        ] {
+            assert!(validate_first_party_policy(&bad).is_err());
+        }
+        let mut policy = crate::domain::Policy::default();
+        policy.nuget.first_party_packages = entry("Circit.", "https://api.nuget.org/v3/index.json");
+        let (report, status) = scan(&[], &[], None, &policy, None).unwrap();
+        assert_eq!(status, 1);
+        assert!(report.errors[0].contains("Azure Artifacts feed in the Circit organization"));
     }
 }

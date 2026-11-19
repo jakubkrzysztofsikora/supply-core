@@ -588,9 +588,13 @@ pip:
 nuget:
   require_integrity: true
   fallback_to_frozen: true
-  first_party_packages: []   # ids with this prefix are trusted only from this exact feed
-  #  - prefix: "Circit."
-  #    source: "https://pkgs.dev.azure.com/Circit/Circit/_packaging/Backend/nuget/v3/index.json"
+  first_party_packages: []
+  # Replace [] with a list to attest first-party ids that Azure Artifacts cannot hash. The
+  # source must be a Circit-organization Azure Artifacts feed; ids with the prefix are trusted
+  # only when restored from that exact feed and must not exist on nuget.org:
+  #   first_party_packages:
+  #     - prefix: "Circit."
+  #       source: "https://pkgs.dev.azure.com/Circit/Circit/_packaging/Backend/nuget/v3/index.json"
 
 docker:
   require_digest_pin: true

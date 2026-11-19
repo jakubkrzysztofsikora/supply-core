@@ -149,8 +149,7 @@ fn release_from_source_with_client(
         anyhow::bail!("NuGet source must use HTTPS");
     }
     let host = source_url.host_str().context("NuGet source has no host")?;
-    let is_circit = host == "pkgs.dev.azure.com" && source_url.path().starts_with("/Circit/")
-        || host == "circit.pkgs.visualstudio.com";
+    let is_circit = is_circit_feed(source);
     if token.is_some() && !is_circit {
         anyhow::bail!("NuGet credentials are not allowed for this source");
     }
@@ -194,25 +193,50 @@ fn release_from_source_with_client(
         Some(entry) => entry.clone(),
         None => serde_json::Value::Null,
     };
-    let mut metadata = release_metadata(&leaf_value, &catalog);
-    if is_circit && metadata["packageHash"].is_null() {
-        if let Some(content) = leaf_value.get("packageContent").and_then(|v| v.as_str()) {
-            let content_url =
-                reqwest::Url::parse(content).context("invalid NuGet package content URL")?;
-            if content_url.host_str() != Some(host) {
-                anyhow::bail!("NuGet source redirected across hosts");
-            }
-            let credential =
-                token.context("SUPPLY_NUGET_TOKEN is required for Circit feed metadata")?;
-            metadata["feedContentHash"] = serde_json::Value::String(registry_package_hash(
-                client,
-                &content_url,
-                Some(credential),
-                trusted_azure_destination,
-            )?);
+    Ok(release_metadata(&leaf_value, &catalog))
+}
+
+/// True for an HTTPS Azure Artifacts feed in the Circit organization, the only feeds the
+/// scanner will send credentials to.
+pub fn is_circit_feed(source: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(source) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && match url.host_str() {
+            Some("pkgs.dev.azure.com") => url.path().starts_with("/Circit/"),
+            Some("circit.pkgs.visualstudio.com") => true,
+            _ => false,
         }
+}
+
+/// SHA-512 (base64) of the bytes a Circit Azure Artifacts feed serves for a package. Used
+/// only for first-party packages, whose registration leaf carries no attestable hash.
+pub fn feed_package_hash(
+    source: &str,
+    package_content: &str,
+    token: Option<&str>,
+) -> Result<String> {
+    if !is_circit_feed(source) {
+        anyhow::bail!("first-party feeds must be Azure Artifacts feeds in the Circit organization");
     }
-    Ok(metadata)
+    let credential = token.context("SUPPLY_NUGET_TOKEN is required for Circit feed content")?;
+    let source_url = reqwest::Url::parse(source).context("invalid NuGet source URL")?;
+    let content_url =
+        reqwest::Url::parse(package_content).context("invalid NuGet package content URL")?;
+    if content_url.host_str() != source_url.host_str() {
+        anyhow::bail!("NuGet source redirected across hosts");
+    }
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    registry_package_hash(
+        &client,
+        &content_url,
+        Some(credential),
+        trusted_azure_destination,
+    )
 }
 
 const MAX_PACKAGE_CONTENT_BYTES: u64 = 512 * 1024 * 1024;
