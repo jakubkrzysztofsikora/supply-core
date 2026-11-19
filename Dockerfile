@@ -90,6 +90,7 @@ ENV SUPPLY_BIN=/usr/local/bin/supply-core \
     GUARDDOG_MANIFEST=/opt/supply-core/guarddog/supply-guarddog-manifest.json \
     OSSGADGET_BIN=/opt/supply-core/ossgadget/ossgadget \
     OSSGADGET_MANIFEST=/opt/supply-core/ossgadget/supply-ossgadget-manifest.json
+ENV SUPPLY_SCRATCH_DIR=/scratch
 ENTRYPOINT ["python3", "/radar/scan-quarantine.py"]
 
 # Keep the server image as the default (last) stage for plain `docker build`.

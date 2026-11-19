@@ -16,20 +16,12 @@ cycle() {
     echo "ERROR: capture failed" >&2
     return 0
   fi
-  # Content-scan the versions this capture holds in the quarantine window.
+  # Content-scan the versions this capture holds, plus every version the
+  # capture blocks on a critical or high advisory (verification only).
   # Runs whenever the capture succeeded, independent of status publishing.
-  # GuardDog is used when installed (or pointed at by GUARDDOG_BIN); the
-  # static AI/agent rules run either way.
-  if command -v guarddog >/dev/null 2>&1 || [ -n "${GUARDDOG_BIN:-}" ]; then
-    python3 /radar/scan-quarantine.py "/radar/data/$day" \
-      --bin "$SUPPLY_BIN" --findings /radar/data/content-findings.jsonl \
-      || echo "ERROR: content scan failed" >&2
-  else
-    python3 /radar/scan-quarantine.py "/radar/data/$day" \
-      --bin "$SUPPLY_BIN" --findings /radar/data/content-findings.jsonl \
-      --no-guarddog \
-      || echo "ERROR: content scan failed (static only)" >&2
-  fi
+  python3 /radar/scan-quarantine.py "/radar/data/$day" \
+    --bin "$SUPPLY_BIN" --findings /radar/data/content-findings.jsonl \
+    || echo "ERROR: content scan failed" >&2
   if [ -z "${SUPPLY_STATUS_URL:-}" ]; then
     echo "WARN: SUPPLY_STATUS_URL is not set; capture only" >&2
     return 0

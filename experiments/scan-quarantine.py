@@ -1,19 +1,28 @@
 #!/usr/bin/env python3
-"""Content-scan the npm versions a daily capture holds in the quarantine window.
+"""Content-scan the npm versions a daily capture holds or already blocks.
 
-For every dependency whose decision carries an "inside quarantine window"
-reason, the wrapper:
+Two kinds of version are scanned:
+
+* versions inside the quarantine window, which have no verdict of their own,
+* versions the capture blocks on a critical or high advisory, which are
+  re-scanned every day as independent proof that content detection finds the
+  same versions the advisory feed reports.
+
+For each candidate the wrapper:
 
 1. resolves the exact version document on registry.npmjs.org,
 2. downloads the tarball and verifies it against `dist.integrity` (sha512),
    so the scanner only ever sees bytes the registry vouched for,
 3. runs `supply scan-package` against the verified staged archive and parses its JSON `ArtifactReport`,
-4. appends findings to a shared JSONL file.
+4. for quarantine-window versions only, appends findings to the shared JSONL file.
 
 The JSONL file is what `snapshot-npm --findings` enforces on later captures.
+Advisory-blocked versions are verification only: their findings are not
+written, because the evaluator weighs a content-scan hold before the advisory
+query and a hold would replace the advisory reason in the published status.
 Every candidate is scanned unless `--limit` asks for a subset. Downloads are
-cached by name@version. Incomplete scans remain held for retry; blocks are
-reported as scan outcomes, not process failures.
+cached by name@version. Incomplete quarantine scans remain held for retry;
+blocks are reported as scan outcomes, not process failures.
 """
 import argparse
 import base64
@@ -34,13 +43,17 @@ from pathlib import Path
 
 REGISTRY = "https://registry.npmjs.org"
 MAX_TARBALL_BYTES = 64 * 1024 * 1024
+QUARANTINE_REASON = "inside quarantine window"
+ADVISORY_REASON_RE = re.compile(
+    r"^(critical|high) vulnerability \S+ from .+$", re.IGNORECASE
+)
 
 
-def quarantined_packages(documents):
-    """Unique (name, version) pairs held by the quarantine window.
+def selected_packages(documents, reason_matches):
+    """Unique pairs from dependencies whose reasons match `reason_matches`.
 
-    Accepts parsed npm snapshot documents; later duplicates lose to the
-    first occurrence so the output is stable across days.
+    Later duplicates lose to the first occurrence so output is stable
+    across days.
     """
     seen, packages = set(), []
     for document in documents:
@@ -49,7 +62,7 @@ def quarantined_packages(documents):
             continue
         for dependency in dependencies:
             reasons = dependency.get("reasons") or []
-            if not any("inside quarantine window" in str(reason) for reason in reasons):
+            if not any(reason_matches(str(reason)) for reason in reasons):
                 continue
             name = dependency.get("package")
             version = dependency.get("resolved")
@@ -60,6 +73,62 @@ def quarantined_packages(documents):
             seen.add((name, version))
             packages.append({"package": name, "version": version})
     return packages
+
+
+def quarantined_packages(documents):
+    """Pairs the quarantine window holds with no verdict of their own.
+
+    Their findings are what keeps them held, so they are enforced.
+    """
+    return selected_packages(documents, lambda reason: QUARANTINE_REASON in reason)
+
+
+def advisory_blocked_packages(documents):
+    """Pairs the capture already blocks on a critical or high advisory.
+
+    Scanned every day to prove content detection finds the same versions the
+    advisory feed reports, independently of it.
+    """
+    return selected_packages(documents, ADVISORY_REASON_RE.match)
+
+
+def scan_plan(window, advisory, pending):
+    """Candidates to scan, each tagged with whether findings are enforced.
+
+    Advisory-blocked versions are verification only: the evaluator weighs a
+    content-scan hold before the advisory query, so recording a finding for
+    them would replace the advisory reason and hide the confirmed row from
+    the published status. Verification never re-tries, so a version already
+    blocked by an advisory cannot accumulate hold records.
+    """
+    verified = {(item["package"], item["version"]) for item in advisory}
+    plan, seen = [], set()
+    for group in (window, pending):
+        for item in group:
+            key = (item["package"], item["version"])
+            if key in seen or key in verified:
+                continue
+            seen.add(key)
+            plan.append({**item, "enforce": True})
+    for item in advisory:
+        key = (item["package"], item["version"])
+        if key in seen:
+            continue
+        seen.add(key)
+        plan.append({**item, "enforce": False})
+    return plan
+
+
+def merge_candidates(*groups):
+    merged, seen = [], set()
+    for group in groups:
+        for item in group:
+            key = (item["package"], item["version"])
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+    return merged
 
 
 def safe_file_name(name, version):
@@ -214,8 +283,10 @@ def scan_package(
     command = [
         binary, "scan-package", "npm", str(archive),
         f"--name={name}", f"--version={version}",
-        f"--findings-out={findings_path}", f"--ledger-db={ledger_db}", "--json",
+        f"--ledger-db={ledger_db}", "--json",
     ]
+    if findings_path is not None:
+        command.append(f"--findings-out={findings_path}")
     if scratch_dir is not None:
         command.append(f"--scratch-dir={scratch_dir}")
     environment = dict(os.environ)
@@ -433,11 +504,12 @@ def main():
             documents.append(json.loads(snapshot.read_text()))
         except (OSError, json.JSONDecodeError) as error:
             print(f"scan-quarantine: unreadable snapshot {snapshot}: {error}", file=sys.stderr)
-    packages = merge_candidates(
+    candidates = scan_plan(
         quarantined_packages(documents),
+        advisory_blocked_packages(documents),
         incomplete_candidates(findings_path),
     )
-    packages = limited(packages, max(args.limit, 0))
+    candidates = limited(candidates, max(args.limit, 0))
     cache.mkdir(parents=True, exist_ok=True)
     pruned = prune_cache(cache)
     if pruned:
@@ -448,14 +520,17 @@ def main():
         "ledger_status": "ledger_pending",
         "day": args.day_dir.name,
         "guarddog": guarddog,
-        "candidates": len(packages),
+        "candidates": len(candidates),
         "scanned": [],
         "blocked": [],
         "errors": [],
+        "verification_errors": [],
     }
-    for package in packages:
+    for package in candidates:
         scan_report = None
         name, version = package["package"], package["version"]
+        enforce = package["enforce"]
+        outcome_errors = report["errors"] if enforce else report["verification_errors"]
         try:
             tarball, integrity = parse_version_document(
                 fetch_json(version_url(name, version)), name, version,
@@ -467,7 +542,7 @@ def main():
                 archive,
                 name,
                 version,
-                findings_path,
+                findings_path if enforce else None,
                 scratch_dir=args.scratch_dir,
                 guarddog=guarddog,
                 ledger_db=args.ledger_db,
@@ -478,19 +553,18 @@ def main():
                 report["blocked"].append({"package": name, "version": version})
             if summary["coverage"] != "complete" or summary["decision"] == "incomplete":
                 detail = scan_report.get("reason") or "required scanner coverage incomplete"
-                report["errors"].append(
-                    {"package": name, "version": version, "error": detail}
-                )
-                append_record(
-                    findings_path,
-                    incomplete_record(
-                        name,
-                        version,
-                        detail,
-                        scan_report.get("artifact_sha256"),
-                        scan_report.get("policy_sha256"),
-                    ),
-                )
+                outcome_errors.append({"package": name, "version": version, "error": detail})
+                if enforce:
+                    append_record(
+                        findings_path,
+                        incomplete_record(
+                            name,
+                            version,
+                            detail,
+                            scan_report.get("artifact_sha256"),
+                            scan_report.get("policy_sha256"),
+                        ),
+                    )
             else:
                 cleared = clear_incomplete(
                     findings_path,
@@ -504,10 +578,14 @@ def main():
             print(
                 f"{summary['decision'].upper()} {name}@{version} "
                 f"findings={summary['findings']} coverage={summary['coverage']}"
+                + ("" if enforce else " (verification only)")
             )
         except Exception as error:  # noqa: BLE001 - every failure is evidence
             detail = str(error)
-            report["errors"].append({"package": name, "version": version, "error": detail})
+            outcome_errors.append({"package": name, "version": version, "error": detail})
+            if not enforce:
+                print(f"FAIL {name}@{version} (verification only): {error}", file=sys.stderr)
+                continue
             scan_identity = scan_report if isinstance(scan_report, dict) else {}
             try:
                 append_record(
@@ -531,7 +609,12 @@ def main():
             print(f"FAIL {name}@{version}: {error}", file=sys.stderr)
 
     summary_path = write_summary(report, args.day_dir)
-    print(f"content scan: {len(report['scanned'])} scanned, {len(report['errors'])} errors -> {summary_path}")
+    verified = sum(1 for item in candidates if not item["enforce"])
+    print(
+        f"content scan: {len(report['scanned'])} scanned ({verified} verifications), "
+        f"{len(report['errors'])} errors, "
+        f"{len(report['verification_errors'])} verification errors -> {summary_path}"
+    )
     return 1 if report["errors"] else 0
 
 

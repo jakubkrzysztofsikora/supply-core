@@ -4,6 +4,7 @@ import base64
 import hashlib
 import importlib.util
 import json
+import sys
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -28,6 +29,7 @@ class QuarantinedPackagesTest(unittest.TestCase):
             snapshot([
                 dependency("marked", "18.0.13", ["package version is inside quarantine window"]),
                 dependency("lodash", "4.17.21", ["known advisory GHSA-x"]),
+                dependency("handlebars", "4.7.6", ["critical vulnerability GHSA-x from OSV"]),
             ]),
             snapshot([
                 dependency("zod", "4.6.4", ["package version is inside quarantine window"]),
@@ -41,19 +43,41 @@ class QuarantinedPackagesTest(unittest.TestCase):
             ],
         )
 
-    def test_duplicates_and_malformed_entries_are_skipped(self):
+    def test_advisory_blocked_packages_are_selected_separately(self):
         documents = [
             snapshot([
-                dependency("marked", "18.0.13", ["inside quarantine window"]),
-                dependency("marked", "18.0.13", ["inside quarantine window"]),
-                {"resolved": "1.0.0", "reasons": ["inside quarantine window"]},
-                dependency("zod", None, ["inside quarantine window"]),
-            ]),
-            {"dependencies": "not-a-list"},
+                dependency("handlebars", "4.7.6", ["critical vulnerability GHSA-x from OSV"]),
+                dependency("zod", "3.25.76", ["high vulnerability GHSA-y from OSV"]),
+                dependency("safe", "1.0.0", ["medium vulnerability GHSA-z from OSV"]),
+                dependency("plain", "1.0.0", ["package version is inside quarantine window"]),
+            ])
         ]
         self.assertEqual(
-            scan_quarantine.quarantined_packages(documents),
-            [{"package": "marked", "version": "18.0.13"}],
+            scan_quarantine.advisory_blocked_packages(documents),
+            [
+                {"package": "handlebars", "version": "4.7.6"},
+                {"package": "zod", "version": "3.25.76"},
+            ],
+        )
+
+    def test_scan_plan_gives_advisory_versions_precedence(self):
+        window = [{"package": "a", "version": "1.0.0"}]
+        advisory = [
+            {"package": "handlebars", "version": "4.7.6"},
+            {"package": "a", "version": "1.0.0"},
+        ]
+        pending = [{"package": "b", "version": "2.0.0"}]
+        self.assertEqual(
+            scan_quarantine.scan_plan(window, advisory, pending),
+            [
+                {"package": "b", "version": "2.0.0", "enforce": True},
+                {"package": "handlebars", "version": "4.7.6", "enforce": False},
+                {"package": "a", "version": "1.0.0", "enforce": False},
+            ],
+        )
+        self.assertEqual(
+            [item["package"] for item in scan_quarantine.scan_plan(window, [], pending)],
+            ["a", "b"],
         )
 
 
@@ -429,6 +453,125 @@ class ScanPackageTest(unittest.TestCase):
                 scratch_dir=Path(directory),
             )
         self.assertEqual(result["decision"], "pass")
+
+    def test_verification_scan_omits_findings_output(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = Path(directory) / "argv.txt"
+            binary = Path(directory) / "fake-supply"
+            binary.write_text(
+                "#!/bin/sh\n"
+                f'printf "%s\\n" "$*" >> "{recorder}"\n'
+                "printf '{\"decision\":\"pass\",\"coverage\":\"complete\",\"engines\":[]}\\n'\n"
+            )
+            binary.chmod(0o755)
+            scan_quarantine.scan_package(
+                str(binary), Path("archive.tgz"), "pkg", "1.0.0", None,
+                scratch_dir=Path(directory),
+            )
+            argv = recorder.read_text()
+        self.assertNotIn("--findings-out", argv)
+        self.assertIn("--scratch-dir", argv)
+
+class MainFlowTest(unittest.TestCase):
+    """End-to-end candidate handling: enforcement only for quarantine holds."""
+
+    def _run_main(self, directory, outcome):
+        day = Path(directory) / "2026-11-19"
+        day.mkdir()
+        (day / "sikoras-chat.npm.json").write_text(json.dumps(snapshot([
+            dependency("windowed", "1.0.0", ["package version is inside quarantine window"]),
+            dependency("handlebars", "4.7.6", ["critical vulnerability GHSA-x from OSV"]),
+        ])))
+        findings = Path(directory) / "content-findings.jsonl"
+        calls = []
+
+        def fake_scan(binary, archive, name, version, findings_path, **kwargs):
+            calls.append((name, version, findings_path, kwargs.get("scratch_dir")))
+            decision, coverage, reason = outcome(name)
+            report = {
+                "decision": decision,
+                "coverage": coverage,
+                "engines": [],
+                "reason": reason,
+                "artifact_sha256": "a" * 64,
+                "policy_sha256": "b" * 64,
+            }
+            return report
+
+        with mock.patch.object(scan_quarantine, "fetch_json", return_value={
+            "dist": {"tarball": "https://registry.npmjs.org/x.tgz", "integrity": "sha512-AAA"},
+        }), mock.patch.object(scan_quarantine, "ensure_archive", return_value=b""), \
+             mock.patch.object(scan_quarantine, "scan_package", side_effect=fake_scan), \
+             mock.patch.object(sys, "argv", [
+                 "scan-quarantine.py", str(day),
+                 "--bin", sys.executable,
+                 "--cache", str(Path(directory) / "cache"),
+                 "--findings", str(findings),
+                 "--ledger-db", str(Path(directory) / "ledger.sqlite"),
+                 "--scratch-dir", str(Path(directory) / "scratch"),
+             ]):
+            rc = scan_quarantine.main()
+        return rc, calls, findings, json.loads((day / "content-scan.json").read_text())
+
+    def test_advisory_candidates_are_scanned_without_findings_output(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            rc, calls, findings, report = self._run_main(
+                directory, lambda name: ("pass", "complete", None),
+            )
+            self.assertEqual(
+                [(name, version, path) for name, version, path, _ in calls],
+                [
+                    ("windowed", "1.0.0", findings),
+                    ("handlebars", "4.7.6", None),
+                ],
+            )
+            self.assertTrue(all(scratch is not None for *_, scratch in calls))
+            self.assertFalse(findings.exists())
+            self.assertEqual(rc, 0)
+            self.assertEqual(report["candidates"], 2)
+            self.assertEqual(len(report["scanned"]), 2)
+            self.assertEqual(report["errors"], [])
+
+    def test_incomplete_advisory_scan_never_holds_or_fails_the_run(self):
+        import tempfile
+
+        def outcome(name):
+            if name == "handlebars":
+                return ("incomplete", "partial", "scanner_reported_errors")
+            return ("pass", "complete", None)
+
+        with tempfile.TemporaryDirectory() as directory:
+            rc, _calls, findings, report = self._run_main(directory, outcome)
+            self.assertFalse(findings.exists())
+            self.assertEqual(rc, 0)
+            self.assertEqual(
+                [(e["package"], e["error"]) for e in report["verification_errors"]],
+                [("handlebars", "scanner_reported_errors")],
+            )
+            self.assertEqual(report["errors"], [])
+            self.assertEqual(
+                [row["decision"] for row in report["scanned"]], ["pass", "incomplete"]
+            )
+
+    def test_incomplete_quarantine_scan_still_holds(self):
+        import tempfile
+
+        def outcome(name):
+            if name == "windowed":
+                return ("incomplete", "partial", "coverage_unverified")
+            return ("pass", "complete", None)
+
+        with tempfile.TemporaryDirectory() as directory:
+            rc, _calls, findings, report = self._run_main(directory, outcome)
+            records = [json.loads(line) for line in findings.read_text().splitlines()]
+            self.assertEqual(rc, 1)
+            self.assertEqual([(r["package"], r["version"]) for r in records], [("windowed", "1.0.0")])
+            self.assertEqual([e["package"] for e in report["errors"]], ["windowed"])
+            self.assertEqual(report["verification_errors"], [])
 class GuarddogBinaryTest(unittest.TestCase):
     def test_explicit_and_environment_win(self):
         self.assertEqual(scan_quarantine.guarddog_binary("/opt/guarddog"), "/opt/guarddog")
