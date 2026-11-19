@@ -203,7 +203,7 @@ def scan_package(
     scratch_dir=None,
     guarddog=None,
     ledger_db=None,
-    timeout=600,
+    timeout=900,
 ):
     ledger_db = ledger_db or Path(
         os.environ.get(

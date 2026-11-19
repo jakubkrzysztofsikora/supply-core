@@ -23,6 +23,8 @@ const SCANNER_MEMORY_LIMIT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// .NET reserves its GC region range up front; with the region range and heap
 /// bounded below, OSSGadget starts and scans within this address space.
 const OSSGADGET_MEMORY_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// OSSGadget scans single-threaded; a 1.5 MB package already takes about a minute.
+const OSSGADGET_TIMEOUT: Duration = Duration::from_secs(480);
 #[cfg(target_os = "linux")]
 const OSSGADGET_GC_REGION_RANGE: &str = "40000000";
 #[cfg(target_os = "linux")]
@@ -372,7 +374,7 @@ impl OssGadgetScanner {
         Ok(Self {
             command,
             rule_bundle_sha256: manifest.rule_bundle_sha256,
-            timeout: DEFAULT_TIMEOUT,
+            timeout: OSSGADGET_TIMEOUT,
             max_output_bytes: DEFAULT_MAX_OUTPUT,
         })
     }
