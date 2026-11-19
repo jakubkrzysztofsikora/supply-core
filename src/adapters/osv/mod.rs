@@ -53,17 +53,47 @@ impl ReqwestOsvTransport {
         })
     }
 }
+const OSV_ATTEMPTS: u32 = 3;
+
+impl ReqwestOsvTransport {
+    fn post_once(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> std::result::Result<serde_json::Value, (anyhow::Error, bool)> {
+        let resp = self.client.post(url).json(body).send().map_err(|error| {
+            let retryable = error.is_timeout() || error.is_connect();
+            (
+                anyhow::Error::new(error).context("OSV request failed"),
+                retryable,
+            )
+        })?;
+        let status = resp.status();
+        if !status.is_success() {
+            let retryable = status.is_server_error() || status.as_u16() == 429;
+            return Err((anyhow::anyhow!("OSV returned non-2xx: {status}"), retryable));
+        }
+        resp.json().map_err(|error| {
+            (
+                anyhow::Error::new(error).context("OSV returned non-JSON"),
+                false,
+            )
+        })
+    }
+}
 impl OsvTransport for ReqwestOsvTransport {
     fn post_json(&self, url: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
-        let resp = self
-            .client
-            .post(url)
-            .json(body)
-            .send()
-            .context("OSV request failed")?
-            .error_for_status()
-            .context("OSV returned non-2xx")?;
-        resp.json().context("OSV returned non-JSON")
+        let mut attempt = 1;
+        loop {
+            match self.post_once(url, body) {
+                Ok(value) => return Ok(value),
+                Err((_, true)) if attempt < OSV_ATTEMPTS => {
+                    std::thread::sleep(std::time::Duration::from_millis(500 * u64::from(attempt)));
+                    attempt += 1;
+                }
+                Err((error, _)) => return Err(error),
+            }
+        }
     }
 }
 
@@ -531,5 +561,53 @@ mod tests {
             .unwrap();
         assert!(f.is_empty());
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    fn serve_sequence(
+        responses: Vec<&'static str>,
+    ) -> Result<(String, std::thread::JoinHandle<usize>)> {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+        let url = format!("http://{}/v1/query", listener.local_addr()?);
+        let handle = std::thread::spawn(move || {
+            let mut served = 0;
+            for response in responses {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buffer = [0u8; 4096];
+                let _ = stream.read(&mut buffer);
+                let _ = stream.write_all(response.as_bytes());
+                served += 1;
+            }
+            served
+        });
+        Ok((url, handle))
+    }
+
+    #[test]
+    fn transport_retries_server_errors_then_returns_the_answer() -> Result<()> {
+        let (url, server) = serve_sequence(vec![
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        ])?;
+        let value = ReqwestOsvTransport::new()?.post_json(&url, &serde_json::json!({}))?;
+        assert_eq!(value, serde_json::json!({}));
+        assert_eq!(server.join().map_err(|_| anyhow::anyhow!("server"))?, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn transport_does_not_retry_client_errors() -> Result<()> {
+        let (url, server) = serve_sequence(vec![
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        ])?;
+        let error = ReqwestOsvTransport::new()?
+            .post_json(&url, &serde_json::json!({}))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("400"));
+        drop(server);
+        Ok(())
     }
 }

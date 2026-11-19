@@ -139,7 +139,101 @@ fn release_from_source_with_client(
         Some(entry) => entry.clone(),
         None => serde_json::Value::Null,
     };
-    Ok(release_metadata(&leaf_value, &catalog))
+    let mut metadata = release_metadata(&leaf_value, &catalog);
+    if metadata["packageHash"].is_null() {
+        if let Some(content) = leaf_value.get("packageContent").and_then(|v| v.as_str()) {
+            let content_url =
+                reqwest::Url::parse(content).context("invalid NuGet package content URL")?;
+            if content_url.host_str() != Some(host) {
+                anyhow::bail!("NuGet source redirected across hosts");
+            }
+            let credential = if is_circit {
+                Some(token.context("SUPPLY_NUGET_TOKEN is required for Circit feed metadata")?)
+            } else {
+                None
+            };
+            metadata["packageHash"] = serde_json::Value::String(registry_package_hash(
+                client,
+                &content_url,
+                credential,
+                is_https,
+            )?);
+            metadata["packageHashAlgorithm"] = serde_json::Value::String("SHA512".into());
+        }
+    }
+    Ok(metadata)
+}
+
+const MAX_PACKAGE_CONTENT_BYTES: u64 = 512 * 1024 * 1024;
+
+fn is_https(url: &reqwest::Url) -> bool {
+    url.scheme() == "https"
+}
+
+// Azure Artifacts registration leaves point catalogEntry at a URL that always 404s, so no
+// packageHash is attested. Credentials go to the feed host only; the blob redirect is
+// followed once without them.
+fn registry_package_hash(
+    client: &reqwest::blocking::Client,
+    content_url: &reqwest::Url,
+    credential: Option<&str>,
+    scheme_allowed: fn(&reqwest::Url) -> bool,
+) -> Result<String> {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha512};
+    use std::io::Read;
+
+    if !scheme_allowed(content_url) {
+        anyhow::bail!("NuGet package content must use HTTPS");
+    }
+    let mut request = client.get(content_url.clone());
+    if let Some(credential) = credential {
+        request = request.basic_auth("AzureDevOps", Some(credential));
+    }
+    let mut response = request
+        .send()
+        .context("NuGet package content request failed")?;
+    if response.status().is_redirection() {
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .context("NuGet package content redirect has no location")?;
+        let target = content_url
+            .join(location)
+            .context("invalid NuGet package content redirect")?;
+        if !scheme_allowed(&target) {
+            anyhow::bail!("NuGet package content redirect must use HTTPS");
+        }
+        response = client
+            .get(target)
+            .send()
+            .context("NuGet package content redirect request failed")?;
+    }
+    if response.status().is_redirection() {
+        anyhow::bail!("NuGet package content redirected more than once");
+    }
+    let mut reader = response
+        .error_for_status()
+        .context("NuGet package content source rejected request")?
+        .take(MAX_PACKAGE_CONTENT_BYTES + 1);
+    let mut digest = Sha512::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .context("NuGet package content download failed")?;
+        if read == 0 {
+            break;
+        }
+        total += read as u64;
+        if total > MAX_PACKAGE_CONTENT_BYTES {
+            anyhow::bail!("NuGet package content exceeds {MAX_PACKAGE_CONTENT_BYTES} bytes");
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(base64::engine::general_purpose::STANDARD.encode(digest.finalize()))
 }
 
 fn release_metadata(
@@ -575,6 +669,120 @@ mod tests {
         let version = PackageVersionId::parse(&Ecosystem::NuGet, "1.0.0").unwrap();
         let pv = package_version_from_nuget(&payload, "Example", &version, None, None)?;
         assert!(pv.published_at.is_none());
+        Ok(())
+    }
+
+    fn http_allowed(_: &reqwest::Url) -> bool {
+        true
+    }
+
+    fn serve_once(response: Vec<u8>) -> Result<(String, std::thread::JoinHandle<String>)> {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+        let address = listener.local_addr()?;
+        let handle = std::thread::spawn(move || {
+            let mut request = String::new();
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buffer = [0u8; 4096];
+                if let Ok(read) = stream.read(&mut buffer) {
+                    request = String::from_utf8_lossy(&buffer[..read]).to_lowercase();
+                }
+                let _ = stream.write_all(&response);
+                let _ = stream.flush();
+            }
+            request
+        });
+        Ok((format!("http://{address}/pkg.nupkg"), handle))
+    }
+
+    fn ok_response(body: &[u8]) -> Vec<u8> {
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    fn redirect_response(location: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 303 See Other\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes()
+    }
+
+    fn plain_client() -> Result<reqwest::blocking::Client> {
+        Ok(reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?)
+    }
+
+    #[test]
+    fn registry_package_hash_is_sha512_of_served_bytes_without_following_credentials() -> Result<()>
+    {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha512};
+        let body = b"nupkg bytes";
+        let (blob_url, blob) = serve_once(ok_response(body))?;
+        let (feed_url, feed) = serve_once(redirect_response(&blob_url))?;
+
+        let hash = registry_package_hash(
+            &plain_client()?,
+            &reqwest::Url::parse(&feed_url)?,
+            Some("secret-token"),
+            http_allowed,
+        )?;
+
+        let expected = base64::engine::general_purpose::STANDARD.encode(Sha512::digest(body));
+        assert_eq!(hash, expected);
+        let feed_request = feed.join().map_err(|_| anyhow::anyhow!("feed thread"))?;
+        let blob_request = blob.join().map_err(|_| anyhow::anyhow!("blob thread"))?;
+        assert!(feed_request.contains("authorization: basic"));
+        assert!(!blob_request.contains("authorization"));
+        Ok(())
+    }
+
+    #[test]
+    fn registry_package_hash_rejects_second_redirect_and_error_status() -> Result<()> {
+        let (second_url, second) = serve_once(redirect_response("http://127.0.0.1:1/x"))?;
+        let (feed_url, feed) = serve_once(redirect_response(&second_url))?;
+        let error = registry_package_hash(
+            &plain_client()?,
+            &reqwest::Url::parse(&feed_url)?,
+            None,
+            http_allowed,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("redirected more than once"));
+        let _ = feed.join();
+        let _ = second.join();
+
+        let (missing_url, missing) = serve_once(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        )?;
+        assert!(registry_package_hash(
+            &plain_client()?,
+            &reqwest::Url::parse(&missing_url)?,
+            None,
+            http_allowed,
+        )
+        .is_err());
+        let _ = missing.join();
+        Ok(())
+    }
+
+    #[test]
+    fn registry_package_hash_requires_https_by_default() -> Result<()> {
+        let error = registry_package_hash(
+            &plain_client()?,
+            &reqwest::Url::parse("http://feed.test/pkg.nupkg")?,
+            None,
+            is_https,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("must use HTTPS"));
         Ok(())
     }
 }
