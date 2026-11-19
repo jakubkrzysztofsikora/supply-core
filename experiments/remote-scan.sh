@@ -17,7 +17,8 @@ set -euo pipefail
 day_dir=$1
 findings=$2
 ledger=$3
-image=${SUPPLY_SCAN_IMAGE:?SUPPLY_SCAN_IMAGE is not set}
+[ -n "${SUPPLY_SCAN_IMAGE:-}" ] || { echo "remote-scan: SUPPLY_SCAN_IMAGE is not set" >&2; exit 3; }
+image=$SUPPLY_SCAN_IMAGE
 namespace=${SUPPLY_SCAN_NAMESPACE:-supply-core}
 node=${SUPPLY_SCAN_NODE:-k3s-node-1}
 pod="supply-core-scan-$(date +%s)"

@@ -21,11 +21,14 @@ export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 export SUPPLY_LEDGER_PATH="${SUPPLY_LEDGER_PATH:-$HERE/data/ledger.sqlite}"
 
-# This private file supplies SUPPLY_STATUS_URL and SUPPLY_STATUS_AUTH_TOKEN.
-# It stays outside the repository because cron does not inherit shell secrets.
+# This private file supplies SUPPLY_STATUS_URL, SUPPLY_STATUS_AUTH_TOKEN and
+# optionally SUPPLY_SCAN_IMAGE. It stays outside the repository because cron
+# does not inherit shell secrets; values are exported for remote-scan.sh.
 PUBLISH_ENV="${SUPPLY_STATUS_PUBLISH_ENV:-$HOME/.config/supply-core/status-publisher.env}"
 if [ -r "$PUBLISH_ENV" ]; then
+  set -a
   . "$PUBLISH_ENV"
+  set +a
 fi
 
 cd "$ROOT" || exit 1
