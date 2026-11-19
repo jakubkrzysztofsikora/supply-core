@@ -2977,7 +2977,7 @@ mod tests {
         assert_eq!(attested.coverage, Coverage::Complete);
         assert_eq!(attested.reason, None);
         assert_eq!(attested.findings.len(), 1);
-        assert_eq!(attested.findings[0].rule, "BD000610");
+        assert_eq!(attested.findings[0].rule, "bd000610");
         attested.validate().unwrap();
 
         let unknown_rule = report_with(&std::collections::BTreeSet::from(["BD000200".to_string()]));
