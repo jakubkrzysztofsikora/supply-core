@@ -669,16 +669,22 @@ impl Default for PipPolicy {
 pub struct NuGetPolicy {
     pub require_integrity: bool,
     pub fallback_to_frozen: bool,
-    pub first_party_package_prefixes: Vec<String>,
+    pub first_party_packages: Vec<FirstPartyNuGetPackages>,
 }
 impl Default for NuGetPolicy {
     fn default() -> Self {
         Self {
             require_integrity: true,
             fallback_to_frozen: true,
-            first_party_package_prefixes: Vec::new(),
+            first_party_packages: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FirstPartyNuGetPackages {
+    pub prefix: String,
+    pub source: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

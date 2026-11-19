@@ -588,7 +588,9 @@ pip:
 nuget:
   require_integrity: true
   fallback_to_frozen: true
-  first_party_package_prefixes: []   # e.g. ["Circit."]; ids that must not exist on nuget.org
+  first_party_packages: []   # ids with this prefix are trusted only from this exact feed
+  #  - prefix: "Circit."
+  #    source: "https://pkgs.dev.azure.com/Circit/Circit/_packaging/Backend/nuget/v3/index.json"
 
 docker:
   require_digest_pin: true
