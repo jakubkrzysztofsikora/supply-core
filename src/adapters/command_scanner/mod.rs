@@ -20,6 +20,9 @@ const OSSGADGET_UPSTREAM_COMMIT: &str = "4063457b40211c25b41d56465d41783f2d42c5c
 const OSSGADGET_MANIFEST: &str = "supply-ossgadget-manifest.json";
 const OSSGADGET_COVERAGE_ENV: &str = "SUPPLY_OSSGADGET_COVERAGE_PATH";
 const SCANNER_MEMORY_LIMIT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Archive scanners copy the input and unpack members; outside large scans
+/// both are bounded by the 64 MiB compressed and expanded archive caps.
+const ARCHIVE_SCANNER_FILE_SIZE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 /// .NET reserves its GC region range up front; with the region range and heap
 /// bounded below, OSSGadget starts and scans within this address space.
 const OSSGADGET_MEMORY_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -510,6 +513,7 @@ impl OssGadgetScanner {
             None,
             self.timeout,
             self.max_output_bytes,
+            self.max_output_bytes as u64,
             OSSGADGET_MEMORY_LIMIT_BYTES,
             "ossgadget",
         )
@@ -1035,6 +1039,7 @@ impl CommandScanner {
             Some(archive_fd),
             self.timeout,
             self.max_output_bytes,
+            ARCHIVE_SCANNER_FILE_SIZE_LIMIT_BYTES,
             SCANNER_MEMORY_LIMIT_BYTES,
             &self.command.display().to_string(),
         )?;
@@ -1161,6 +1166,7 @@ fn run_isolated_tool_with_network_and_env(
         None,
         timeout,
         output_limit,
+        output_limit as u64,
         SCANNER_MEMORY_LIMIT_BYTES,
         &scanner.display().to_string(),
     )
@@ -1260,10 +1266,11 @@ fn run_bounded_command(
     stdin: Option<File>,
     timeout: Duration,
     output_limit: usize,
+    file_size_limit: u64,
     memory_limit: u64,
     label: &str,
 ) -> Result<BoundedCommandOutput> {
-    install_resource_limits(&mut command, timeout, output_limit, memory_limit)?;
+    install_resource_limits(&mut command, timeout, file_size_limit, memory_limit)?;
     let mut child = command
         .stdin(stdin.map(Stdio::from).unwrap_or_else(Stdio::null))
         .stdout(Stdio::piped())
@@ -1321,7 +1328,7 @@ fn run_bounded_command(
 fn install_resource_limits(
     command: &mut Command,
     timeout: Duration,
-    output_limit: usize,
+    file_size_limit: u64,
     memory_limit: u64,
 ) -> Result<()> {
     if !scanner_memory_limit_supported() {
@@ -1335,7 +1342,7 @@ fn install_resource_limits(
             .saturating_add(u64::from(timeout.subsec_nanos() > 0))
             .max(1) as libc::rlim_t;
         let memory_limit = memory_limit as libc::rlim_t;
-        let file_size_limit = output_limit as libc::rlim_t;
+        let file_size_limit = file_size_limit as libc::rlim_t;
         command.process_group(0);
         unsafe {
             command.pre_exec(move || {
@@ -1358,7 +1365,7 @@ fn install_resource_limits(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (command, timeout, output_limit, memory_limit);
+        let _ = (command, timeout, file_size_limit, memory_limit);
     }
     Ok(())
 }
@@ -3456,6 +3463,26 @@ EOF"#,
             .unwrap();
 
         assert_eq!(output.trim(), "2097152");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn guarddog_can_copy_an_archive_larger_than_its_output_limit() {
+        let (_archive_directory, archive) = script(
+            "f=/tmp/supply-core-fsize-$$; /usr/bin/head -c 9000000 /dev/zero > \"$f\" && echo copied; /usr/bin/rm -f \"$f\"",
+        );
+        let scanner = CommandScanner::guarddog(dispatcher());
+        let mut archive_file = File::open(&archive).unwrap();
+        let output = scanner
+            .run_with_runner(
+                &Ecosystem::Npm,
+                &mut archive_file,
+                &archive,
+                &passthrough_runner(),
+            )
+            .unwrap();
+
+        assert_eq!(output.trim(), "copied");
     }
 
     #[cfg(target_os = "macos")]

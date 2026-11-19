@@ -208,7 +208,8 @@ The GuardDog manifest binds the console script and every file of the installed
 `guarddog` package; its other Python dependencies are pinned by the install but
 not re-verified per scan. OSSGadget never executes package files. Its .NET runtime
 gets a 4 GiB address-space cap with a bounded GC region and heap, and 480 s per
-scan; other engines keep 2 GiB. Each sandbox mounts the public system CA bundle
+scan; other engines keep 2 GiB. GuardDog may write files up to 64 MiB, since it
+copies the input archive before unpacking it. Each sandbox mounts the public system CA bundle
 read-only, because GuardDog's `pygit2` aborts at import without it. The static
 scanner rejects text members above 16 MiB. OSSGadget reports one finding per
 rule and file, so repeated matches in minified bundles stay under the 256-finding
