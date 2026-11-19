@@ -24,7 +24,7 @@ spec:
         effect: NoExecute
       containers:
       - name: app
-        image: ghcr.io/jakubkrzysztofsikora/supply-core:v0.4.4
+        image: ghcr.io/jakubkrzysztofsikora/supply-core:v0.4.5
         imagePullPolicy: Always
         ports:
         - containerPort: 4873
