@@ -295,57 +295,44 @@ class IncompleteRecordTest(unittest.TestCase):
                 "ecosystem": "Npm", "package": "b", "version": "2.0.0",
                 "source": "guarddog", "score": 9, "rules": ["threat-x"], "summary": "real",
             })
-            self.assertEqual(
-                scan_quarantine.clear_incomplete(
-                    path, "a", "1.0.0", artifact_a, policy
-                ),
-                1,
-            )
-            self.assertEqual(
-                scan_quarantine.clear_incomplete(
-                    path, "a", "1.0.0", artifact_a, policy
-                ),
-                0,
-            )
-            self.assertEqual(
-                scan_quarantine.clear_incomplete(
-                    path, "b", "2.0.0", artifact_b, policy
-                ),
-                1,
-            )
+            self.assertEqual(scan_quarantine.clear_incomplete(path, "a", "1.0.0"), 1)
+            self.assertEqual(scan_quarantine.clear_incomplete(path, "a", "1.0.0"), 0)
+            self.assertEqual(scan_quarantine.clear_incomplete(path, "b", "2.0.0"), 1)
             remaining = [line for line in path.read_text().splitlines() if line.strip()]
             self.assertEqual(len(remaining), 1)
             self.assertTrue(any('"threat-x"' in line for line in remaining))
             self.assertFalse(any('"scan-incomplete"' in line for line in remaining))
 
-    def test_clear_requires_matching_artifact_and_policy_identity(self):
+    def test_clear_removes_digestless_holds_from_fetch_failures(self):
         import tempfile
 
-        artifact = "a" * 64
-        policy = "b" * 64
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "findings.jsonl"
-            records = [
-                ("a" * 64, "b" * 64),
-                ("c" * 64, "b" * 64),
-                ("a" * 64, "d" * 64),
-            ]
-            for artifact_sha256, policy_sha256 in records:
-                record = scan_quarantine.incomplete_record(
-                    "a", "1.0.0", "boom", artifact_sha256, policy_sha256
+            for _ in range(3):
+                scan_quarantine.append_record(
+                    path, scan_quarantine.incomplete_record("sql.js", "1.15.0", "scan_failed")
                 )
-                scan_quarantine.append_record(path, record)
-
-            removed = scan_quarantine.clear_incomplete(
-                path, "a", "1.0.0", artifact, policy
+            scan_quarantine.append_record(
+                path,
+                scan_quarantine.incomplete_record("sql.js", "1.15.0", "boom", "a" * 64, "b" * 64),
+            )
+            scan_quarantine.append_record(path, {
+                "ecosystem": "Npm", "package": "sql.js", "version": "1.15.0",
+                "source": "guarddog", "score": 9, "rules": ["threat-x"], "summary": "real",
+            })
+            scan_quarantine.append_record(
+                path, scan_quarantine.incomplete_record("sql.js", "9.9.9", "boom", "c" * 64, "d" * 64)
             )
 
+            self.assertEqual(
+                scan_quarantine.clear_incomplete(path, "sql.js", "1.15.0"), 4
+            )
             remaining = [json.loads(line) for line in path.read_text().splitlines()]
-        self.assertEqual(removed, 1)
         self.assertEqual(
-            [(record["artifact_sha256"], record["policy_sha256"]) for record in remaining],
-            [("c" * 64, "b" * 64), ("a" * 64, "d" * 64)],
+            [(r["package"], r["version"]) for r in remaining],
+            [("sql.js", "1.15.0"), ("sql.js", "9.9.9")],
         )
+        self.assertEqual(remaining[0]["rules"], ["threat-x"])
 
     def test_clear_on_missing_file_is_a_noop(self):
         import tempfile
@@ -353,10 +340,7 @@ class IncompleteRecordTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "missing.jsonl"
             self.assertEqual(
-                scan_quarantine.clear_incomplete(
-                    path, "a", "1.0.0", "a" * 64, "b" * 64
-                ),
-                0,
+                scan_quarantine.clear_incomplete(path, "a", "1.0.0"), 0
             )
 
     def test_incomplete_candidates_are_retried_and_merged(self):

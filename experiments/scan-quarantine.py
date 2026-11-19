@@ -383,10 +383,14 @@ def append_record(path, record):
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
-def clear_incomplete(path, name, version, artifact_sha256, policy_sha256):
-    """Clear only incomplete holds for the exact artifact and policy revision."""
-    if artifact_sha256 is None or policy_sha256 is None:
-        return 0
+def clear_incomplete(path, name, version):
+    """Clear every incomplete hold for a version a scan just covered completely.
+
+    npm tarballs are immutable, so a verified complete scan of a version
+    supersedes every earlier hold for it, including the ones written by a
+    fetch or registry failure. Those carry no artifact identity, so an
+    identity-matched clear would leave them blocking the version forever.
+    """
     with path.with_suffix(".lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
@@ -408,8 +412,6 @@ def clear_incomplete(path, name, version, artifact_sha256, policy_sha256):
                     is_incomplete
                     and record.get("package") == name
                     and record.get("version") == version
-                    and record.get("artifact_sha256") == artifact_sha256
-                    and record.get("policy_sha256") == policy_sha256
                 ):
                     removed += 1
                 else:
@@ -566,15 +568,12 @@ def main():
                         ),
                     )
             else:
-                cleared = clear_incomplete(
-                    findings_path,
-                    name,
-                    version,
-                    scan_report.get("artifact_sha256"),
-                    scan_report.get("policy_sha256"),
-                )
+                cleared = clear_incomplete(findings_path, name, version)
                 if cleared:
-                    print(f"cleared {cleared} stale scan-incomplete record(s) for {name}@{version}")
+                    print(
+                        f"cleared {cleared} stale scan-incomplete record(s) "
+                        f"for {name}@{version}"
+                    )
             print(
                 f"{summary['decision'].upper()} {name}@{version} "
                 f"findings={summary['findings']} coverage={summary['coverage']}"
