@@ -3,7 +3,8 @@ use super::{
     MAX_ARCHIVE_ENTRIES, MAX_IMAGE_METADATA_BYTES, MAX_LAYER_BYTES,
 };
 use crate::adapters::command_scanner::{
-    run_isolated_tool_with_env, run_networked_isolated_tool, BoundedCommandOutput, SandboxMount,
+    run_isolated_image_tool, run_isolated_tool_with_env, run_networked_isolated_tool,
+    BoundedCommandOutput, SandboxMount,
 };
 use crate::application::ledger::{engine_finding_id, Coverage, EngineFinding, EngineReport};
 use crate::application::scanner::StagedArchive;
@@ -92,6 +93,83 @@ pub(super) fn trivy_report(staged: &StagedArchive, input_sha256: Option<&str>) -
         Ok(report) => report,
         Err(error) => failed_engine_report("trivy", input_sha256, 1, failure_code(&error)),
     }
+}
+
+pub(super) fn registry_trivy_findings(
+    layout: &Path,
+    scratch_parent: &Path,
+    cache: &Path,
+    binary: &Path,
+) -> Result<Vec<EngineFinding>> {
+    let scratch = tempfile::tempdir_in(scratch_parent)?;
+    // Both databases must stage: a missing Java DB would silently drop
+    // Java-package results while OS or other language results still passed
+    // the coverage check below.
+    for (database, filename) in [("db", "trivy.db"), ("java-db", "trivy-java.db")] {
+        let source = cache.join(database);
+        let target = scratch.path().join("trivy-cache").join(database);
+        fs::create_dir_all(&target)?;
+        for file in [filename, "metadata.json"] {
+            fs::copy(source.join(file), target.join(file)).context("stage Trivy database")?;
+        }
+    }
+    let output = run_isolated_image_tool(
+        binary,
+        &args([
+            "--cache-dir",
+            "/tmp/trivy-cache",
+            "image",
+            "--input",
+            "/scan/image",
+            "--offline-scan",
+            "--skip-db-update",
+            "--skip-java-db-update",
+            "--skip-version-check",
+            "--disable-telemetry",
+            "--cache-backend",
+            "memory",
+            "--parallel",
+            "1",
+            "--format",
+            "json",
+            "--scanners",
+            "vuln",
+            "--quiet",
+        ]),
+        &[mount(layout, "/scan/image")],
+        scratch.path(),
+        SCANNER_TIMEOUT,
+        OUTPUT_LIMIT,
+    )?;
+    ensure!(
+        output.complete && output.status.success(),
+        "Trivy scan failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+            .chars()
+            .filter(|character| !character.is_control() || *character == '\n')
+            .take(512)
+            .collect::<String>()
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    ensure!(
+        report
+            .get("ArtifactType")
+            .and_then(serde_json::Value::as_str)
+            == Some("container_image")
+            && report
+                .get("Results")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|results| {
+                    results.iter().any(|result| {
+                        matches!(
+                            result.get("Class").and_then(serde_json::Value::as_str),
+                            Some("os-pkgs" | "lang-pkgs")
+                        )
+                    })
+                }),
+        "Trivy did not establish vulnerability scan coverage"
+    );
+    parse_trivy(&output.stdout)
 }
 
 pub(super) fn yarahunter_report(

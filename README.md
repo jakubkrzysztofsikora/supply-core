@@ -414,6 +414,68 @@ kubectl apply -k deploy/k8s
 
 ---
 
+### Docker Hub mirror
+
+The server enables a read-only Docker Registry V2 pull-through mirror at `/v2/`
+by default. Add its HTTPS URL to the Docker Engine daemon configuration, then
+restart Docker.
+
+```json
+{
+  "registry-mirrors": ["https://supply-core.example.com"]
+}
+```
+
+You can also pull using the mirror address directly, for example
+`docker pull supply-core.example.com/library/alpine:3.23`. Use the explicit
+address or restrict client egress to Docker Hub if pulls must enforce Supply
+Core's policy. Docker Engine can try Docker Hub directly after a configured
+mirror denies a pull.
+
+The mirror resolves mutable tags against Docker Hub and records the first time
+it sees each repository and manifest digest. Registry responses lack a trusted
+publish timestamp, so even older Hub images spend the default seven days in
+quarantine on their first pull through this mirror. Tags that move to a new
+digest start a new window. The mirror verifies the content digests and scans
+each runnable platform with Trivy. It serves the index, child manifests, and
+blobs only after the age window and a complete passing scan. With the default
+policy, any reported vulnerability keeps the image held. A missing or failing
+scan also keeps it held. Scan results are reused for 24 hours.
+
+| Setting | Default and behavior |
+| --- | --- |
+| `SUPPLY_DOCKER_MIRROR_ENABLED` | Enabled. Set to `false` to remove the mirror routes. |
+| `SUPPLY_DOCKER_MIRROR_DIR` | `data/docker-mirror` on the host and `/app/docker-mirror` in the container. Persist this directory for both quarantine timestamps and cached content. Use one server per directory. |
+| `SUPPLY_DOCKER_MIRROR_POLICY` | Optional Supply Core policy file. Also accepted as `serve --policy PATH`. |
+| `TRIVY_BIN` | `trivy` on `PATH`. The supplied server image bundles a pinned build. |
+| `TRIVY_CACHE_DIR` | Optional operator-managed Trivy database directory. By default the mirror fetches its vulnerability and Java databases from Aqua's GHCR repositories. An external cache needs a vulnerability database updated within 48 hours and a Java database to scan Java packages. |
+
+The mirror accepts up to 8 GiB of content per image graph. The cache stores up
+to 20 GiB of image content and evicts the oldest scans as needed. Reserve
+additional space for databases, scan scratch, and incoming content. For a native installation run the server as an unprivileged Linux user
+with Trivy, Bubblewrap, and unprivileged user namespaces available. The Compose
+configuration permits Bubblewrap to create its isolated scanner namespaces.
+If running the image directly, use `--init` and the Compose security options
+or a seccomp profile that permits the required namespace and mount operations.
+
+Public Docker Hub pulls are supported, with Docker schema 2 and OCI images and
+indexes. The mirror supports pull by tag and digest, manifest and blob HEAD,
+blob range requests, and pagination of released cache entries. Push and delete
+operations, private Hub authentication, and standalone OCI artifacts are outside
+this mirror's scope.
+
+Run the Docker Engine integration test against a local daemon.
+
+```sh
+cargo test --locked docker_engine_cannot_pull_until_release -- --ignored
+```
+
+With a current Trivy database in `TRIVY_CACHE_DIR`, run
+`cargo test --locked docker_hub_cve_keeps_image_quarantined -- --ignored` to
+verify the release gate against a pinned Docker Hub image and the real scanner.
+
+[Docker Hub pull-through mirror documentation](https://docs.docker.com/docker-hub/image-library/mirror/#run-a-registry-as-a-pull-through-cache)
+
 ## Features at a Glance
 
 | Feature | What It Does | Why It Matters |

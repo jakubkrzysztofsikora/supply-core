@@ -1,6 +1,7 @@
 use crate::{
     adapters::{
-        azure_devops::pipeline_annotations, config::parse_policy_str, github::workflow_annotations,
+        azure_devops::pipeline_annotations, config::parse_policy_str, docker_mirror,
+        github::workflow_annotations,
     },
     application::{AzurePipelinesScanner, GitHubActionsScanner},
     domain::{Decision, GitHubActionReference, PipelineReference, Policy},
@@ -194,6 +195,26 @@ pub fn app() -> Router {
 }
 
 pub fn app_with_config(config: ServerConfig) -> Router {
+    match docker_mirror::Config::from_env(Policy::default())
+        .map(docker_mirror::routes)
+        .transpose()
+    {
+        Ok(mirror) => server_routes(config, mirror),
+        Err(error) => {
+            eprintln!("Docker mirror could not start: {error:#}");
+            server_routes(config, None)
+        }
+    }
+}
+
+pub fn app_with_policy(config: ServerConfig, policy: Policy) -> Result<Router> {
+    let mirror = docker_mirror::Config::from_env(policy)
+        .map(docker_mirror::routes)
+        .transpose()?;
+    Ok(server_routes(config, mirror))
+}
+
+fn server_routes(config: ServerConfig, mirror: Option<Router>) -> Router {
     let state = Arc::new(config);
     let public_cors = CorsLayer::new()
         .allow_origin(Any)
@@ -207,7 +228,7 @@ pub fn app_with_config(config: ServerConfig) -> Router {
         .route("/api/v1/version", get(version_info))
         .layer(public_cors);
 
-    Router::new()
+    let server = Router::new()
         .route("/", get(status_page))
         .route("/api/v1/status/quarantine", put(publish_quarantine_status))
         .route("/api/v1/download/:artifact", get(download_artifact))
@@ -216,7 +237,8 @@ pub fn app_with_config(config: ServerConfig) -> Router {
         .route("/api/v1/scan/actions", post(scan_github_actions))
         .route("/api/v1/scan/github-actions", post(scan_github_actions))
         .merge(public)
-        .with_state(state)
+        .with_state(state);
+    server.merge(mirror.unwrap_or_default())
 }
 
 async fn status_page() -> impl IntoResponse {

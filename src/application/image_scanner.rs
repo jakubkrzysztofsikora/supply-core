@@ -318,6 +318,24 @@ pub fn scan_image(
     })
 }
 
+pub(crate) fn scan_registry_image(
+    layout: &Path,
+    scratch_parent: &Path,
+    cache: &Path,
+    binary: &Path,
+    policy: &Policy,
+) -> Result<bool> {
+    let findings = engines::registry_trivy_findings(layout, scratch_parent, cache, binary)?;
+    Ok(findings.into_iter().any(|finding| {
+        policy.quarantine.cve_keeps_quarantined
+            || finding
+                .native_severity
+                .as_deref()
+                .and_then(trivy_severity)
+                .is_none_or(|severity| policy.vulnerabilities.blocks_severity(&severity))
+    }))
+}
+
 fn trivy_severity(raw: &str) -> Option<Severity> {
     if raw.eq_ignore_ascii_case("low") {
         Some(Severity::Low)

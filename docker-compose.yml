@@ -4,19 +4,27 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: runner
+      target: server
     container_name: supply-core
+    init: true
+    # Bubblewrap creates private scanner namespaces inside the non-root container.
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=unconfined
     restart: unless-stopped
     ports:
       - "4873:4873"
     environment:
       - SUPPLY_SERVICE_NAME=supply-core-selfhosted
+      - SUPPLY_DOCKER_MIRROR_ENABLED=${SUPPLY_DOCKER_MIRROR_ENABLED:-true}
       - SUPPLY_STATUS_FILE=/app/data/quarantine-status.json
       - SUPPLY_AUTH_TOKEN=${SUPPLY_AUTH_TOKEN:-}
       - PORT=4873
     volumes:
       - ./artifacts:/app/artifacts
       - ./data:/app/data
+      - docker-mirror:/app/docker-mirror
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:4873/health"]
       interval: 15s
@@ -44,3 +52,6 @@ services:
       - ./radar:/radar-config:ro
       - ./radar/data:/radar/data
       - ${SUPPLY_WORKSPACE:-./workspace}:/workspace:ro
+
+volumes:
+  docker-mirror:
