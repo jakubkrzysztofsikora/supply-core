@@ -24,12 +24,18 @@ spec:
         effect: NoExecute
       containers:
       - name: app
-        image: ghcr.io/jakubkrzysztofsikora/supply-core:v0.4.5
+        image: ghcr.io/jakubkrzysztofsikora/supply-core:v0.4.6
         imagePullPolicy: Always
         ports:
         - containerPort: 4873
           name: http
         env:
+        # The official server publishes package quarantine status only. The
+        # pull-through mirror is opt-in here: it needs its own volume, a
+        # Trivy-sized memory limit, and Docker Hub credentials for useful
+        # rate limits. Compose and self-hosted installs keep the default.
+        - name: SUPPLY_DOCKER_MIRROR_ENABLED
+          value: "false"
         - name: SUPPLY_SERVICE_NAME
           value: "supply-core-official"
         - name: SUPPLY_ARTIFACTS_DIR
