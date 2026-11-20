@@ -6,7 +6,9 @@ use crate::adapters::command_scanner::{
     run_isolated_image_tool, run_isolated_tool_with_env, run_networked_isolated_tool,
     BoundedCommandOutput, SandboxMount,
 };
-use crate::application::ledger::{engine_finding_id, Coverage, EngineFinding, EngineReport};
+use crate::application::ledger::{
+    engine_finding_id, Coverage, EngineFinding, EngineReport, MAX_ENGINE_FINDINGS,
+};
 use crate::application::scanner::StagedArchive;
 use anyhow::{ensure, Context, Result};
 use rust_decimal::Decimal;
@@ -455,7 +457,10 @@ fn parse_trivy(payload: &[u8]) -> Result<Vec<EngineFinding>> {
             if !seen.insert(id.clone()) {
                 continue;
             }
-            ensure!(findings.len() < 256, "scanner finding count exceeds limit");
+            ensure!(
+                findings.len() < MAX_ENGINE_FINDINGS,
+                "scanner finding count exceeds limit"
+            );
             findings.push(EngineFinding {
                 id,
                 rule,
@@ -497,7 +502,10 @@ fn parse_yarahunter(payload: &[u8], layer_root: &Path) -> Result<Vec<EngineFindi
         if !seen.insert(id.clone()) {
             continue;
         }
-        ensure!(findings.len() < 256, "scanner finding count exceeds limit");
+        ensure!(
+            findings.len() < MAX_ENGINE_FINDINGS,
+            "scanner finding count exceeds limit"
+        );
         findings.push(EngineFinding {
             id,
             rule,
@@ -524,7 +532,10 @@ fn parse_capa(payload: &[u8], location: &str) -> Result<Vec<EngineFinding>> {
         ensure!(details.is_object(), "capa rule result is malformed");
         let rule = safe_code(rule_name);
         let id = engine_finding_id("capa", &rule, location, rule_name)?;
-        ensure!(findings.len() < 256, "scanner finding count exceeds limit");
+        ensure!(
+            findings.len() < MAX_ENGINE_FINDINGS,
+            "scanner finding count exceeds limit"
+        );
         findings.push(EngineFinding {
             id,
             rule,
@@ -947,7 +958,7 @@ fn engine_report(
     complete: bool,
     reason: Option<&str>,
 ) -> EngineReport {
-    let reason = if findings.len() > 256 {
+    let reason = if findings.len() > MAX_ENGINE_FINDINGS {
         Some("finding_limit")
     } else {
         reason
@@ -965,7 +976,7 @@ fn engine_report(
         } else {
             Coverage::Partial
         },
-        findings: findings.into_iter().take(256).collect(),
+        findings: findings.into_iter().take(MAX_ENGINE_FINDINGS).collect(),
         reason: reason.map(str::to_string),
     }
 }
@@ -1239,7 +1250,7 @@ mod tests {
     }
     #[test]
     fn scanner_finding_limits_reject_truncated_reports() -> Result<()> {
-        let trivy_vulnerabilities = (0..257)
+        let trivy_vulnerabilities = (0..=MAX_ENGINE_FINDINGS)
             .map(|index| {
                 serde_json::json!({
                     "VulnerabilityID": format!("CVE-2025-{index:04}"),
@@ -1258,7 +1269,7 @@ mod tests {
         assert!(parse_trivy(&trivy).is_err());
 
         let yara = serde_json::to_vec(&serde_json::json!({
-            "IOC": (0..257)
+            "IOC": (0..=MAX_ENGINE_FINDINGS)
                 .map(|index| serde_json::json!({
                     "Matched Rule Name": format!("rule-{index}"),
                     "Full File Name": "/scan/layers/0000/file"
@@ -1268,7 +1279,7 @@ mod tests {
         assert!(parse_yarahunter(&yara, Path::new("/scan/layers")).is_err());
 
         let capa = serde_json::to_vec(&serde_json::json!({
-            "rules": (0..257)
+            "rules": (0..=MAX_ENGINE_FINDINGS)
                 .map(|index| (format!("rule-{index}"), serde_json::json!({})))
                 .collect::<serde_json::Map<String, serde_json::Value>>()
         }))?;

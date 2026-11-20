@@ -104,6 +104,13 @@ pub struct EngineFinding {
     pub policy_score: Option<rust_decimal::Decimal>,
 }
 
+/// Maximum findings one engine report may retain. Large-but-clean packages
+/// legitimately emit hundreds of deduplicated matches (zod emits ~277 from
+/// OSSGadget); reports above the cap are marked partial with reason
+/// `finding_limit`, so the bound must stay above real-world volume while
+/// still capping memory and payload size.
+pub const MAX_ENGINE_FINDINGS: usize = 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EngineReport {
@@ -159,7 +166,10 @@ impl EngineReport {
         if let Some(reason) = self.reason.as_deref() {
             validate_code(reason, "engine report reason")?;
         }
-        ensure!(self.findings.len() <= 256, "too many engine findings");
+        ensure!(
+            self.findings.len() <= MAX_ENGINE_FINDINGS,
+            "too many engine findings"
+        );
         for (index, finding) in self.findings.iter().enumerate() {
             validate_sha256(&finding.id, "engine finding ID")?;
             validate_code(&finding.rule, "engine finding rule")?;

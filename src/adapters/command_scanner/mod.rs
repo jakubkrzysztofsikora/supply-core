@@ -1,4 +1,6 @@
-use crate::application::ledger::{engine_finding_id, Coverage, EngineFinding, EngineReport};
+use crate::application::ledger::{
+    engine_finding_id, Coverage, EngineFinding, EngineReport, MAX_ENGINE_FINDINGS,
+};
 use crate::domain::{ContentFinding, Ecosystem, PackageVersionId};
 use crate::ports::ContentScanner;
 use anyhow::{Context, Result};
@@ -788,7 +790,7 @@ fn ossgadget_engine_report(
             if !finding_ids.insert(id.clone()) {
                 continue;
             }
-            if findings.len() == 256 {
+            if findings.len() == MAX_ENGINE_FINDINGS {
                 finding_limit_exceeded = true;
                 continue;
             }
@@ -2448,7 +2450,7 @@ fn report_findings(
     if rules.is_empty() {
         rules.push("external-risk".to_string());
     }
-    let truncated = rules.len() > 256;
+    let truncated = rules.len() > MAX_ENGINE_FINDINGS;
     let member = archive
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -2456,7 +2458,7 @@ fn report_findings(
     let severity = severity.map(safe_code);
     let findings = rules
         .into_iter()
-        .take(256)
+        .take(MAX_ENGINE_FINDINGS)
         .enumerate()
         .map(|(index, raw_rule)| {
             let rule = safe_code(&raw_rule);
@@ -3053,14 +3055,14 @@ mod tests {
 
     #[test]
     fn ossgadget_distinct_rule_file_pairs_over_limit_stay_partial() {
-        let files = (0..257)
+        let files = (0..=MAX_ENGINE_FINDINGS)
             .map(|index| format!("lib/f{index}.js"))
             .collect::<Vec<_>>();
         let occurrences = files.clone().into_iter().map(|file| (file, 1));
         let report = ossgadget_report_for(&files, occurrences);
         assert_eq!(report.coverage, Coverage::Partial);
         assert_eq!(report.reason.as_deref(), Some("finding_limit"));
-        assert_eq!(report.findings.len(), 256);
+        assert_eq!(report.findings.len(), MAX_ENGINE_FINDINGS);
     }
 
     #[test]

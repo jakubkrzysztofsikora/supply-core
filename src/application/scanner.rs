@@ -1,7 +1,7 @@
 use crate::application::ledger::{
     engine_finding_id, engine_policy_revision_sha256, Coverage, EngineFinding, EngineReport,
     LedgerEvent, LedgerEventDetails, LedgerIdentity, LedgerRecorder, LedgerSourceKind,
-    PackageEvidence, ScanCompletedBody, ScanFailedBody, ScannerFinding,
+    PackageEvidence, ScanCompletedBody, ScanFailedBody, ScannerFinding, MAX_ENGINE_FINDINGS,
 };
 use crate::domain::{ContentFinding, Ecosystem, PackageVersionId};
 use crate::ports::MetadataStore;
@@ -1433,7 +1433,7 @@ fn static_engine_report(
     let mut findings = Vec::new();
     let mut findings_truncated = false;
     for (member, occurrence) in ordered_occurrences {
-        if findings.len() == 256 {
+        if findings.len() == MAX_ENGINE_FINDINGS {
             findings_truncated = true;
             break;
         }
@@ -1791,7 +1791,7 @@ fn static_rule_occurrence_regex(rule: &str) -> Option<&'static Regex> {
     }
 }
 
-const MAX_STATIC_REPORT_OCCURRENCES: usize = 257;
+const MAX_STATIC_REPORT_OCCURRENCES: usize = MAX_ENGINE_FINDINGS + 1;
 
 fn advance_line_and_column(bytes: &[u8], line: &mut usize, column: &mut usize) {
     for byte in bytes {
@@ -3809,7 +3809,7 @@ mod tests {
     fn static_report_bounds_occurrence_storage() -> Result<()> {
         let content = format!(
             "const child_process = require('child_process');\n{}",
-            (0..300)
+            (0..MAX_ENGINE_FINDINGS)
                 .map(|index| { format!("fetch('https://discord.com/api/webhooks/{index}/x');") })
                 .collect::<Vec<_>>()
                 .join("\n")
@@ -3822,13 +3822,13 @@ mod tests {
             .map(|finding| finding.occurrences.len())
             .sum::<usize>();
 
-        assert_eq!(occurrence_count, 257);
+        assert_eq!(occurrence_count, MAX_STATIC_REPORT_OCCURRENCES);
 
         let paths = scan.processed_paths.clone();
         let report =
             static_engine_report(&"c".repeat(64), &paths, &paths, true, &scan.member_findings)?;
 
-        assert_eq!(report.findings.len(), 256);
+        assert_eq!(report.findings.len(), MAX_ENGINE_FINDINGS);
         assert_eq!(report.coverage, Coverage::Partial);
         assert_eq!(report.reason.as_deref(), Some("finding_limit"));
         Ok(())

@@ -219,8 +219,9 @@ scan; other engines keep 2 GiB. GuardDog may write files up to 64 MiB, since it
 copies the input archive before unpacking it. Each sandbox mounts the public system CA bundle
 read-only, because GuardDog's `pygit2` aborts at import without it. The static
 scanner rejects text members above 16 MiB. OSSGadget reports one finding per
-rule and file, so repeated matches in minified bundles stay under the 256-finding
-limit. OSSGadget also scans inside nested archives; their matches count against
+rule and file, and each engine report retains at most 1024 findings; a report
+over that limit is incomplete rather than silently truncated. OSSGadget also
+scans inside nested archives; their matches count against
 the archive member. Binary members keep a scan incomplete unless their header is
 wasm, zip, gzip, PNG, JPEG or TrueType.
 
