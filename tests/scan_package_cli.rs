@@ -140,3 +140,22 @@ fn missing_package_archive_emits_incomplete_report() -> Result<()> {
     assert!(String::from_utf8_lossy(&verification.stdout).contains("integrity=valid tree_size=1"));
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn invalid_capture_lock_descriptor_fails_before_writing_ledger() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let ledger = directory.path().join("ledger.sqlite");
+    let output = Command::new(env!("CARGO_BIN_EXE_supply-core"))
+        .env("SUPPLY_DAILY_CAPTURE_LOCK_FD", "-1")
+        .args(["--ledger-db"])
+        .arg(&ledger)
+        .args(["scan-package", "npm"])
+        .arg(directory.path().join("missing.tgz"))
+        .args(["--name", "fixture", "--version", "1.0.0", "--json"])
+        .output()?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid capture lock descriptor"));
+    assert!(!ledger.exists());
+    Ok(())
+}

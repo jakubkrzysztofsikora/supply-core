@@ -318,8 +318,10 @@ def scan_package(
         environment["GUARDDOG_BIN"] = guarddog
     home_bin = str(Path.home() / ".local/bin")
     environment["PATH"] = home_bin + os.pathsep + environment.get("PATH", "")
+    lock_fd = environment.get("SUPPLY_DAILY_CAPTURE_LOCK_FD")
     completed = subprocess.run(
         command, capture_output=True, text=True, timeout=timeout, env=environment,
+        pass_fds=(int(lock_fd),) if lock_fd is not None else (),
     )
     if completed.returncode not in (0, 2, 3):
         detail = (completed.stderr or completed.stdout).strip()[:2000]

@@ -517,6 +517,60 @@ class ScanPackageTest(unittest.TestCase):
         self.assertNotIn("--findings-out", argv)
         self.assertIn("--scratch-dir", argv)
 
+    def test_scan_child_keeps_capture_lock_if_parent_dies(self):
+        import fcntl
+        import os
+        import subprocess
+        import tempfile
+        import time
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lock_path = root / "capture.lock"
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            binary = root / "fake-supply"
+            binary.write_text(
+                '#!/bin/sh\n'
+                ': > "$FIXTURE_DIR/started"\n'
+                'while [ ! -e "$FIXTURE_DIR/release" ]; do sleep 0.1; done\n'
+                ': > "$FIXTURE_DIR/done"\n'
+            )
+            binary.chmod(0o755)
+            env = dict(os.environ, FIXTURE_DIR=str(root), SUPPLY_DAILY_CAPTURE_LOCK_FD=str(lock_fd))
+            code = (
+                'import importlib.util, pathlib, sys; '
+                'spec=importlib.util.spec_from_file_location("scanner", sys.argv[1]); '
+                'module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module); '
+                'module.scan_package(sys.argv[2], pathlib.Path("a"), "pkg", "1.0.0", None)'
+            )
+            parent = subprocess.Popen(
+                [sys.executable, "-c", code, str(MODULE_PATH), str(binary)],
+                env=env, pass_fds=(lock_fd,), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            os.close(lock_fd)
+            try:
+                deadline = time.monotonic() + 10
+                while not (root / "started").exists() and time.monotonic() < deadline:
+                    if parent.poll() is not None:
+                        self.fail("scanner parent exited before starting the child")
+                    time.sleep(0.05)
+                self.assertTrue((root / "started").exists(), "scanner child did not start")
+                parent.kill()
+                parent.wait(timeout=5)
+                with lock_path.open("a") as contender:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                (root / "release").touch()
+                if parent.poll() is None:
+                    parent.kill()
+                    parent.wait(timeout=5)
+                deadline = time.monotonic() + 10
+                while not (root / "done").exists() and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertTrue((root / "done").exists(), "scanner child did not exit")
+
 class MainFlowTest(unittest.TestCase):
     """End-to-end candidate handling: enforcement only for quarantine holds."""
 

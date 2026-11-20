@@ -53,7 +53,7 @@ FROM runner AS radar
 USER root
 RUN apk add --no-cache bash git python3
 WORKDIR /radar
-COPY experiments/run.sh experiments/publish-status.py experiments/docker-entrypoint.sh experiments/policy.yml experiments/scan-quarantine.py /radar/
+COPY experiments/run.sh experiments/capture-lock.sh experiments/capture_validation.py experiments/publish-status.py experiments/docker-entrypoint.sh experiments/policy.yml experiments/scan-quarantine.py /radar/
 RUN chmod +x /radar/run.sh /radar/docker-entrypoint.sh && \
     mkdir -p /radar/data && chown -R supply:supply /radar
 USER supply

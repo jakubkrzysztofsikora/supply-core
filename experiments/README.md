@@ -27,6 +27,11 @@ python3 report.py           # baseline vs latest diff
 package name, resolved version, and recognized status; malformed snapshots make
 capture incomplete.
 
+`run.sh`, `remote-scan.sh`, and `daily-capture.sh` share a nonblocking lock
+within the same checkout. Concurrent runs exit without modifying the capture.
+Standalone `scan-quarantine.py` runs and the radar container's full cycle do
+not hold this lock. Do not share their files with a concurrent capture.
+
 
 ## Daily auto-capture (GitHub-backed)
 

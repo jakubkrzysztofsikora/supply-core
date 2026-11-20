@@ -18,6 +18,9 @@ day_dir=$1
 findings=$2
 ledger=$3
 [ -n "${SUPPLY_SCAN_IMAGE:-}" ] || { echo "remote-scan: SUPPLY_SCAN_IMAGE is not set" >&2; exit 3; }
+HERE="$(cd "$(dirname "$0")" && pwd)"
+. "$HERE/capture-lock.sh"
+capture_lock "$HERE/data/.daily-capture.lock" || exit 1
 image=$SUPPLY_SCAN_IMAGE
 namespace=${SUPPLY_SCAN_NAMESPACE:-supply-core}
 node=${SUPPLY_SCAN_NODE:-k3s-node-1}
@@ -36,7 +39,7 @@ infra_fail() {
 cp_back() {
   local attempt
   for attempt in 1 2 3; do
-    "${kube[@]}" cp "$1" "$2" >/dev/null 2>&1 && return 0
+    "${kube[@]}" cp "$1" "$2" && return 0
     sleep $((attempt * 5))
   done
   return 1
@@ -86,7 +89,8 @@ fi
 # A run with nothing to enforce legitimately leaves this file empty.
 "${kube[@]}" exec "$pod" -- sh -c 'touch /work/content-findings.jsonl' >/dev/null 2>&1 || true
 if [ -f "$ledger" ]; then
-  "${kube[@]}" cp "$ledger" "$pod:/work/ledger.sqlite" >/dev/null || infra_fail "cannot copy ledger"
+  "${kube[@]}" exec -i "$pod" -- sh -c 'umask 077; cat > /work/ledger.sqlite' <"$ledger" \
+    || infra_fail "cannot copy ledger"
 fi
 "${kube[@]}" exec "$pod" -- chmod 600 /work/ledger.sqlite 2>/dev/null || true
 

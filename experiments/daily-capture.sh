@@ -17,6 +17,8 @@ mkdir -p "$HERE/data" || exit 1
 # Cron-friendly PATH: rustup proxies live in ~/.cargo/bin; GuardDog lives in
 # ~/.local/bin; keep the system defaults for git/python3.
 export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+. "$HERE/capture-lock.sh"
+capture_lock "$HERE/data/.daily-capture.lock" || exit 1
 export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 export SUPPLY_LEDGER_PATH="${SUPPLY_LEDGER_PATH:-$HERE/data/ledger.sqlite}"
@@ -39,19 +41,19 @@ cd "$ROOT" || exit 1
   echo "rustc: $(command -v rustc 2>/dev/null || echo MISSING)"
 
   # Track upstream so candidates.txt / run.sh / source edits land here.
-  branch="$(git rev-parse --abbrev-ref HEAD)"
-  if git fetch --quiet origin "$branch" 2>/dev/null; then
-    if ! git pull --ff-only --quiet origin "$branch" 2>/dev/null; then
+  branch="$(git rev-parse --abbrev-ref HEAD 9>&-)"
+  if git fetch --quiet origin "$branch" 9>&- 2>/dev/null; then
+    if ! git pull --ff-only --quiet origin "$branch" 9>&- 2>/dev/null; then
       echo "WARN: git pull --ff-only failed (local commits?); running on local HEAD"
     fi
   else
     echo "WARN: git fetch failed (offline?); running on local HEAD"
   fi
-  rev="$(git rev-parse --short HEAD)"
+  rev="$(git rev-parse --short HEAD 9>&-)"
   echo "repo rev $rev on $branch"
 
   # Incremental release build. ~1s when nothing changed, ~30s after src edits.
-  if cargo build --release --locked --quiet; then
+  if cargo build --release --locked --quiet 9>&-; then
     echo "binary $BIN ($(stat -f%Sm "$BIN" 2>/dev/null || stat -c%y "$BIN"))"
   else
     echo "ERROR: cargo build failed; skipping run.sh"
@@ -81,7 +83,7 @@ cd "$ROOT" || exit 1
       if [ -n "${SUPPLY_SCRATCH_DIR:-}" ]; then
         scratch_args+=(--scratch-dir "$SUPPLY_SCRATCH_DIR")
       fi
-      python3 "$HERE/scan-quarantine.py" "$HERE/data/$DAY" --bin "$BIN" \
+      SUPPLY_DAILY_CAPTURE_LOCK_FD=9 python3 "$HERE/scan-quarantine.py" "$HERE/data/$DAY" --bin "$BIN" \
         ${scratch_args[@]+"${scratch_args[@]}"} \
         --ledger-db "$SUPPLY_LEDGER_PATH" \
         --findings "$HERE/data/content-findings.jsonl" || scan_rc=$?

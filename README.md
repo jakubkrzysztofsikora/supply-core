@@ -244,10 +244,11 @@ python3 experiments/scan-quarantine.py experiments/data/2026-09-13 \
 On a macOS capture host, set `SUPPLY_SCAN_IMAGE` to a scanner image in the
 publisher env file. `experiments/remote-scan.sh` then runs the scan in a
 short-lived pod (`SUPPLY_SCAN_NAMESPACE`, default `supply-core`; `SUPPLY_SCAN_NODE`,
-default `k3s-node-1`). It copies in that day's snapshots, the findings file and
-the ledger, and copies them back only after a completed scan. The capture host
-stays the single writer. If the pod cannot run, the capture scans locally and
-the results stay incomplete.
+default `k3s-node-1`). It copies in that day's snapshots and findings, streams
+the ledger over standard input, and copies results back after a completed scan.
+If WebSocket streaming fails, set `KUBECTL_REMOTE_COMMAND_WEBSOCKETS=false` to use SPDY.
+Concurrent captures and remote scans in one checkout share a lock. If the pod
+cannot run, the capture scans locally and the results stay incomplete.
 
 Verify local ledger consistency:
 
@@ -350,7 +351,7 @@ server over the compose network. Captures land in `radar/data/`. Without the
   {
     "generated_at": "2026-11-15T08:32:00Z",
     "service": "supply-core",
-    "version": "0.4.7",
+    "version": "0.4.8",
     "health": {"status": "ok"},
     "quarantine": {
       "enabled": true,

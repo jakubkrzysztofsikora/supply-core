@@ -254,6 +254,18 @@ fn open_ledger(path: Option<&Path>) -> Result<supply_core::application::ledger::
     }
     supply_core::application::ledger::LedgerRecorder::open(path)
 }
+#[cfg(unix)]
+fn capture_lock_close_on_exec(fd: i32) -> Result<()> {
+    anyhow::ensure!(fd > 2, "invalid capture lock descriptor");
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
 
 #[cfg(unix)]
 fn require_local_operator_mode(path: &Path) -> Result<()> {
@@ -561,6 +573,14 @@ async fn main() -> Result<()> {
             findings_out,
             json,
         } => {
+            #[cfg(unix)]
+            if let Some(fd) = std::env::var_os("SUPPLY_DAILY_CAPTURE_LOCK_FD") {
+                let fd = fd
+                    .to_str()
+                    .and_then(|value| value.parse::<i32>().ok())
+                    .ok_or_else(|| anyhow::anyhow!("invalid capture lock descriptor"))?;
+                capture_lock_close_on_exec(fd)?;
+            }
             let ledger = open_ledger(ledger_db.as_deref())?;
             let policy = load_policy(policy.as_deref())?;
             let report = tokio::task::spawn_blocking(move || {
@@ -1392,6 +1412,29 @@ fn snapshot_nuget(
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn capture_lock_cannot_escape_to_exec_children() -> Result<()> {
+        use std::os::fd::AsRawFd;
+        use std::process::Command;
+
+        let file = tempfile::tempfile()?;
+        let fd = file.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) },
+            0
+        );
+        capture_lock_close_on_exec(fd)?;
+        let child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("test ! -e /dev/fd/{fd}"))
+            .status()?;
+        assert!(child.success(), "capture lock reached an exec child");
+        assert!(capture_lock_close_on_exec(-1).is_err());
+        Ok(())
+    }
 
     #[test]
     fn version_flag_is_supported() {

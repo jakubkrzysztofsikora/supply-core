@@ -6,6 +6,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 BIN="${SUPPLY_BIN:-$HERE/../target/release/supply-core}"
 [ -x "$BIN" ] || BIN="$HERE/../target/debug/supply-core"
 DATA="$HERE/data"
+. "$HERE/capture-lock.sh"
+capture_lock "$DATA/.daily-capture.lock" || exit 1
 DAY="${1:-$(date +%Y-%m-%d)}"
 DIR="$DATA/$DAY"
 OSV_CACHE="$DATA/osv-cache"
