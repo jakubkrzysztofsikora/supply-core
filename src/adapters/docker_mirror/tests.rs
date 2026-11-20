@@ -636,3 +636,161 @@ async fn docker_hub_cve_keeps_image_quarantined() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn oversized_index_batch_is_rejected_without_scanning() -> anyhow::Result<()> {
+    let registry = Registry::default();
+    let entries = (0..5)
+        .map(|index| {
+            // The cap accounts declared descriptor sizes before any fetch,
+            // so the children themselves never need to exist upstream.
+            desc(
+                MANIFEST_TYPES[2],
+                &digest(format!("child:{index}").as_bytes()),
+                4 * 1024 * 1024,
+            )
+        })
+        .collect::<Vec<_>>();
+    let bytes = serde_json::to_vec(&json!({
+        "schemaVersion": 2, "mediaType": MANIFEST_TYPES[0], "manifests": entries,
+    }))?;
+    let hash = registry.insert("manifests", MANIFEST_TYPES[0], bytes)?;
+    registry.tag("main", &hash)?;
+    let (upstream, task) = registry.serve().await?;
+    let dir = tempfile::tempdir()?;
+    let scans = Arc::new(AtomicUsize::new(0));
+    let scan: TestScan = {
+        let scans = Arc::clone(&scans);
+        Arc::new(move |_| {
+            scans.fetch_add(1, Ordering::SeqCst);
+            Ok(Verdict::Clean)
+        })
+    };
+    let mirror = mirror(dir.path(), upstream, scan)?;
+    let app = router(Arc::clone(&mirror));
+    // Young: observed, quarantined, and the background scan already fails.
+    assert_eq!(
+        request(&app, Method::GET, &uri("manifests", "main"), &[])
+            .await?
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    finish_background(&mirror).await;
+    age(dir.path(), &hash)?;
+    assert_eq!(
+        request(&app, Method::GET, &uri("manifests", "main"), &[])
+            .await?
+            .status(),
+        StatusCode::BAD_GATEWAY
+    );
+    finish_background(&mirror).await;
+    assert_eq!(scans.load(Ordering::SeqCst), 0);
+    task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn external_cache_requires_both_databases_fresh() -> anyhow::Result<()> {
+    fn seed(cache: &Path, directory: &str, file: &str) -> anyhow::Result<()> {
+        let path = cache.join(directory);
+        std::fs::create_dir_all(&path)?;
+        std::fs::write(
+            path.join("metadata.json"),
+            format!(r#"{{"UpdatedAt":"{}"}}"#, Utc::now().to_rfc3339()),
+        )?;
+        std::fs::write(path.join(file), b"database")?;
+        Ok(())
+    }
+    let dir = tempfile::tempdir()?;
+    let cache = dir.path().join("trivy-cache");
+    std::fs::create_dir_all(&cache)?;
+    seed(&cache, "db", "trivy.db")?;
+    seed(&cache, "java-db", "trivy-java.db")?;
+    let config = Config {
+        directory: dir.path().join("mirror"),
+        trivy: PathBuf::new(),
+        external_database: Some(cache.clone()),
+        policy: Policy::default(),
+    };
+    let mirror = Mirror::new(config, Upstream::docker_hub()?)?;
+    let accepted = mirror
+        .database(dir.path())
+        .await
+        .map_err(|_| anyhow::anyhow!("a fresh cache was rejected"))?;
+    assert_eq!(accepted, cache);
+    std::fs::remove_file(cache.join("java-db").join("trivy-java.db"))?;
+    assert!(matches!(
+        mirror.database(dir.path()).await,
+        Err(MirrorError::Scanner(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn metadata_bursts_hit_quotas_instead_of_growing_state() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = Store::open(dir.path())?;
+    let now = Utc::now();
+    for index in 0..store::MAX_METADATA_IMAGES {
+        store.observe(
+            "r",
+            &digest(format!("digest:{index}").as_bytes()),
+            None,
+            now,
+        )?;
+    }
+    assert!(store.observe("r", &digest(b"overflow"), None, now).is_err());
+    let tags = tempfile::tempdir()?;
+    let store = Store::open(tags.path())?;
+    let shared = digest(b"one-image");
+    for index in 0..store::MAX_METADATA_TAGS {
+        store.observe("r", &shared, Some(&format!("tag:{index}")), now)?;
+    }
+    assert!(store.observe("r", &shared, Some("overflow"), now).is_err());
+    Ok(())
+}
+
+#[test]
+fn observation_prunes_orphan_tags_and_aged_metadata() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = Store::open(dir.path())?;
+    let now = Utc::now();
+    let kept = digest(b"kept");
+    store.observe("r", &kept, Some("stable"), now)?;
+    {
+        let db = rusqlite::Connection::open(dir.path().join("state.db"))?;
+        db.execute(
+            "INSERT INTO tags VALUES ('r','ghost',?1)",
+            ["sha256:deadbeef"],
+        )?;
+        db.execute(
+            "INSERT INTO images (repository,digest,first_seen) VALUES ('old','sha256:beef',?1)",
+            [now.timestamp() - store::METADATA_RETENTION_SECONDS - 1],
+        )?;
+    }
+    store.observe("r", &digest(b"fresh"), None, now)?;
+    let db = rusqlite::Connection::open(dir.path().join("state.db"))?;
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM tags WHERE NOT EXISTS (SELECT 1 FROM images WHERE images.repository = tags.repository AND images.digest = tags.digest)",
+            [],
+            |row| row.get::<_, i64>(0)
+        )?,
+        0
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM images WHERE repository='old'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )?,
+        0
+    );
+    let first_seen = db.query_row(
+        "SELECT first_seen FROM images WHERE repository='r' AND digest=?1",
+        [kept],
+        |row| row.get::<_, i64>(0),
+    )?;
+    assert_eq!(first_seen, now.timestamp());
+    Ok(())
+}
