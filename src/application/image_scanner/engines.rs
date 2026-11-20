@@ -102,11 +102,11 @@ pub(super) fn registry_trivy_findings(
     binary: &Path,
 ) -> Result<Vec<EngineFinding>> {
     let scratch = tempfile::tempdir_in(scratch_parent)?;
+    // Both databases must stage: a missing Java DB would silently drop
+    // Java-package results while OS or other language results still passed
+    // the coverage check below.
     for (database, filename) in [("db", "trivy.db"), ("java-db", "trivy-java.db")] {
         let source = cache.join(database);
-        if database == "java-db" && !source.exists() {
-            continue;
-        }
         let target = scratch.path().join("trivy-cache").join(database);
         fs::create_dir_all(&target)?;
         for file in [filename, "metadata.json"] {

@@ -13,6 +13,7 @@ use super::upstream::{Manifest, Repository};
 
 const MAX_OBJECTS: usize = 4096;
 const MAX_MANIFESTS: usize = 128;
+const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_DEPTH: usize = 8;
 const MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const ATTESTATION_TYPE: &str = "application/vnd.in-toto+json";
@@ -132,9 +133,18 @@ impl Graph {
                     .filter(|child| !child.annotations.contains_key("vnd.docker.reference.type"))
                     .map(|child| child.digest.clone())
                     .collect::<BTreeSet<_>>();
+                let mut child_bytes = 0_u64;
                 let mut children_to_fetch = Vec::with_capacity(children.len());
                 for child in children {
                     descriptor(&child).map_err(MirrorError::invalid)?;
+                    // The batch retains every child body until the walk
+                    // writes it to staging: cap the aggregate, not each part.
+                    child_bytes = account(child_bytes, child.size)?;
+                    if child_bytes > MAX_MANIFEST_BYTES {
+                        return Err(MirrorError::invalid(anyhow::anyhow!(
+                            "child manifests exceed the aggregate size limit"
+                        )));
+                    }
                     if child.size > MAX_MANIFEST as u64
                         || !MANIFEST_TYPES.contains(&child.media_type.as_str())
                     {

@@ -11,6 +11,9 @@ use std::{
 
 const MAX_CACHE_BYTES: i64 = 20 * 1024 * 1024 * 1024;
 const SCAN_TTL_SECONDS: i64 = 24 * 60 * 60;
+const MAX_METADATA_IMAGES: i64 = 4096;
+const MAX_METADATA_TAGS: i64 = 8192;
+const METADATA_RETENTION_SECONDS: i64 = 90 * 24 * 60 * 60;
 
 pub(super) struct Store {
     db: Mutex<Connection>,
@@ -107,12 +110,51 @@ impl Store {
     ) -> anyhow::Result<DateTime<Utc>> {
         let mut db = self.db()?;
         let tx = db.transaction()?;
+        // Metadata for an observed digest is kept even when no released copy
+        // exists: it anchors the quarantine window and a known rejection. That
+        // retention is bounded here, not in commit, so a caller polling
+        // unique digests cannot grow the database between successful scans.
+        // Pruning restarts the window for a re-observed digest: fail closed.
         tx.execute(
-            "INSERT OR IGNORE INTO images (repository,digest,first_seen) VALUES (?1,?2,?3)",
-            params![repo, digest, now.timestamp()],
+            "DELETE FROM images WHERE cache_key IS NULL AND first_seen < ?1",
+            params![now.timestamp() - METADATA_RETENTION_SECONDS],
+        )?;
+        tx.execute(
+            "DELETE FROM tags WHERE NOT EXISTS (SELECT 1 FROM images WHERE images.repository = tags.repository AND images.digest = tags.digest)",
+            [],
         )?;
         if let Some(tag) = tag {
-            tx.execute("INSERT INTO tags VALUES (?1,?2,?3) ON CONFLICT(repository,tag) DO UPDATE SET digest=excluded.digest", params![repo, tag, digest])?;
+            let existing: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM tags WHERE repository=?1 AND tag=?2)",
+                params![repo, tag],
+                |row| row.get(0),
+            )?;
+            if !existing {
+                let tags: i64 = tx.query_row("SELECT COUNT(*) FROM tags", [], |row| row.get(0))?;
+                anyhow::ensure!(tags < MAX_METADATA_TAGS, "mirror tag capacity reached");
+            }
+        }
+        let known: Option<i64> = tx
+            .query_row(
+                "SELECT first_seen FROM images WHERE repository=?1 AND digest=?2",
+                [repo, digest],
+                |row| row.get(0),
+            )?
+            .optional()?;
+        if known.is_none() {
+            let pending: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM images WHERE cache_key IS NULL",
+                [],
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(
+                pending < MAX_METADATA_IMAGES,
+                "mirror image capacity reached"
+            );
+            tx.execute(
+                "INSERT OR IGNORE INTO images (repository,digest,first_seen) VALUES (?1,?2,?3)",
+                params![repo, digest, now.timestamp()],
+            )?;
         }
         let ts = tx.query_row(
             "SELECT first_seen FROM images WHERE repository=?1 AND digest=?2",

@@ -278,11 +278,23 @@ impl Mirror {
 
     async fn database(&self, root: &Path) -> Result<PathBuf> {
         if let Some(cache) = &self.config.external_database {
-            if db_fresh(cache, "db", "trivy.db", Duration::from_secs(48 * 3600)).await {
+            // An external cache is never refreshed here, so every database the
+            // scan will read must already be present and fresh. A missing or
+            // stale Java DB would silently disable language-package scanning
+            // while OS results alone satisfied the coverage gate.
+            let fresh = db_fresh(cache, "db", "trivy.db", Duration::from_secs(48 * 3600)).await
+                && db_fresh(
+                    cache,
+                    "java-db",
+                    "trivy-java.db",
+                    Duration::from_secs(7 * 24 * 3600),
+                )
+                .await;
+            if fresh {
                 return Ok(cache.clone());
             }
             return Err(MirrorError::scanner(anyhow::anyhow!(
-                "configured Trivy vulnerability database missing or stale"
+                "configured Trivy vulnerability or Java database missing or stale"
             )));
         }
         let cache = root.join("trivy-cache");
