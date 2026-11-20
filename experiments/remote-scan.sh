@@ -28,6 +28,20 @@ infra_fail() {
   echo "remote-scan: $*" >&2
   exit 3
 }
+
+# kubectl cp streams tar over a websocket that drops intermittently; a failed
+# copy-back after a successful scan would discard good results and fall back to
+# a host scan without engines. Retries are cheap and land on the same staged
+# path.
+cp_back() {
+  local attempt
+  for attempt in 1 2 3; do
+    "${kube[@]}" cp "$1" "$2" >/dev/null 2>&1 && return 0
+    sleep $((attempt * 5))
+  done
+  return 1
+}
+
 cleanup() {
   "${kube[@]}" delete pod "$pod" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 }
@@ -90,11 +104,11 @@ esac
 
 stage=$(mktemp -d "$(dirname -- "$findings")/.remote-scan.XXXXXX")
 trap 'rm -rf -- "$stage"; cleanup' EXIT
-"${kube[@]}" cp "$pod:/work/day/content-scan.json" "$stage/content-scan.json" >/dev/null \
+cp_back "$pod:/work/day/content-scan.json" "$stage/content-scan.json" \
   || infra_fail "cannot copy scan summary back"
-"${kube[@]}" cp "$pod:/work/content-findings.jsonl" "$stage/content-findings.jsonl" >/dev/null \
+cp_back "$pod:/work/content-findings.jsonl" "$stage/content-findings.jsonl" \
   || infra_fail "cannot copy findings back"
-"${kube[@]}" cp "$pod:/work/ledger.sqlite" "$stage/ledger.sqlite" >/dev/null \
+cp_back "$pod:/work/ledger.sqlite" "$stage/ledger.sqlite" \
   || infra_fail "cannot copy ledger back"
 for copied in content-scan.json ledger.sqlite; do
   [ -s "$stage/$copied" ] || infra_fail "copied $copied is empty"
