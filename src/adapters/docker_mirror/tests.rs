@@ -557,8 +557,11 @@ async fn docker_engine_cannot_pull_until_release() -> anyhow::Result<()> {
         .output()
         .await?;
     let error = String::from_utf8_lossy(&held.stderr);
+    // Docker's resolver probes the tag with HEAD, which carries no body, so
+    // the quarantine reason is asserted in-process against GET. The
+    // engine-visible contract is that the pull is denied with 403.
     assert!(
-        !held.status.success() && error.contains("quarantine window"),
+        !held.status.success() && error.contains("403 Forbidden"),
         "{error}"
     );
     finish_background(&mirror).await;
