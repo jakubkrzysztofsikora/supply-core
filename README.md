@@ -83,6 +83,10 @@ cargo run -- scan-docker .
 
 *`snapshot-*` prints a JSON report; `scan-docker` exits `2` when an image is unpinned.*
 
+On macOS, built-in HTTPS clients trust the system certificate store alongside
+bundled public roots. `SSL_CERT_FILE` or `SSL_CERT_DIR` replaces the system
+store, but does not replace the bundled public roots.
+
 Inspect local image archives without starting containers. Set
 `SUPPLY_SCRATCH_DIR` to an existing real directory. Compressed image archives
 above 64 MiB need a user-owned, non-shared directory on a Unix volume separate
@@ -162,10 +166,13 @@ checks exact registry metadata, requires every npm SRI digest for the strongest
 algorithm present in the lock to match registry metadata (including historical
 SHA-1 locks through `dist.shasum`), and fails closed when registry metadata lacks
 the locked algorithm. Full npm registry URL paths keep same-host feeds
-independently assessed. It recomputes NuGet's signature-excluded `contentHash`,
-checks archive SHA-512 against the cache sidecar and registry package hash, and
-keeps same-host NuGet feeds independently assessed. It also checks publication
-age and OSV advisories. The JSON `source` retains validated feed paths and
+independently assessed. It recomputes NuGet's signature-excluded `contentHash`
+and checks archive SHA-512 against the cache sidecar and registry catalog. When
+an Azure Artifacts feed lacks a catalog hash, configured first-party packages
+are compared with a fresh authenticated feed download; mirrored packages are
+compared with nuget.org's catalog. See the [threat model](docs/threat-model.md)
+for the trust boundaries. It also checks publication age and OSV advisories.
+The JSON `source` retains validated feed paths and
 rejects URL credentials, queries, and fragments; keep scan artifacts within the
 CI access boundary because feed paths can identify private organization and
 project names. Exit `0` means complete with no policy findings, `2` means policy

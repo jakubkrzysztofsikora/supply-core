@@ -11,9 +11,10 @@ trust model.
    different bytes. These are policy guarantees, not cryptographic ones.
    Mirrors, self-hosted registries, and project-local feeds may violate them;
    NuGet additionally allows unlisting without deleting.
-2. **Trusted transport.** TLS to the upstream registry is assumed intact
-   (CA-pinned system roots, `rustls`). An attacker who breaks TLS
-   controls both metadata and tarballs.
+2. **Trusted transport.** TLS uses bundled public roots. On macOS, it also
+   trusts system roots or the roots selected by `SSL_CERT_FILE` and
+   `SSL_CERT_DIR`. An attacker controlling a trusted CA can intercept registry
+   and vulnerability data.
 3. **Integrity strings are authoritative.** npm lock SRI selects its strongest
    supported algorithm and requires every locked digest for that algorithm to
    match registry `dist.integrity`; historical SHA-1 pins use `dist.shasum`.
@@ -23,11 +24,12 @@ trust model.
    only. PyPI `digests.sha256` and the NuGet registration `packageHash` identify
    published archive bytes. NuGet `packages.lock.json contentHash` excludes the
    `.signature.p7s` entry. `scan-packages` recomputes that signature-independent
-   hash from restored package bytes, then checks archive SHA-512 against both
-   the cache sidecar and each full NuGet feed identity's registry `packageHash`;
-   when a feed's `catalogEntry` is unfetchable (Azure Artifacts commitLog URLs
-   404 under basic auth), assessment continues from the same authenticated
-   registration leaf, and packages without registry archive metadata fail closed.
+   hash from restored package bytes, then checks archive SHA-512 against the
+   cache sidecar and registry catalog. If a Circit Azure Artifacts feed lacks
+   a catalog hash, configured first-party packages are checked against a fresh
+   authenticated feed download after confirming their IDs are absent from
+   nuget.org. Mirrored packages are checked against nuget.org's catalog hash.
+   Missing required metadata or an unsuccessful verification fails closed.
    `snapshot-nuget` has no restored archive and does not verify lock
    `contentHash`. A registry that lies consistently (matching bytes + matching
    hash) is out of scope until signed provenance/attestation checks exist.
@@ -85,8 +87,8 @@ trust model.
   incomplete. Contents of nested archives are covered by OSSGadget only.
 - `ArtifactStore::get` still takes caller-supplied paths; constrained
   before the HTTP serve endpoint lands.
-- Azure Artifacts feeds publish no NuGet catalog, so the registry cannot attest a
-  package hash. Mirrored packages are attested against nuget.org's catalog hash.
+- Some Azure Artifacts feeds expose no usable NuGet catalog hash. Mirrored
+  packages are attested against nuget.org's catalog hash.
   Packages matching a `nuget.first_party_packages` prefix are trusted only when
   restored from that entry's exact feed (a prefixed id from any other source is
   refused) and have no independent attestation: the scanner requires that no

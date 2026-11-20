@@ -1464,6 +1464,40 @@ mod tests {
     }
 
     #[test]
+    fn first_party_attestation_rejects_a_different_restored_archive() -> Result<()> {
+        let feed_hash = "ECWb/hpBBY5GcdBaO5Yrd0xLFpRrQEC8BVBZ0YWdXxXsTX8Byj91YWMtAK3WEi0zcCKhURdOW5zr9DAlS46fpw==";
+        let altered_hash = "z9Sus36GJD0vsRXnFdyjuHDBzTGfaz8r8Opi5xHs2I85NsYIbPwyBllwf5LW4X6tN+XTOdXfn4lsRL2QwG0rjg==";
+        let (metadata, attestation) = attested_nuget_metadata(
+            &leaf(None),
+            "Circit.Evidence",
+            BACKEND,
+            &first_party(),
+            &no_upstream_release,
+            &|| Ok(false),
+            &|_| Ok(feed_hash.to_string()),
+        )?;
+        let version = PackageVersionId::parse(&Ecosystem::NuGet, "1.0.0")?;
+        let accepted = nuget::package_version_from_nuget(
+            &metadata,
+            "Circit.Evidence",
+            &version,
+            Some("LOCK"),
+            Some(feed_hash),
+        )?;
+        assert_eq!(accepted.integrity.as_deref(), Some("sha512-LOCK"));
+        assert_eq!(attestation, "first-party-feed-bytes");
+        assert!(nuget::package_version_from_nuget(
+            &metadata,
+            "Circit.Evidence",
+            &version,
+            Some("LOCK"),
+            Some(altered_hash),
+        )
+        .is_err());
+        Ok(())
+    }
+
+    #[test]
     fn first_party_id_on_nuget_org_is_refused_even_with_a_catalog_hash() {
         for metadata in [leaf(Some("CATALOG")), leaf(None)] {
             let error = attested_nuget_metadata(

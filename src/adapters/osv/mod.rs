@@ -570,6 +570,152 @@ mod tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn transport_respects_native_roots_without_accepting_untrusted_certificates() -> Result<()> {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::process::{Command, Stdio};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        const URL_ENV: &str = "SUPPLY_CORE_TEST_OSV_TLS_URL";
+        const TRUSTED_ENV: &str = "SUPPLY_CORE_TEST_OSV_TLS_TRUSTED";
+        if let Ok(url) = std::env::var(URL_ENV) {
+            let result = ReqwestOsvTransport::with_timeout(Duration::from_secs(3))?
+                .post_once(&url, &serde_json::json!({}));
+            if std::env::var_os(TRUSTED_ENV).is_some() {
+                assert_eq!(result.map_err(|(error, _)| error)?, serde_json::json!({}));
+            } else {
+                let (error, _) = result.unwrap_err();
+                assert!(
+                    error.chain().any(|cause| {
+                        let mut inner = Some(cause);
+                        while let Some(current) = inner {
+                            if matches!(
+                                current.downcast_ref::<rustls::Error>(),
+                                Some(rustls::Error::InvalidCertificate(_))
+                            ) {
+                                return true;
+                            }
+                            inner = current
+                                .downcast_ref::<std::io::Error>()
+                                .and_then(std::io::Error::get_ref)
+                                .map(|error| error as &(dyn std::error::Error + 'static));
+                        }
+                        false
+                    }),
+                    "{error:#}"
+                );
+            }
+            return Ok(());
+        }
+
+        let rcgen::CertifiedKey { cert, key_pair } =
+            rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()])?;
+        let other = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()])?;
+        let directory = tempfile::tempdir()?;
+        let trusted_ca = directory.path().join("trusted.pem");
+        let untrusted_ca = directory.path().join("untrusted.pem");
+        std::fs::write(&trusted_ca, cert.pem())?;
+        std::fs::write(&untrusted_ca, other.cert.pem())?;
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der()).into(),
+        )?;
+
+        for (ca, trusted) in [(&trusted_ca, true), (&untrusted_ca, false)] {
+            let listener = TcpListener::bind(("127.0.0.1", 0))?;
+            listener.set_nonblocking(true)?;
+            let url = format!("https://{}/v1/query", listener.local_addr()?);
+            let config = Arc::new(config.clone());
+            let server = std::thread::spawn(move || -> Result<()> {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                };
+                socket.set_nonblocking(false)?;
+                socket.set_read_timeout(Some(Duration::from_secs(3)))?;
+                let connection = rustls::ServerConnection::new(config)?;
+                let mut stream = rustls::StreamOwned::new(connection, socket);
+                let mut request = Vec::new();
+                let mut buffer = [0; 4096];
+                loop {
+                    let length = match stream.read(&mut buffer) {
+                        Ok(length) => length,
+                        Err(error) if trusted => return Err(error.into()),
+                        Err(_) => break,
+                    };
+                    if length == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..length]);
+                    if request.windows(6).any(|chunk| chunk == b"\r\n\r\n{}") {
+                        stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                        )?;
+                        stream.flush()?;
+                        break;
+                    }
+                }
+                Ok(())
+            });
+            let mut command = Command::new(std::env::current_exe()?);
+            command
+                .arg("--exact")
+                .arg("adapters::osv::tests::transport_respects_native_roots_without_accepting_untrusted_certificates")
+                .env(URL_ENV, &url)
+                .env("SSL_CERT_FILE", ca)
+                .env_remove("SSL_CERT_DIR");
+            if trusted {
+                command.env(TRUSTED_ENV, "1");
+            } else {
+                command.env_remove(TRUSTED_ENV);
+            }
+            let mut child = command
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let timed_out = loop {
+                if child.try_wait()?.is_some() {
+                    break false;
+                }
+                if Instant::now() >= deadline {
+                    child.kill()?;
+                    break true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            let output = child.wait_with_output()?;
+            let server_result = server
+                .join()
+                .map_err(|_| anyhow::anyhow!("TLS server panicked"))?;
+            assert!(
+                !timed_out && output.status.success(),
+                "child test failed or timed out:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            server_result?;
+        }
+        Ok(())
+    }
+
     fn serve_sequence(
         responses: Vec<&'static str>,
     ) -> Result<(String, std::thread::JoinHandle<usize>)> {
