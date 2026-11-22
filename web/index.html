@@ -9,16 +9,24 @@
     :root {
       color-scheme: light;
       --ink: #18212f;
-      --muted: #6b778c;
+      --muted: #5d697c;
       --line: #e5eaf1;
       --surface: #ffffff;
       --canvas: #f5f7fb;
       --accent: #3761e9;
-      --accent-soft: #eaf0ff;
-      --good: #16835b;
+      --good: #11734f;
       --good-soft: #e4f6ee;
-      --warn: #a56800;
+      --warn: #7b4a00;
       --warn-soft: #fff3d8;
+      --error: #991b1b;
+      --error-soft: #fee4e2;
+      --neutral: #475569;
+      --neutral-soft: #e8edf3;
+      --summary-bg: #0d1117;
+      --summary-card: #111820;
+      --summary-line: #30363d;
+      --summary-text: #c9d1d9;
+      --summary-muted: #8b949e;
       --shadow: 0 14px 40px rgba(32, 52, 84, 0.08);
     }
 
@@ -39,13 +47,14 @@
       justify-content: space-between;
       padding: 20px clamp(20px, 5vw, 72px);
     }
-    .brand { align-items: center; display: flex; gap: 12px; }
+    .brand { align-items: center; display: flex; gap: 12px; min-width: 0; }
     .brand-mark {
       align-items: center;
       background: var(--accent);
       border-radius: 10px;
       color: white;
       display: inline-flex;
+      flex: 0 0 auto;
       font-weight: 800;
       height: 38px;
       justify-content: center;
@@ -56,52 +65,108 @@
     .brand-subtitle { color: var(--muted); font-size: 12px; }
     .status-pill {
       align-items: center;
-      background: var(--good-soft);
+      background: var(--neutral-soft);
       border-radius: 999px;
-      color: var(--good);
+      color: var(--neutral);
       display: inline-flex;
+      flex: 0 0 auto;
       font-size: 13px;
       font-weight: 700;
       gap: 8px;
       padding: 7px 12px;
     }
-    .status-dot { background: currentColor; border-radius: 50%; height: 7px; width: 7px; }
+    .status-pill.status-good { background: var(--good-soft); color: var(--good); }
+    .status-pill.status-warn { background: var(--warn-soft); color: var(--warn); }
+    .status-pill.status-error { background: var(--error-soft); color: var(--error); }
+    .status-dot { background: currentColor; border-radius: 50%; flex: 0 0 auto; height: 7px; width: 7px; }
     main { margin: 0 auto; max-width: 1180px; padding: 54px clamp(20px, 5vw, 72px) 72px; }
-    .intro { margin-bottom: 30px; }
+    .intro { margin-bottom: 28px; }
     h1 { font-size: clamp(30px, 4vw, 46px); letter-spacing: -0.05em; line-height: 1.05; margin: 0 0 12px; }
     .intro p { color: var(--muted); margin: 0; max-width: 650px; }
-    .status-card { display: block; height: auto; margin-top: 22px; max-width: 100%; }
+    .status-summary {
+      background: var(--summary-bg);
+      border: 1px solid var(--summary-line);
+      border-radius: 14px;
+      color: var(--summary-text);
+      margin-bottom: 28px;
+      padding: clamp(18px, 3vw, 26px);
+    }
+    .summary-head { align-items: flex-start; display: flex; flex-wrap: wrap; gap: 8px 20px; justify-content: space-between; }
+    .summary-head h2 { color: #f0f6fc; }
+    .summary-message { color: var(--summary-muted); font-size: 13px; margin: 5px 0 0; overflow-wrap: anywhere; }
+    .summary-message.freshness-stale { color: #ffd166; }
+    .summary-message.freshness-invalid { color: #ffb86c; }
+    .summary-message.freshness-missing { color: var(--summary-muted); }
+    .summary-message.freshness-fresh { color: #8ae2a6; }
+    .summary-message.freshness-error { color: #ff7b72; }
+    .summary-grid { display: grid; gap: 14px; grid-template-columns: repeat(4, minmax(0, 1fr)); margin-top: 20px; }
+    .summary-category {
+      background: var(--summary-card);
+      border: 1px solid var(--summary-line);
+      border-radius: 10px;
+      min-width: 0;
+      padding: 14px;
+    }
+    .summary-category h3 { font-size: 13px; line-height: 1.35; margin: 0; overflow-wrap: anywhere; }
+    .summary-category:nth-child(1) h3 { color: #58a6ff; }
+    .summary-category:nth-child(2) h3 { color: #f85149; }
+    .summary-category:nth-child(3) h3 { color: #d29922; }
+    .summary-category:nth-child(4) h3 { color: #bc8cff; }
+    .summary-count { color: #f0f6fc; font-size: 23px; font-weight: 750; letter-spacing: -0.04em; margin-top: 6px; overflow-wrap: anywhere; }
+    .summary-list { display: grid; gap: 8px; list-style: none; margin: 12px 0 0; padding: 0; }
+    .summary-list li { color: var(--summary-text); font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
+    .summary-list .summary-placeholder, .summary-list .summary-omitted { color: var(--summary-muted); }
+    .summary-list .summary-omitted { font-weight: 700; }
     .grid { display: grid; gap: 18px; grid-template-columns: repeat(4, minmax(0, 1fr)); }
     .card {
       background: var(--surface);
       border: 1px solid var(--line);
       border-radius: 14px;
       box-shadow: var(--shadow);
+      min-width: 0;
       padding: 22px;
     }
     .metric-label { color: var(--muted); font-size: 12px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
-    .metric-value { font-size: 30px; font-weight: 780; letter-spacing: -0.05em; margin-top: 10px; }
-    .metric-note { color: var(--muted); font-size: 13px; margin-top: 5px; }
+    .metric-value { font-size: 30px; font-weight: 780; letter-spacing: -0.05em; margin-top: 10px; overflow-wrap: anywhere; }
+    .metric-value.health-good { color: var(--good); }
+    .metric-value.health-warn { color: var(--warn); }
+    .metric-value.health-error { color: var(--error); }
+    .metric-value.health-neutral { color: var(--neutral); }
+    .metric-note { color: var(--muted); font-size: 13px; margin-top: 5px; overflow-wrap: anywhere; }
     .section { margin-top: 28px; }
-    .section-head { align-items: end; display: flex; justify-content: space-between; margin-bottom: 12px; }
+    .section-head { align-items: flex-start; display: flex; flex-wrap: wrap; gap: 12px; justify-content: space-between; margin-bottom: 12px; }
     h2 { font-size: 20px; letter-spacing: -0.03em; margin: 0; }
-    .section-head p { color: var(--muted); font-size: 13px; margin: 0; }
-    .table-wrap { overflow-x: auto; }
+    .section-head p { color: var(--muted); font-size: 13px; margin: 0; max-width: 650px; overflow-wrap: anywhere; }
+    .section-head p.freshness-stale, .section-head p.freshness-invalid { color: var(--warn); font-weight: 700; }
+    .section-head p.freshness-error { color: var(--error); font-weight: 700; }
+    .table-wrap { max-width: 100%; overflow-x: auto; overscroll-behavior-inline: contain; }
+    .table-wrap:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+    .table-wrap.is-empty, .table-wrap.has-note { overflow-x: visible; }
     table { border-collapse: collapse; min-width: 560px; width: 100%; }
-    th, td { border-bottom: 1px solid var(--line); padding: 15px 12px; text-align: left; }
+    .table-wrap.is-empty table, .table-wrap.has-note table { min-width: 0; table-layout: fixed; }
+    th, td { border-bottom: 1px solid var(--line); overflow-wrap: anywhere; padding: 15px 12px; text-align: left; vertical-align: top; }
     th { color: var(--muted); font-size: 11px; letter-spacing: .07em; text-transform: uppercase; }
     td:first-child, th:first-child { padding-left: 0; }
     td:last-child, th:last-child { padding-right: 0; text-align: right; }
-    .empty { color: var(--muted); padding: 28px 0 12px; }
-    .badge { background: var(--warn-soft); border-radius: 999px; color: var(--warn); font-size: 12px; font-weight: 700; padding: 5px 9px; }
-    footer { color: var(--muted); font-size: 12px; margin-top: 42px; }
+    td.empty { color: var(--muted); padding: 28px 0 12px; text-align: left; white-space: normal; }
+    .badge { background: var(--warn-soft); border-radius: 999px; color: var(--warn); display: inline-block; font-size: 12px; font-weight: 700; overflow-wrap: anywhere; padding: 5px 9px; }
+    footer { color: var(--muted); font-size: 12px; margin-top: 42px; overflow-wrap: anywhere; }
+    .freshness-flag { font-weight: 700; }
+    .freshness-flag.freshness-fresh { color: var(--good); }
+    .freshness-flag.freshness-stale, .freshness-flag.freshness-invalid { color: var(--warn); }
+    .freshness-flag.freshness-missing { color: var(--neutral); }
+    .freshness-flag.freshness-error { color: var(--error); }
     @media (max-width: 800px) {
-      .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .grid, .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .topbar { align-items: flex-start; gap: 16px; }
-      .status-pill { white-space: nowrap; }
     }
     @media (max-width: 480px) {
-      .grid { grid-template-columns: 1fr 1fr; }
+      .topbar { align-items: flex-start; flex-wrap: wrap; padding: 16px; }
+      main { padding: 36px 16px 56px; }
+      .status-pill { max-width: 100%; white-space: normal; }
+      .grid { gap: 12px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .summary-grid { grid-template-columns: 1fr; }
+      .card { padding: 16px; }
       .metric-value { font-size: 25px; }
     }
   </style>
@@ -116,13 +181,42 @@
           <div class="brand-subtitle">Dependency firewall diagnostics</div>
         </div>
       </div>
-      <div class="status-pill"><span class="status-dot"></span><span id="service-status">Checking status</span></div>
+      <div class="status-pill status-neutral" id="service-status-pill" role="status" aria-live="polite" aria-atomic="true"><span class="status-dot" aria-hidden="true"></span><span id="service-status">Checking status</span></div>
     </header>
     <main>
       <section class="intro">
         <h1>Server status</h1>
         <p>Public diagnostics for the Supply Core service. Repository contents and project-specific details are intentionally not shown.</p>
-        <img class="status-card" src="/api/v1/status/card.svg" alt="Quarantined versions, confirmed CVEs, and scan-suspected packages">
+      </section>
+      <section class="status-summary" aria-labelledby="status-summary-heading">
+        <div class="summary-head">
+          <div>
+            <h2 id="status-summary-heading">Package status</h2>
+            <p class="summary-message freshness-missing" id="snapshot-message">Loading snapshot data…</p>
+          </div>
+        </div>
+        <div class="summary-grid">
+          <article class="summary-category">
+            <h3>Quarantined packages</h3>
+            <div class="summary-count" id="summary-quarantine-count">Unknown</div>
+            <ul class="summary-list" id="summary-quarantine-list" aria-label="Quarantined package rows"></ul>
+          </article>
+          <article class="summary-category">
+            <h3>Confirmed CVEs</h3>
+            <div class="summary-count" id="summary-confirmed-count">Unknown</div>
+            <ul class="summary-list" id="summary-confirmed-list" aria-label="Confirmed advisory rows"></ul>
+          </article>
+          <article class="summary-category">
+            <h3>Suspected packages</h3>
+            <div class="summary-count" id="summary-suspected-count">Unknown</div>
+            <ul class="summary-list" id="summary-suspected-list" aria-label="Suspected package rows"></ul>
+          </article>
+          <article class="summary-category">
+            <h3>Incomplete scans</h3>
+            <div class="summary-count" id="summary-incomplete-count">Unknown</div>
+            <ul class="summary-list" id="summary-incomplete-list" aria-label="Incomplete scan rows"></ul>
+          </article>
+        </div>
       </section>
       <section class="grid" aria-label="Service diagnostics">
         <article class="card">
@@ -132,7 +226,7 @@
         </article>
         <article class="card">
           <div class="metric-label">Health</div>
-          <div class="metric-value" id="health-value">—</div>
+          <div class="metric-value health-neutral" id="health-value">Unknown</div>
           <div class="metric-note">Public health probe</div>
         </article>
         <article class="card">
@@ -143,7 +237,7 @@
         <article class="card">
           <div class="metric-label">Packages held</div>
           <div class="metric-value" id="quarantine-count">—</div>
-          <div class="metric-note">Currently in quarantine</div>
+          <div class="metric-note" id="quarantine-note">Waiting for snapshot data.</div>
         </article>
       </section>
       <section class="section" aria-labelledby="scan-heading">
@@ -183,7 +277,7 @@
             <p>Latest published decisions, coverage, findings, scores, rules, sources, and incomplete-engine reasons.</p>
           </div>
         </div>
-        <div class="table-wrap">
+        <div class="table-wrap is-empty" role="region" aria-label="Scanned package details table. Use horizontal scrolling for all columns." tabindex="0">
           <table>
             <thead>
               <tr>
@@ -205,7 +299,7 @@
             <p>Scanned rows with a block decision only; confirmed OSV blocks are listed separately.</p>
           </div>
         </div>
-        <div class="table-wrap">
+        <div class="table-wrap is-empty" role="region" aria-label="Scan-derived blocks table. Use horizontal scrolling for all columns." tabindex="0">
           <table>
             <thead>
               <tr>
@@ -227,7 +321,7 @@
             <p>Confirmed advisory findings, separate from scan-derived block decisions.</p>
           </div>
         </div>
-        <div class="table-wrap">
+        <div class="table-wrap is-empty" role="region" aria-label="Confirmed OSV blocks table. Use horizontal scrolling for all columns." tabindex="0">
           <table>
             <thead>
               <tr>
@@ -248,7 +342,7 @@
             <p>Only package name, version, age, and status are shown.</p>
           </div>
         </div>
-        <div class="table-wrap">
+        <div class="table-wrap is-empty" role="region" aria-label="Quarantine packages table. Use horizontal scrolling for all columns." tabindex="0">
           <table>
             <thead>
               <tr><th>Package</th><th>Version</th><th>Age</th><th>Status</th></tr>
@@ -266,7 +360,7 @@
             <p>Packages with incomplete scans have no score available.</p>
           </div>
         </div>
-        <div class="table-wrap">
+        <div class="table-wrap is-empty" role="region" aria-label="Incomplete scans table. Use horizontal scrolling for all columns." tabindex="0">
           <table>
             <thead>
               <tr><th>Package</th><th>Version</th><th>Scan status</th></tr>
@@ -277,11 +371,27 @@
           </table>
         </div>
       </section>
-      <footer>Supply Core <span id="footer-version"></span> · Public diagnostics only · Updated <span id="updated-at">—</span></footer>
+      <footer>Supply Core <span id="footer-version"></span> · Public diagnostics only · Latest snapshot: <time id="updated-at">—</time> · <span class="freshness-flag freshness-missing" id="freshness-label">Checking</span></footer>
     </main>
   </div>
   <script>
+    const MAX_SUMMARY_ROWS = 8;
+    const MAX_CAPTURE_AGE_MS = 36 * 60 * 60 * 1000;
+    let captureState = null;
+    let freshnessTimer = null;
     const text = (id, value) => { document.getElementById(id).textContent = String(value ?? "—"); };
+    const safeText = (value) => String(value ?? "—");
+    const countText = (value) => Number.isSafeInteger(value) && value >= 0 ? String(value) : "Unknown";
+    const setServiceStatus = (state, label) => {
+      const pill = document.getElementById("service-status-pill");
+      pill.className = `status-pill status-${state}`;
+      text("service-status", label);
+    };
+    const setHealthValue = (state, label) => {
+      const value = document.getElementById("health-value");
+      value.className = `metric-value health-${state}`;
+      value.textContent = label;
+    };
     const showMessage = (id, columns, message) => {
       const body = document.getElementById(id);
       const row = document.createElement("tr");
@@ -291,39 +401,244 @@
       cell.textContent = message;
       row.appendChild(cell);
       body.replaceChildren(row);
+      body.closest(".table-wrap")?.classList.remove("has-note");
+      body.closest(".table-wrap")?.classList.add("is-empty");
     };
-    const renderRows = (id, rows, columns, emptyMessage, valuesForRow) => {
-      const body = document.getElementById(id);
-      body.replaceChildren();
-      if (!Array.isArray(rows) || !rows.length) {
+    const renderRows = (id, rows, columns, emptyMessage, valuesForRow, unknownMessage) => {
+      if (!Array.isArray(rows)) {
+        showMessage(id, columns, unknownMessage);
+        return;
+      }
+      if (!rows.length) {
         showMessage(id, columns, emptyMessage);
         return;
       }
+      const body = document.getElementById(id);
+      body.closest(".table-wrap")?.classList.remove("is-empty", "has-note");
+      body.replaceChildren();
       rows.forEach((item) => {
         const row = document.createElement("tr");
         valuesForRow(item).forEach((value) => {
           const cell = document.createElement("td");
-          cell.textContent = String(value ?? "—");
+          cell.textContent = safeText(value);
           row.appendChild(cell);
         });
         body.appendChild(row);
       });
     };
+    const appendSummaryMessage = (list, message, className = "summary-placeholder") => {
+      const item = document.createElement("li");
+      item.className = className;
+      item.textContent = message;
+      list.appendChild(item);
+    };
+    const renderSummaryCategory = (countId, listId, rows, available, formatRow, emptyMessage, unknownMessage, extraCount = 0) => {
+      const count = document.getElementById(countId);
+      const list = document.getElementById(listId);
+      list.replaceChildren();
+      if (!available || !Array.isArray(rows)) {
+        count.textContent = "Unknown";
+        appendSummaryMessage(list, unknownMessage);
+        return;
+      }
+      const extra = Number.isSafeInteger(extraCount) && extraCount >= 0 ? extraCount : null;
+      const total = extra === null ? null : rows.length + extra;
+      count.textContent = total === null ? "Unknown" : String(total);
+      const visible = rows.slice(0, MAX_SUMMARY_ROWS);
+      if (!visible.length && total === 0) {
+        appendSummaryMessage(list, emptyMessage);
+      } else if (!visible.length && total === null) {
+        appendSummaryMessage(list, "The total count is unavailable.");
+      } else {
+        visible.forEach((row) => appendSummaryMessage(list, formatRow(row), ""));
+      }
+      const omitted = rows.length - visible.length + (extra ?? 0);
+      if (omitted > 0) appendSummaryMessage(list, `+${omitted} more`, "summary-omitted");
+      if (extra === null && rows.length) appendSummaryMessage(list, "Additional count unavailable.");
+    };
+    const captureDetails = (capturedAt) => {
+      if (capturedAt === null || capturedAt === undefined) {
+        return { kind: "missing", display: "Not published", message: "Snapshot not published. Package counts are unknown." };
+      }
+      if (typeof capturedAt !== "string" || !capturedAt.trim()) {
+        return { kind: "invalid", display: "Invalid timestamp", message: "Capture timestamp invalid. Counts are shown from published data." };
+      }
+      const timestamp = Date.parse(capturedAt);
+      if (!Number.isFinite(timestamp) || timestamp > Date.now()) {
+        return { kind: "invalid", display: "Invalid timestamp", message: "Capture timestamp invalid. Counts are shown from published data." };
+      }
+      const ageMs = Date.now() - timestamp;
+      const ageHours = Math.floor(ageMs / (60 * 60 * 1000));
+      const ageMinutes = Math.floor(ageMs / (60 * 1000));
+      const ageDays = Math.floor(ageHours / 24);
+      const remainingHours = ageHours % 24;
+      const quantity = (count, unit) => `${count} ${unit}${count === 1 ? "" : "s"}`;
+      const age = ageMs < 60 * 1000
+        ? "less than 1 minute old"
+        : ageMs < 60 * 60 * 1000
+          ? `${quantity(ageMinutes, "minute")} old`
+          : ageHours < 24
+            ? `${quantity(ageHours, "hour")} old`
+            : `${quantity(ageDays, "day")} ${quantity(remainingHours, "hour")} old`;
+      const date = new Date(timestamp).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+      const display = `${date} (${age})`;
+      return {
+        kind: ageMs > MAX_CAPTURE_AGE_MS ? "stale" : "fresh",
+        display,
+        iso: new Date(timestamp).toISOString(),
+        message: ageMs > MAX_CAPTURE_AGE_MS
+          ? `Stale snapshot: captured ${display}. Data age exceeds 36 hours.`
+          : `Captured ${display}. Within the 36-hour freshness window.`,
+      };
+    };
+    const setSnapshotFreshness = (capturedAt) => {
+      const details = captureDetails(capturedAt);
+      const time = document.getElementById("updated-at");
+      time.textContent = details.display;
+      if (details.iso) time.dateTime = details.iso;
+      else time.removeAttribute("datetime");
+      const flag = document.getElementById("freshness-label");
+      flag.className = `freshness-flag freshness-${details.kind}`;
+      flag.textContent = {
+        fresh: "Within 36-hour window",
+        stale: "Stale · older than 36 hours",
+        invalid: "Unknown · invalid timestamp",
+        missing: "Unknown · not published",
+      }[details.kind];
+      const message = document.getElementById("snapshot-message");
+      message.className = `summary-message freshness-${details.kind}`;
+      message.textContent = details.message;
+      return details;
+    };
+    const scanCaptureMessage = (capturedAt, available) => {
+      if (!available) return "No scan snapshot published; scan counts are unknown.";
+      const details = captureDetails(capturedAt);
+      if (details.kind === "missing") return "Scan capture time not published; counts shown from available scan data.";
+      if (details.kind === "invalid") return "Scan capture timestamp invalid; counts shown from published scan data.";
+      if (details.kind === "stale") return `Stale scan capture: ${details.display}. Data age exceeds 36 hours.`;
+      return `Scan captured ${details.display}.`;
+    };
+    const refreshCaptureDisplays = () => {
+      if (!captureState) return;
+      const details = setSnapshotFreshness(captureState.quarantineCapturedAt);
+      if (details.kind === "invalid" && captureState.snapshotAvailable) {
+        text("snapshot-message", `${details.message} Counts reflect available snapshot data.`);
+      }
+      const scanCapture = document.getElementById("scan-captured-at");
+      scanCapture.textContent = scanCaptureMessage(captureState.scanCapturedAt, captureState.scanAvailable);
+      scanCapture.className = `freshness-${captureState.scanAvailable ? captureDetails(captureState.scanCapturedAt).kind : "missing"}`;
+    };
+    const renderQuarantineRows = (packages, snapshotAvailable) => {
+      if (!snapshotAvailable) {
+        showMessage("quarantine-list", 4, "Quarantine snapshot not published; package count unknown.");
+        return;
+      }
+      if (!Array.isArray(packages)) {
+        showMessage("quarantine-list", 4, "Quarantine package count unavailable.");
+        return;
+      }
+      if (!packages.length) {
+        showMessage("quarantine-list", 4, "No packages are currently held in quarantine.");
+        return;
+      }
+      const list = document.getElementById("quarantine-list");
+      list.closest(".table-wrap")?.classList.remove("is-empty", "has-note");
+      list.replaceChildren();
+      packages.forEach((pkg) => {
+        const row = document.createElement("tr");
+        [pkg.name, pkg.version, `${safeText(pkg.age_days)} days`].forEach((value) => {
+          const cell = document.createElement("td");
+          cell.textContent = safeText(value);
+          row.appendChild(cell);
+        });
+        const status = document.createElement("td");
+        const badge = document.createElement("span");
+        badge.className = "badge";
+        badge.textContent = safeText(pkg.status);
+        status.appendChild(badge);
+        row.appendChild(status);
+        list.appendChild(row);
+      });
+    };
+    const renderIncompleteRows = (findings, truncated, snapshotAvailable) => {
+      if (!snapshotAvailable) {
+        showMessage("incomplete-list", 3, "Quarantine snapshot not published; incomplete scan count unknown.");
+        return;
+      }
+      if (!Array.isArray(findings)) {
+        showMessage("incomplete-list", 3, "Incomplete scan count unavailable.");
+        return;
+      }
+      const truncatedCount = Number.isSafeInteger(truncated) && truncated >= 0 ? truncated : null;
+      if (!findings.length) {
+        if (truncatedCount === 0) showMessage("incomplete-list", 3, "No incomplete scans were reported.");
+        else if (truncatedCount === null) showMessage("incomplete-list", 3, "Incomplete scan count unavailable.");
+        else showMessage("incomplete-list", 3, `Individual rows omitted upstream: ${truncatedCount}.`);
+        return;
+      }
+      const list = document.getElementById("incomplete-list");
+      list.closest(".table-wrap")?.classList.remove("is-empty", "has-note");
+      list.replaceChildren();
+      findings.forEach((finding) => {
+        const row = document.createElement("tr");
+        [finding.name, finding.version, finding.verdict].forEach((value) => {
+          const cell = document.createElement("td");
+          cell.textContent = safeText(value);
+          row.appendChild(cell);
+        });
+        list.appendChild(row);
+      });
+      if (truncatedCount === null || truncatedCount > 0) {
+        const row = document.createElement("tr");
+        const cell = document.createElement("td");
+        cell.colSpan = 3;
+        cell.className = "empty";
+        cell.textContent = truncatedCount === null
+          ? "Additional incomplete count unavailable."
+          : `Additional incomplete scan findings omitted: ${truncatedCount}.`;
+        row.appendChild(cell);
+        list.appendChild(row);
+        list.closest(".table-wrap")?.classList.add("has-note");
+      }
+    };
     const render = (data) => {
-      text("service-status", data.health.status === "ok" ? "Operational" : "Degraded");
-      text("service-name", data.service);
-      text("service-version", `Version ${data.version}`);
-      text("health-value", data.health.status === "ok" ? "OK" : "Degraded");
-      text("quarantine-days", data.quarantine.minimum_age_days);
-      text("quarantine-count", data.quarantine.packages.length);
-      text("footer-version", `v${data.version}`);
-      text("updated-at", new Date(data.generated_at).toLocaleTimeString());
-      const scan = data.scan && typeof data.scan === "object" ? data.scan : null;
-      text("scan-captured-at", scan ? `Captured ${scan.captured_at}` : "No scan capture published.");
-      text("scan-candidates", scan ? scan.candidate_count : "—");
-      text("scan-count", scan ? scan.scanned_count : "—");
-      text("scan-blocked-count", scan ? scan.blocked_count : "—");
-      text("scan-error-count", scan ? scan.error_count : "—");
+      const payload = data && typeof data === "object" ? data : {};
+      const health = payload.health && typeof payload.health === "object" ? payload.health : {};
+      const quarantine = payload.quarantine && typeof payload.quarantine === "object" ? payload.quarantine : {};
+      const snapshotAvailable = quarantine.captured_at !== null && quarantine.captured_at !== undefined;
+      const healthState = health.status === "ok"
+        ? "good"
+        : health.status === "unavailable" || health.status === "error"
+          ? "error"
+          : typeof health.status === "string" && health.status
+            ? "warn"
+            : "neutral";
+      const healthLabel = {
+        good: "Operational",
+        warn: "Degraded",
+        error: "Unavailable",
+        neutral: "Health unknown",
+      }[healthState];
+      setServiceStatus(healthState, healthLabel);
+      setHealthValue(healthState, healthLabel);
+      text("service-name", payload.service);
+      text("service-version", payload.version == null ? "Version unavailable" : `Version ${safeText(payload.version)}`);
+      text("quarantine-days", countText(quarantine.minimum_age_days));
+      text("quarantine-count", snapshotAvailable && Array.isArray(quarantine.packages) ? quarantine.packages.length : "Unknown");
+      text("quarantine-note", snapshotAvailable ? "Currently in quarantine." : "Snapshot not published; package count unknown.");
+      text("footer-version", payload.version == null ? "" : `v${safeText(payload.version)}`);
+      const scan = payload.scan && typeof payload.scan === "object" && !Array.isArray(payload.scan) ? payload.scan : null;
+      captureState = {
+        quarantineCapturedAt: quarantine.captured_at,
+        snapshotAvailable,
+        scanCapturedAt: scan ? scan.captured_at : null,
+        scanAvailable: Boolean(scan),
+      };
+      refreshCaptureDisplays();
+      text("scan-candidates", scan ? countText(scan.candidate_count) : "Unknown");
+      text("scan-count", scan ? countText(scan.scanned_count) : "Unknown");
+      text("scan-blocked-count", scan ? countText(scan.blocked_count) : "Unknown");
+      text("scan-error-count", scan ? countText(scan.error_count) : "Unknown");
       const scanCells = (row) => [
         row.name,
         row.version,
@@ -337,96 +652,123 @@
       ];
       renderRows(
         "scanned-list",
-        scan ? scan.scanned : [],
+        scan ? scan.scanned : null,
         9,
         "No scanned package details were published.",
         scanCells,
+        "Scan snapshot not published; scan detail count unknown.",
       );
       renderRows(
         "blocked-list",
-        scan ? scan.blocked : [],
+        scan ? scan.blocked : null,
         9,
         "No blocked packages were reported.",
         scanCells,
+        "Scan snapshot not published; blocked package count unknown.",
+      );
+      renderSummaryCategory(
+        "summary-quarantine-count",
+        "summary-quarantine-list",
+        quarantine.packages,
+        snapshotAvailable,
+        (pkg) => `${safeText(pkg.name)}@${safeText(pkg.version)} · ${safeText(pkg.age_days)}d`,
+        "No package versions in this snapshot.",
+        "Snapshot not published; package count unknown.",
+      );
+      renderSummaryCategory(
+        "summary-confirmed-count",
+        "summary-confirmed-list",
+        quarantine.confirmed,
+        snapshotAvailable,
+        (finding) => `${safeText(finding.name)}@${safeText(finding.version)} · ${finding.severity ? `${safeText(finding.severity)} · ` : ""}${safeText(finding.advisory)}`,
+        "No confirmed advisories in this snapshot.",
+        "Snapshot not published; confirmed advisory count unknown.",
+      );
+      renderSummaryCategory(
+        "summary-suspected-count",
+        "summary-suspected-list",
+        quarantine.suspected,
+        snapshotAvailable,
+        (finding) => {
+          const rules = Array.isArray(finding.rules) ? finding.rules : [];
+          const shownRules = rules.slice(0, 2).map(safeText);
+          const ruleText = shownRules.length ? ` · ${shownRules.join(", ")}` : "";
+          const omittedRules = rules.length > shownRules.length ? ` · +${rules.length - shownRules.length} rules omitted` : "";
+          return `${safeText(finding.name)}@${safeText(finding.version)} · score ${safeText(finding.score)}${ruleText}${omittedRules}`;
+        },
+        "No suspected packages in this snapshot.",
+        "Snapshot not published; suspected package count unknown.",
+      );
+      const incomplete = quarantine.scan_incomplete;
+      const truncated = countText(quarantine.scan_incomplete_truncated) === "Unknown" ? null : quarantine.scan_incomplete_truncated;
+      renderSummaryCategory(
+        "summary-incomplete-count",
+        "summary-incomplete-list",
+        incomplete,
+        snapshotAvailable,
+        (finding) => `${safeText(finding.name)}@${safeText(finding.version)} · ${safeText(finding.verdict)}`,
+        "No incomplete scans in this snapshot.",
+        "Snapshot not published; incomplete scan count unknown.",
+        truncated,
       );
       renderRows(
         "confirmed-list",
-        data.quarantine.confirmed,
+        snapshotAvailable ? quarantine.confirmed : null,
         4,
         "No confirmed OSV blocks were reported.",
         (finding) => [finding.name, finding.version, finding.advisory, finding.severity],
+        "Snapshot not published; confirmed OSV count unknown.",
       );
-      const list = document.getElementById("quarantine-list");
-      list.replaceChildren();
-      if (!data.quarantine.packages.length) {
-        const row = document.createElement("tr");
-        const cell = document.createElement("td");
-        cell.colSpan = 4;
-        cell.className = "empty";
-        cell.textContent = "No packages are currently held in quarantine.";
-        row.appendChild(cell);
-        list.appendChild(row);
+      renderQuarantineRows(quarantine.packages, snapshotAvailable);
+      renderIncompleteRows(incomplete, quarantine.scan_incomplete_truncated, snapshotAvailable);
+      if (freshnessTimer === null) freshnessTimer = window.setInterval(refreshCaptureDisplays, 60_000);
+    };
+    const renderUnavailable = () => {
+      if (freshnessTimer !== null) {
+        window.clearInterval(freshnessTimer);
+        freshnessTimer = null;
       }
-      data.quarantine.packages.forEach((pkg) => {
-        const row = document.createElement("tr");
-        [pkg.name, pkg.version, `${pkg.age_days} days`].forEach((value) => {
-          const cell = document.createElement("td");
-          cell.textContent = value;
-          row.appendChild(cell);
-        });
-        const status = document.createElement("td");
-        const badge = document.createElement("span");
-        badge.className = "badge";
-        badge.textContent = pkg.status;
-        status.appendChild(badge);
-        row.appendChild(status);
-        list.appendChild(row);
-      });
-      const incompleteList = document.getElementById("incomplete-list");
-      incompleteList.replaceChildren();
-      const incomplete = data.quarantine.scan_incomplete || [];
-      if (!incomplete.length) {
-        const row = document.createElement("tr");
-        const cell = document.createElement("td");
-        cell.colSpan = 3;
-        cell.className = "empty";
-        cell.textContent = "No incomplete scans were reported.";
-        row.appendChild(cell);
-        incompleteList.appendChild(row);
-      } else {
-        incomplete.forEach((finding) => {
-          const row = document.createElement("tr");
-          [finding.name, finding.version, "Scan incomplete"].forEach((value) => {
-            const cell = document.createElement("td");
-            cell.textContent = value;
-            row.appendChild(cell);
-          });
-          incompleteList.appendChild(row);
-        });
-      }
-      const incompleteTruncated = data.quarantine.scan_incomplete_truncated || 0;
-      if (incompleteTruncated > 0) {
-        const row = document.createElement("tr");
-        const cell = document.createElement("td");
-        cell.colSpan = 3;
-        cell.className = "empty";
-        cell.textContent = `Additional incomplete scan findings omitted: ${incompleteTruncated}.`;
-        row.appendChild(cell);
-        incompleteList.appendChild(row);
-      }
+      captureState = null;
+      setServiceStatus("error", "Unavailable");
+      setHealthValue("error", "Unavailable");
+      text("service-name", "Unavailable");
+      text("service-version", "Version unavailable");
+      text("quarantine-days", "Unknown");
+      text("quarantine-count", "Unknown");
+      text("quarantine-note", "Status request unavailable.");
+      text("footer-version", "");
+      const time = document.getElementById("updated-at");
+      time.textContent = "Unavailable";
+      time.removeAttribute("datetime");
+      const freshness = document.getElementById("freshness-label");
+      freshness.className = "freshness-flag freshness-error";
+      freshness.textContent = "Unavailable";
+      const message = document.getElementById("snapshot-message");
+      message.className = "summary-message freshness-error";
+      message.textContent = "Status request failed. Snapshot and package counts are unavailable.";
+      text("scan-captured-at", "Status request unavailable.");
+      document.getElementById("scan-captured-at").className = "freshness-error";
+      text("scan-candidates", "Unknown");
+      text("scan-count", "Unknown");
+      text("scan-blocked-count", "Unknown");
+      text("scan-error-count", "Unknown");
+      renderSummaryCategory("summary-quarantine-count", "summary-quarantine-list", null, false, () => "", "", "Status request unavailable; count unknown.");
+      renderSummaryCategory("summary-confirmed-count", "summary-confirmed-list", null, false, () => "", "", "Status request unavailable; count unknown.");
+      renderSummaryCategory("summary-suspected-count", "summary-suspected-list", null, false, () => "", "", "Status request unavailable; count unknown.");
+      renderSummaryCategory("summary-incomplete-count", "summary-incomplete-list", null, false, () => "", "", "Status request unavailable; count unknown.");
+      showMessage("quarantine-list", 4, "Status request failed; quarantine details are unavailable.");
+      showMessage("scanned-list", 9, "Status request failed; scan details are unavailable.");
+      showMessage("blocked-list", 9, "Status request failed; block details are unavailable.");
+      showMessage("confirmed-list", 4, "Status request failed; advisory details are unavailable.");
+      showMessage("incomplete-list", 3, "Status request failed; incomplete scan details are unavailable.");
     };
     fetch("/api/v1/status", { headers: { Accept: "application/json" } })
-      .then((response) => response.ok ? response.json() : Promise.reject(new Error("status unavailable")))
+      .then((response) => {
+        if (!response.ok) throw new Error("status unavailable");
+        return response.json();
+      })
       .then(render)
-      .catch(() => {
-        text("service-status", "Unavailable");
-        text("health-value", "Error");
-        showMessage("quarantine-list", 4, "Diagnostics are temporarily unavailable.");
-        showMessage("scanned-list", 9, "Scan details are temporarily unavailable.");
-        showMessage("blocked-list", 9, "Scan-derived block details are temporarily unavailable.");
-        showMessage("confirmed-list", 4, "Confirmed OSV details are temporarily unavailable.");
-        showMessage("incomplete-list", 3, "Incomplete scan details are temporarily unavailable.");
-      });
+      .catch(renderUnavailable);
   </script>
 </body>
 </html>

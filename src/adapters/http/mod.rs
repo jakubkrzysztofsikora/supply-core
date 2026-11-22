@@ -322,11 +322,24 @@ const CARD_MAX_ROWS: usize = 8;
 const MAX_INCOMPLETE_FINDINGS: usize = 1_000;
 
 fn xml_escape(raw: &str) -> String {
-    raw.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+    let mut escaped = String::with_capacity(raw.len());
+    for character in raw.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            '\t'
+            | '\n'
+            | '\r'
+            | '\u{20}'..='\u{d7ff}'
+            | '\u{e000}'..='\u{fffd}'
+            | '\u{10000}'..='\u{10ffff}' => escaped.push(character),
+            _ => escaped.push('\u{fffd}'),
+        }
+    }
+    escaped
 }
 
 fn card_section<T>(items: &[T], format_row: impl Fn(&T) -> String) -> (Vec<String>, usize) {
@@ -336,6 +349,83 @@ fn card_section<T>(items: &[T], format_row: impl Fn(&T) -> String) -> (Vec<Strin
         lines.push("(none captured yet)".to_string());
     }
     (lines, hidden)
+}
+
+const CARD_WIDTH: usize = 900;
+const CARD_MARGIN: usize = 24;
+const CARD_GUTTER: usize = 24;
+const CARD_COLUMN_WIDTH: usize = (CARD_WIDTH - CARD_MARGIN * 2 - CARD_GUTTER) / 2;
+const CARD_WRAP_UNITS: usize = 48;
+const CARD_LINE_HEIGHT: usize = 17;
+const CARD_ROW_GAP: usize = 4;
+const CARD_CONTENT_OFFSET: usize = 26;
+const CARD_SECTION_GAP: usize = 18;
+
+fn for_each_card_line(line: &str, mut render: impl FnMut(&str)) -> usize {
+    let mut remaining = line;
+    let mut count = 0;
+
+    if remaining.is_empty() {
+        render(remaining);
+        return 1;
+    }
+
+    while !remaining.is_empty() {
+        let mut units = 0;
+        let mut hard_end = remaining.len();
+        let mut last_space = None;
+
+        for (index, character) in remaining.char_indices() {
+            let width = if character.is_ascii() { 1 } else { 2 };
+            if units + width > CARD_WRAP_UNITS {
+                hard_end = index;
+                break;
+            }
+            units += width;
+            if character.is_whitespace() {
+                last_space = Some((index, character.len_utf8()));
+            }
+        }
+
+        if hard_end == remaining.len() {
+            render(remaining);
+            count += 1;
+            break;
+        }
+
+        let (end, next) = match last_space.filter(|(index, _)| *index > 0) {
+            Some((index, length)) => {
+                let mut next = index + length;
+                while let Some(character) = remaining[next..]
+                    .chars()
+                    .next()
+                    .filter(|c| c.is_whitespace())
+                {
+                    next += character.len_utf8();
+                }
+                (index, next)
+            }
+            None => (hard_end, hard_end),
+        };
+        render(&remaining[..end]);
+        count += 1;
+        remaining = &remaining[next..];
+    }
+
+    count
+}
+
+fn card_wrapped_line_count(line: &str) -> usize {
+    for_each_card_line(line, |_| {})
+}
+
+fn card_section_advance(lines: &[String], hidden: usize) -> usize {
+    let rows_height: usize = lines
+        .iter()
+        .map(|line| card_wrapped_line_count(line) * CARD_LINE_HEIGHT + CARD_ROW_GAP)
+        .sum();
+    let hidden_height = usize::from(hidden > 0) * (CARD_LINE_HEIGHT + CARD_ROW_GAP);
+    CARD_CONTENT_OFFSET + rows_height + hidden_height + CARD_SECTION_GAP
 }
 
 /// Dynamic SVG listing quarantined, confirmed, suspected and incomplete scans.
@@ -430,63 +520,69 @@ fn render_status_card(snapshot: Option<&QuarantineSnapshot>) -> String {
             incomplete_total,
         ),
     ];
-    let rows = sections
-        .iter()
-        .map(|(_, _, lines, hidden, _)| lines.len() + usize::from(*hidden > 0))
-        .max()
-        .unwrap_or(1);
-    let height = 130 + rows * 22 + 20;
+    let top_row_advance = card_section_advance(sections[0].2, sections[0].3)
+        .max(card_section_advance(sections[1].2, sections[1].3));
+    let bottom_row_advance = card_section_advance(sections[2].2, sections[2].3)
+        .max(card_section_advance(sections[3].2, sections[3].3));
+    let height = 78 + top_row_advance + bottom_row_advance + 24;
 
     let mut svg = String::new();
     svg.push_str(&format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"900\" height=\"{height}\" viewBox=\"0 0 900 {height}\" role=\"img\" aria-label=\"supply-core package status\">"
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{CARD_WIDTH}\" height=\"{height}\" viewBox=\"0 0 {CARD_WIDTH} {height}\" role=\"img\" aria-label=\"supply-core package status\">"
     ));
     svg.push_str(&format!(
-        "<rect width=\"900\" height=\"{height}\" rx=\"14\" fill=\"#0d1117\"/>"
+        "<rect width=\"{CARD_WIDTH}\" height=\"{height}\" rx=\"14\" fill=\"#0d1117\"/>"
     ));
     svg.push_str(&format!(
-        "<text x=\"24\" y=\"40\" fill=\"#f0f6fc\" font-family=\"{CARD_FONT}\" font-size=\"19\" font-weight=\"700\">supply-core · package status</text>"
+        "<text x=\"{CARD_MARGIN}\" y=\"40\" fill=\"#f0f6fc\" font-family=\"{CARD_FONT}\" font-size=\"19\" font-weight=\"700\">supply-core · package status</text>"
     ));
     svg.push_str(&format!(
-        "<text x=\"876\" y=\"40\" text-anchor=\"end\" fill=\"#8b949e\" font-family=\"{CARD_FONT}\" font-size=\"12\">{}</text>",
+        "<text x=\"{}\" y=\"40\" text-anchor=\"end\" fill=\"#8b949e\" font-family=\"{CARD_FONT}\" font-size=\"12\">{}</text>",
+        CARD_WIDTH - CARD_MARGIN,
         xml_escape(captured_at)
     ));
-    svg.push_str("<defs>");
-    for index in 0..sections.len() {
-        let x = 24 + index * 219;
-        let width = if index + 1 == sections.len() {
-            876 - x
-        } else {
-            207
-        };
-        svg.push_str(&format!(
-            "<clipPath id=\"status-column-{index}\" clipPathUnits=\"userSpaceOnUse\"><rect x=\"{x}\" y=\"88\" width=\"{width}\" height=\"{}\"/></clipPath>",
-            height - 88
-        ));
-    }
-    svg.push_str("</defs>");
 
     for (index, (color, title, lines, hidden, total)) in sections.iter().enumerate() {
-        let x = 24 + index * 219;
-        svg.push_str(&format!(
-            "<text x=\"{x}\" y=\"78\" fill=\"{color}\" font-family=\"{CARD_FONT}\" font-size=\"13\" font-weight=\"700\">{title} ({total})</text>"
-        ));
-        let mut row = 0usize;
+        let column = index % 2;
+        let section_row = index / 2;
+        let x = CARD_MARGIN + column * (CARD_COLUMN_WIDTH + CARD_GUTTER);
+        let section_y = 78 + usize::from(section_row > 0) * top_row_advance;
+        if snapshot.is_some() {
+            svg.push_str(&format!(
+                "<text x=\"{x}\" y=\"{section_y}\" fill=\"{color}\" font-family=\"{CARD_FONT}\" font-size=\"13\" font-weight=\"700\">{title} ({total})</text>"
+            ));
+        } else {
+            svg.push_str(&format!(
+                "<text x=\"{x}\" y=\"{section_y}\" fill=\"{color}\" font-family=\"{CARD_FONT}\" font-size=\"13\" font-weight=\"700\">{title} (unknown)</text>"
+            ));
+        }
+
+        let mut y = section_y + CARD_CONTENT_OFFSET;
         for line in lines.iter() {
-            let y = 104 + row * 22;
-            let escaped = xml_escape(line);
             let aria_label = if line == "(none captured yet)" {
                 String::new()
             } else {
-                format!(" aria-label=\"{escaped}\"")
+                format!(" aria-label=\"{}\"", xml_escape(line))
             };
             svg.push_str(&format!(
-                "<text x=\"{x}\" y=\"{y}\" clip-path=\"url(#status-column-{index})\"{aria_label} fill=\"#c9d1d9\" font-family=\"{CARD_FONT}\" font-size=\"13\">{escaped}</text>"
+                "<text x=\"{x}\" y=\"{y}\"{aria_label} fill=\"#c9d1d9\" font-family=\"{CARD_FONT}\" font-size=\"13\">"
             ));
-            row += 1;
+            let mut first = true;
+            let wrapped_lines = for_each_card_line(line, |part| {
+                let escaped = xml_escape(part);
+                if first {
+                    svg.push_str(&format!("<tspan>{escaped}</tspan>"));
+                    first = false;
+                } else {
+                    svg.push_str(&format!(
+                        "<tspan x=\"{x}\" dy=\"{CARD_LINE_HEIGHT}\">{escaped}</tspan>"
+                    ));
+                }
+            });
+            svg.push_str("</text>");
+            y += wrapped_lines * CARD_LINE_HEIGHT + CARD_ROW_GAP;
         }
         if *hidden > 0 {
-            let y = 104 + row * 22;
             svg.push_str(&format!(
                 "<text x=\"{x}\" y=\"{y}\" fill=\"#8b949e\" font-family=\"{CARD_FONT}\" font-size=\"13\">+{hidden} more</text>"
             ));
@@ -1121,6 +1217,49 @@ mod tests {
     }
 
     #[test]
+    fn card_replaces_invalid_xml_characters() {
+        let invalid = [
+            '\0', '\u{1}', '\u{8}', '\u{b}', '\u{c}', '\u{e}', '\u{1f}', '\u{fffe}', '\u{ffff}',
+        ];
+        let name = format!(
+            "left{}right<&>é🦀\t\n\r\u{7f}\u{85}",
+            invalid.iter().collect::<String>()
+        );
+        let snapshot: QuarantineSnapshot = serde_json::from_value(json!({
+            "captured_at": "2026-11-22T00:00:00Z",
+            "packages": [{"name": name, "version": "1.0.0", "age_days": 0, "status": "Block"}]
+        }))
+        .unwrap_or_else(|_| panic!("valid snapshot"));
+        assert!(validate_quarantine_snapshot(&snapshot).is_ok());
+
+        let svg = render_status_card(Some(&snapshot));
+        for character in invalid {
+            assert!(
+                !svg.contains(character),
+                "invalid XML character {character:?}"
+            );
+        }
+        assert!(svg.contains("right&lt;&amp;&gt;é🦀\t\n\r\u{7f}\u{85}"));
+
+        let mut reader = quick_xml::Reader::from_str(&svg);
+        reader.config_mut().enable_all_checks(true);
+        let mut saw_root = false;
+        loop {
+            match reader
+                .read_event()
+                .unwrap_or_else(|err| panic!("invalid SVG: {err}"))
+            {
+                quick_xml::events::Event::Start(element) if element.name().as_ref() == "svg" => {
+                    saw_root = true;
+                }
+                quick_xml::events::Event::Eof => break,
+                _ => {}
+            }
+        }
+        assert!(saw_root, "SVG root missing");
+    }
+
+    #[test]
     fn card_reports_incomplete_snapshot_truncation() {
         let snapshot: QuarantineSnapshot = serde_json::from_value(json!({
             "captured_at": "2026-11-14T00:00:00Z",
@@ -1139,31 +1278,35 @@ mod tests {
     }
 
     #[test]
-    fn card_clips_long_rows_and_exposes_full_text() {
-        let snapshot: QuarantineSnapshot = serde_json::from_value(json!({
-            "captured_at": "2026-11-14T00:00:00Z",
-            "packages": [{
-                "name": "@typescript-eslint/eslint-plugin",
-                "version": "1.0.0",
-                "age_days": 0,
-                "status": "Block"
-            }]
-        }))
-        .unwrap_or_else(|_| panic!("valid status snapshot"));
-        let svg = render_status_card(Some(&snapshot));
-
-        assert!(svg.contains("clip-path=\"url(#status-column-0)\""), "{svg}");
-        assert!(
-            svg.contains("aria-label=\"@typescript-eslint/eslint-plugin@1.0.0 · 0d\""),
-            "{svg}"
-        );
-    }
-
-    #[test]
     fn card_empty_state_is_explicit() {
         let svg = render_status_card(None);
         assert_eq!(svg.matches("(none captured yet)").count(), 4);
         assert!(svg.contains("no snapshot yet"));
+    }
+
+    #[test]
+    fn card_distinguishes_missing_and_empty_snapshots() {
+        let snapshot = QuarantineSnapshot {
+            captured_at: "2026-11-22T00:00:00Z".into(),
+            packages: Vec::new(),
+            confirmed: Vec::new(),
+            suspected: Vec::new(),
+            scan_incomplete: Vec::new(),
+            scan_incomplete_truncated: 0,
+            scan: None,
+        };
+        let missing = render_status_card(None);
+        let empty = render_status_card(Some(&snapshot));
+
+        for title in [
+            "QUARANTINED",
+            "CONFIRMED CVE",
+            "SUSPECTED (SCAN)",
+            "SCAN INCOMPLETE",
+        ] {
+            assert!(missing.contains(&format!("{title} (unknown)")), "{missing}");
+            assert!(empty.contains(&format!("{title} (0)")), "{empty}");
+        }
     }
 
     #[tokio::test]

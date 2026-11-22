@@ -310,9 +310,10 @@ Guardrails before any automated submission:
     `PUT /api/v1/status/quarantine` (bearer token, size- and shape-validated)
     and serves `GET /api/v1/status` (JSON) and
     `GET /api/v1/status/card.svg` (dynamic SVG with four lists,
-    `Cache-Control: public, max-age=300`). Long card rows clip within their
-    columns and retain full text in accessible labels. Only name/version-level
-    facts are published: no repository paths, ranges, or file contents.
+    `Cache-Control: public, max-age=300`). Long card rows wrap within their
+    columns and retain valid text in accessible labels. XML-invalid characters
+    appear as replacement characters. Only name/version-level facts are
+    published: no repository paths, ranges, or file contents.
     Older snapshots remain valid; missing fields default to empty lists and
     zero omitted rows.
 

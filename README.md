@@ -316,6 +316,7 @@ server over the compose network. Captures land in `radar/data/`. Without the
   ```
 
   Each dashboard response shows the latest successful published capture, not a registry-wide real-time feed.
+  The dashboard marks captures older than 36 hours as stale and reports missing snapshot counts as unknown. Capture ages update once per minute while the page remains open. Service health and snapshot freshness are shown separately.
 
   `PUT /api/v1/status/quarantine` requires `Authorization: Bearer <SUPPLY_AUTH_TOKEN>` and accepts a JSON snapshot. `captured_at` must be RFC 3339; `packages` is required. `confirmed`, `suspected`, `scan_incomplete`, and `scan_incomplete_truncated` default to empty arrays or zero. The new `scan` object is optional, so older uploads remain valid. The publisher sends `scan.captured_at`, `candidate_count`, sanitized `scanned` rows, and `error_count` only. A valid upload returns `204 No Content`; invalid data returns `400`, invalid credentials return `401`, and missing auth or storage configuration returns `503`:
 
