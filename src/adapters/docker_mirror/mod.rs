@@ -162,6 +162,29 @@ impl Mirror {
         let manifest = upstream.manifest(reference).await?;
         let hash = manifest.digest.clone();
         let now = Utc::now();
+        let mut worker_guard = if !store
+            .has_image(&repo, &hash)
+            .map_err(MirrorError::internal)?
+        {
+            match Arc::clone(&self.worker).try_lock_owned() {
+                Ok(guard) => Some(guard),
+                Err(_) => {
+                    if let Some(tag) = tag {
+                        store
+                            .update_tag(&repo, tag, &hash)
+                            .map_err(MirrorError::internal)?;
+                    }
+                    return if is_version_quarantined(Some(now), now, &self.config.policy.quarantine)
+                    {
+                        Err(MirrorError::Quarantined)
+                    } else {
+                        Err(MirrorError::Busy)
+                    };
+                }
+            }
+        } else {
+            None
+        };
         let first_seen = store
             .observe(&repo, &hash, tag, now)
             .map_err(MirrorError::internal)?;
@@ -175,15 +198,28 @@ impl Mirror {
             return Err(MirrorError::Vulnerable);
         }
         if previous.is_none() {
-            match Arc::clone(&self.worker).try_lock_owned() {
-                Ok(guard) => {
+            let guard = worker_guard
+                .take()
+                .or_else(|| Arc::clone(&self.worker).try_lock_owned().ok());
+            match guard {
+                Some(guard) => {
                     let mirror = Arc::clone(&self);
-                    let repo = repo.clone();
+                    let scan_repo = repo.clone();
+                    let scan_hash = hash.clone();
                     // Once a scan starts, let it finish even if the client
                     // disconnects. Young pulls receive their denial immediately.
                     let worker = tokio::spawn(async move {
                         let _guard = guard;
-                        let result = mirror.prepare(&repo, &upstream, manifest).await;
+                        let result = mirror.prepare(&scan_repo, &upstream, manifest).await;
+                        if result.is_err() {
+                            if let Err(error) = mirror.store().await.and_then(|store| {
+                                store
+                                    .discard_pending(&scan_repo, &scan_hash)
+                                    .map_err(MirrorError::internal)
+                            }) {
+                                error.log();
+                            }
+                        }
                         if quarantined {
                             if let Err(error) = &result {
                                 error.log();
@@ -197,8 +233,8 @@ impl Mirror {
                         return Err(MirrorError::Vulnerable);
                     }
                 }
-                Err(_) if !quarantined => return Err(MirrorError::Busy),
-                Err(_) => {}
+                None if !quarantined => return Err(MirrorError::Busy),
+                None => {}
             }
         }
         if quarantined {
