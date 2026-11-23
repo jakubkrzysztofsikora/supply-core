@@ -20,10 +20,10 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - run: cargo fmt --all --check
-      # The 3 command_scanner sandbox tests need bubblewrap user namespaces,
-      # which this host's LXC forbids inside any container. They run in the
-      # hosted-suite job when billing is restored.
-      - run: cargo test --locked -- --skip guarddog_report_is_complete --skip invalid_json_report_is_partial --skip clean_command_reports_no_findings
+      # command_scanner sandbox tests plus the external-scanner CLI test need
+      # bubblewrap user namespaces, which this host's LXC forbids inside any
+      # container. They run in the hosted-suite job when billing is restored.
+      - run: cargo test --locked -- --skip guarddog_report_is_complete --skip invalid_json_report_is_partial --skip clean_command_reports_no_findings --skip package_scan_records_external_scanner_finding
       - run: python3 -m unittest discover -s experiments -p 'test_*.py'
       - run: cargo clippy --locked --all-targets -- -D warnings
   hosted-suite:
@@ -50,7 +50,7 @@ jobs:
           toolchain: stable
           components: llvm-tools-preview
       - run: cargo install cargo-llvm-cov --version 0.9.1 --locked
-      - run: cargo llvm-cov --locked --fail-under-lines 85 --summary-only -- --skip guarddog_report_is_complete --skip invalid_json_report_is_partial --skip clean_command_reports_no_findings
+      - run: cargo llvm-cov --locked --fail-under-lines 85 --summary-only -- --skip guarddog_report_is_complete --skip invalid_json_report_is_partial --skip clean_command_reports_no_findings --skip package_scan_records_external_scanner_finding
   registry-e2e:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: [self-hosted, supply-core-linux]
