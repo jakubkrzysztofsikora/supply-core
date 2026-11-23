@@ -17,16 +17,17 @@ permissions:
 jobs:
   build-binaries:
     name: Build Binary (${{ matrix.name }})
-    runs-on: ${{ matrix.os }}
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork != true
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
+            runner: [self-hosted, supply-core-linux]
             name: supply-core-linux-x86_64
           - target: aarch64-apple-darwin
-            os: macos-latest
+            runner: [self-hosted, supply-core-mac]
             name: supply-core-darwin-arm64
 
     steps:
@@ -34,8 +35,13 @@ jobs:
         uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
 
       - name: Install musl tools (Linux)
-        if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          if command -v musl-gcc >/dev/null 2>&1; then
+            echo "musl tools already present"
+          else
+            sudo apt-get update && sudo apt-get install -y musl-tools
+          fi
 
       - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
@@ -68,8 +74,9 @@ jobs:
 
   publish-release:
     name: Publish GitHub Release
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork != true
     needs: [build-binaries]
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, supply-core-linux]
     steps:
       - name: Checkout repository
         uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
@@ -95,7 +102,8 @@ jobs:
 
   publish-docker:
     name: Build & Push Container Image
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork != true
+    runs-on: [self-hosted, supply-core-linux]
     steps:
       - name: Checkout repository
         uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
