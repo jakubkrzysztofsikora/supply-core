@@ -10,7 +10,9 @@ permissions:
   contents: read
 jobs:
   test:
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork != true
+    runs-on: [self-hosted, supply-core-linux]
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
@@ -23,8 +25,9 @@ jobs:
       - run: python3 -m unittest discover -s experiments -p 'test_*.py'
       - run: cargo clippy --locked --all-targets -- -D warnings
   coverage:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork != true
+    runs-on: [self-hosted, supply-core-linux]
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
@@ -35,8 +38,8 @@ jobs:
       - run: cargo llvm-cov --locked --fail-under-lines 85 --summary-only
   registry-e2e:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    runs-on: [self-hosted, supply-core-linux]
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
