@@ -147,6 +147,9 @@ scanners. Build YaraHunter at commit
 require Linux. The Linux sandbox mounts its private scratch directory over
 `/tmp`, so install scanner binaries outside `/tmp`.
 
+CAPA shares a 300-second budget across its version probe and executable scans.
+It reports incomplete coverage when that budget expires.
+
 Trivy preserves native vulnerability severity and applies the configured
 `vulnerabilities.block_severities` threshold, including more severe findings.
 For CI, scan committed lockfiles without snapshotting to current registry state:

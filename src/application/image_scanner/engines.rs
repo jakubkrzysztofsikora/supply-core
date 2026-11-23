@@ -19,7 +19,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
 const SCANNER_TIMEOUT: Duration = Duration::from_secs(300);
@@ -324,61 +324,46 @@ pub(super) fn capa_report(
         let binary = required_path("CAPA_BIN")?;
         let rules = required_path("CAPA_RULES_DIR")?;
         let rules_sha256 = hash_tree(&rules)?;
-        let version = tool_version(&binary, staged.engine_scratch_root())?;
-        let mut findings = Vec::new();
-        let mut processed = 0u64;
-        let mut incomplete_reason = None;
-        for (layer_index, (root, inventory)) in image
+        let deadline = Instant::now() + SCANNER_TIMEOUT;
+        let version = tool_version_with_timeout(
+            &binary,
+            staged.engine_scratch_root(),
+            deadline.saturating_duration_since(Instant::now()),
+        )?;
+        let members = image
             .layer_roots
             .iter()
             .zip(image.layer_inventories.values())
             .enumerate()
-        {
-            for member in inventory
-                .members
-                .iter()
-                .filter(|member| member.kind == MemberKind::File && member.binary)
-            {
-                let path = root.join(&member.path);
-                let target = format!("/scan/binary/{layer_index:04}/{}", member.path);
+            .flat_map(|(layer_index, (root, inventory))| {
+                inventory
+                    .members
+                    .iter()
+                    .filter(|member| member.kind == MemberKind::File && member.binary)
+                    .map(move |member| {
+                        let location = format!("{layer_index:04}/{}", member.path);
+                        (
+                            root.join(&member.path),
+                            format!("/scan/binary/{location}"),
+                            location,
+                        )
+                    })
+            });
+        let (findings, processed, incomplete_reason) =
+            scan_capa_members(members, deadline, |path, target, timeout| {
                 let args = args(["-j", "-r", "/scan/capa-rules"])
                     .into_iter()
-                    .chain([OsString::from(target.as_str())])
+                    .chain([OsString::from(target)])
                     .collect::<Vec<_>>();
-                let output = run_tool(
+                run_tool_with_timeout(
                     &binary,
                     &args,
-                    &[mount(&path, &target), mount(&rules, "/scan/capa-rules")],
+                    &[mount(path, target), mount(&rules, "/scan/capa-rules")],
                     staged.engine_scratch_root(),
                     &[],
-                );
-                let output = match output {
-                    Ok(output) => output,
-                    Err(_) => {
-                        incomplete_reason.get_or_insert("scanner_execution_failed");
-                        continue;
-                    }
-                };
-                let parsed = match parse_capa(
-                    &output.stdout,
-                    &format!("{layer_index:04}/{}", member.path),
-                ) {
-                    Ok(findings) => findings,
-                    Err(_) => {
-                        incomplete_reason.get_or_insert("scanner_report_invalid");
-                        continue;
-                    }
-                };
-                findings.extend(parsed);
-                if output.complete && output.status.success() {
-                    processed += 1;
-                } else if !output.complete {
-                    incomplete_reason.get_or_insert("scanner_output_truncated");
-                } else {
-                    incomplete_reason.get_or_insert("scanner_exit_nonzero");
-                }
-            }
-        }
+                    timeout,
+                )
+            });
         ensure!(
             processed <= expected,
             "capa processed input count exceeds inventory"
@@ -408,6 +393,46 @@ pub(super) fn capa_report(
         Ok(report) => report,
         Err(error) => failed_engine_report("capa", input_sha256, expected, failure_code(&error)),
     }
+}
+
+fn scan_capa_members(
+    members: impl IntoIterator<Item = (PathBuf, String, String)>,
+    deadline: Instant,
+    mut run: impl FnMut(&Path, &str, Duration) -> Result<BoundedCommandOutput>,
+) -> (Vec<EngineFinding>, u64, Option<&'static str>) {
+    let mut findings = Vec::new();
+    let mut processed = 0;
+    let mut incomplete_reason = None;
+    for (path, target, location) in members {
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        if timeout.is_zero() {
+            incomplete_reason.get_or_insert("scanner_execution_failed");
+            break;
+        }
+        let output = match run(&path, &target, timeout) {
+            Ok(output) => output,
+            Err(_) => {
+                incomplete_reason.get_or_insert("scanner_execution_failed");
+                continue;
+            }
+        };
+        let parsed = match parse_capa(&output.stdout, &location) {
+            Ok(findings) => findings,
+            Err(_) => {
+                incomplete_reason.get_or_insert("scanner_report_invalid");
+                continue;
+            }
+        };
+        findings.extend(parsed);
+        if output.complete && output.status.success() {
+            processed += 1;
+        } else if !output.complete {
+            incomplete_reason.get_or_insert("scanner_output_truncated");
+        } else {
+            incomplete_reason.get_or_insert("scanner_exit_nonzero");
+        }
+    }
+    (findings, processed, incomplete_reason)
 }
 
 #[derive(Deserialize)]
@@ -985,8 +1010,21 @@ fn tool_version(binary: &Path, scratch: &Path) -> Result<String> {
     tool_version_with_args(binary, scratch, &[OsString::from("--version")])
 }
 
+fn tool_version_with_timeout(binary: &Path, scratch: &Path, timeout: Duration) -> Result<String> {
+    tool_version_with_args_timeout(binary, scratch, &[OsString::from("--version")], timeout)
+}
+
 fn tool_version_with_args(binary: &Path, scratch: &Path, arguments: &[OsString]) -> Result<String> {
-    let output = run_tool(binary, arguments, &[], scratch, &[])?;
+    tool_version_with_args_timeout(binary, scratch, arguments, SCANNER_TIMEOUT)
+}
+
+fn tool_version_with_args_timeout(
+    binary: &Path,
+    scratch: &Path,
+    arguments: &[OsString],
+    timeout: Duration,
+) -> Result<String> {
+    let output = run_tool_with_timeout(binary, arguments, &[], scratch, &[], timeout)?;
     ensure!(
         output.complete && output.status.success(),
         "scanner version command failed"
@@ -1011,13 +1049,31 @@ fn run_tool(
     scratch: &Path,
     environment: &[(OsString, OsString)],
 ) -> Result<BoundedCommandOutput> {
-    run_isolated_tool_with_env(
+    run_tool_with_timeout(
         binary,
         arguments,
         mounts,
         scratch,
         environment,
         SCANNER_TIMEOUT,
+    )
+}
+
+fn run_tool_with_timeout(
+    binary: &Path,
+    arguments: &[OsString],
+    mounts: &[SandboxMount],
+    scratch: &Path,
+    environment: &[(OsString, OsString)],
+    timeout: Duration,
+) -> Result<BoundedCommandOutput> {
+    run_isolated_tool_with_env(
+        binary,
+        arguments,
+        mounts,
+        scratch,
+        environment,
+        timeout,
         OUTPUT_LIMIT,
     )
 }
@@ -1335,5 +1391,47 @@ mod tests {
     #[test]
     fn scanner_paths_outside_layer_root_are_rejected() {
         assert!(relative_scanner_path(Path::new("/scan/layers"), "/tmp/other/file").is_err());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn capa_members_share_one_deadline() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let members = [
+            (
+                PathBuf::from("first"),
+                "/scan/binary/0000/first".to_string(),
+                "0000/first".to_string(),
+            ),
+            (
+                PathBuf::from("second"),
+                "/scan/binary/0000/second".to_string(),
+                "0000/second".to_string(),
+            ),
+        ];
+        let budget = Duration::from_millis(10);
+        let mut calls = 0;
+        let (findings, processed, reason) =
+            scan_capa_members(members, Instant::now() + budget, |_, _, timeout| {
+                calls += 1;
+                assert!(timeout <= budget);
+                std::thread::sleep(Duration::from_millis(30));
+                let stdout = if calls == 1 {
+                    br#"{"rules":{}}"#.to_vec()
+                } else {
+                    br#"{"rules":{"late-call":{}}}"#.to_vec()
+                };
+                Ok(BoundedCommandOutput {
+                    status: std::process::ExitStatus::from_raw(0),
+                    stdout,
+                    stderr: Vec::new(),
+                    complete: true,
+                })
+            });
+
+        assert_eq!(calls, 1);
+        assert_eq!(processed, 1);
+        assert_eq!(reason, Some("scanner_execution_failed"));
+        assert!(findings.is_empty());
     }
 }
