@@ -134,13 +134,6 @@ impl Store {
             |row| row.get(0),
         )?)
     }
-    pub fn update_tag(&self, repo: &str, tag: &str, digest: &str) -> anyhow::Result<()> {
-        self.db()?.execute(
-            "UPDATE tags SET digest=?3 WHERE repository=?1 AND tag=?2",
-            params![repo, tag, digest],
-        )?;
-        Ok(())
-    }
     pub fn discard_pending(&self, repo: &str, digest: &str) -> anyhow::Result<()> {
         let mut db = self.db()?;
         let tx = db.transaction()?;

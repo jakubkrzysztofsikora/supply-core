@@ -169,11 +169,6 @@ impl Mirror {
             match Arc::clone(&self.worker).try_lock_owned() {
                 Ok(guard) => Some(guard),
                 Err(_) => {
-                    if let Some(tag) = tag {
-                        store
-                            .update_tag(&repo, tag, &hash)
-                            .map_err(MirrorError::internal)?;
-                    }
                     return if is_version_quarantined(Some(now), now, &self.config.policy.quarantine)
                     {
                         Err(MirrorError::Quarantined)

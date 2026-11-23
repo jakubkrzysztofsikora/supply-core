@@ -455,8 +455,10 @@ capacity, it prunes the oldest candidate; without one, new digests fail closed.
 Reobserving a pruned digest starts a new quarantine window. Failed scans remove
 new pending metadata, so retries start a new window. Failed evicted-image
 rescans preserve first-seen time and remain held until a successful rescan.
-The mirror keeps up to 8192 tag aliases. At capacity, it skips new aliases without failing pulls;
-`/tags/list` can omit those aliases until space opens. Existing aliases update.
+The mirror keeps up to 8192 tag aliases. At capacity, it skips new aliases
+without failing pulls. `/tags/list` can omit those aliases until space opens.
+Existing aliases update when a new digest is admitted for scanning. A new digest
+rejected because another scan is busy leaves existing aliases unchanged.
 
 | Setting | Default and behavior |
 | --- | --- |

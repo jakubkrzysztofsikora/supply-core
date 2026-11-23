@@ -584,10 +584,13 @@ async fn docker_engine_cannot_pull_until_release() -> anyhow::Result<()> {
         .output()
         .await?;
     let error = String::from_utf8_lossy(&held.stderr);
-    assert!(!held.status.success(), "{error}");
+    assert!(
+        !held.status.success() && error.contains("quarantine window"),
+        "{error}"
+    );
     finish_background(&mirror).await;
     assert_eq!(scans.load(Ordering::SeqCst), 1);
-    let denied = request(&probe, Method::GET, &uri("manifests", "main"), &[]).await?;
+    let denied = request(&probe, Method::HEAD, &uri("manifests", "main"), &[]).await?;
     assert_eq!(denied.status(), StatusCode::FORBIDDEN);
     age(dir.path(), &hash)?;
     let released = tokio::process::Command::new("docker")
@@ -913,5 +916,94 @@ async fn failed_scan_removes_pending_image_and_tag() -> anyhow::Result<()> {
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert_eq!(pending, 0);
     assert_eq!(tags, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn busy_scan_preserves_existing_tag_alias() -> anyhow::Result<()> {
+    let registry = Registry::default();
+    let released = registry.image("released")?;
+    let replacement = registry.image("replacement")?;
+    let busy = registry.image("busy")?;
+    registry.tag("main", &released.hash)?;
+    registry.tag("busy", &busy.hash)?;
+    let blocked_layer = busy.layer_hash.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let started_tx = Arc::new(std::sync::Mutex::new(Some(started_tx)));
+    let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+    let scan: TestScan = Arc::new({
+        let started_tx = Arc::clone(&started_tx);
+        let release_rx = Arc::clone(&release_rx);
+        move |layout| {
+            if object_path(layout, &blocked_layer).exists() {
+                let sender = started_tx
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("scan start lock poisoned"))?
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("scan started more than once"))?;
+                sender.send(())?;
+                release_rx
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("scan release lock poisoned"))?
+                    .recv_timeout(Duration::from_secs(5))?;
+            }
+            Ok(Verdict::Clean)
+        }
+    });
+    let (upstream, task) = registry.clone().serve().await?;
+    let dir = tempfile::tempdir()?;
+    let mirror = mirror(dir.path(), upstream, scan)?;
+    let app = router(Arc::clone(&mirror));
+
+    assert_eq!(
+        request(&app, Method::GET, &uri("manifests", "main"), &[])
+            .await?
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    finish_background(&mirror).await;
+    age(dir.path(), &released.hash)?;
+    assert_eq!(
+        request(&app, Method::GET, &uri("manifests", "main"), &[])
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+
+    registry.tag("main", &replacement.hash)?;
+    let busy_app = app.clone();
+    let busy_path = uri("manifests", "busy");
+    let busy_request =
+        tokio::spawn(async move { request(&busy_app, Method::GET, &busy_path, &[]).await });
+    tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(5))).await??;
+    assert_eq!(busy_request.await??.status(), StatusCode::FORBIDDEN);
+
+    assert_eq!(
+        request(&app, Method::GET, &uri("manifests", "main"), &[])
+            .await?
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        request(&app, Method::GET, &uri("manifests", "busy"), &[])
+            .await?
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let tags = request(&app, Method::GET, "/v2/library/demo/tags/list", &[]).await?;
+    assert_eq!(tags.status(), StatusCode::OK);
+    let tags =
+        serde_json::from_slice::<serde_json::Value>(&to_bytes(tags.into_body(), 1024).await?)?;
+    assert!(
+        tags["tags"]
+            .as_array()
+            .is_some_and(|tags| tags.iter().any(|tag| tag == "main")),
+        "{tags}"
+    );
+
+    release_tx.send(())?;
+    finish_background(&mirror).await;
+    task.abort();
     Ok(())
 }
