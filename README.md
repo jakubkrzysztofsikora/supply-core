@@ -147,6 +147,9 @@ scanners. Build YaraHunter at commit
 require Linux. The Linux sandbox mounts its private scratch directory over
 `/tmp`, so install scanner binaries outside `/tmp`.
 
+CAPA shares a 300-second budget across its version probe and executable scans.
+It reports incomplete coverage when that budget expires.
+
 Trivy preserves native vulnerability severity and applies the configured
 `vulnerabilities.block_severities` threshold, including more severe findings.
 For CI, scan committed lockfiles without snapshotting to current registry state:
@@ -443,6 +446,19 @@ each runnable platform with Trivy. It serves the index, child manifests, and
 blobs only after the age window and a complete passing scan. With the default
 policy, any reported vulnerability keeps the image held. A missing or failing
 scan also keeps it held. Scan results are reused for 24 hours.
+
+The mirror keeps up to 4096 image metadata records without cached content and
+prunes them after 90 days. Cache eviction drops cached content and scan results
+while preserving first-seen time. The schema migration marks legacy uncached
+rows as capacity-prune candidates because their old state is ambiguous. At
+capacity, it prunes the oldest candidate; without one, new digests fail closed.
+Reobserving a pruned digest starts a new quarantine window. Failed scans remove
+new pending metadata, so retries start a new window. Failed evicted-image
+rescans preserve first-seen time and remain held until a successful rescan.
+The mirror keeps up to 8192 tag aliases. At capacity, it skips new aliases
+without failing pulls. `/tags/list` can omit those aliases until space opens.
+Existing aliases update when a new digest is admitted for scanning. A new digest
+rejected because another scan is busy leaves existing aliases unchanged.
 
 | Setting | Default and behavior |
 | --- | --- |

@@ -14,6 +14,10 @@ const SCAN_TTL_SECONDS: i64 = 24 * 60 * 60;
 pub(super) const MAX_METADATA_IMAGES: i64 = 4096;
 pub(super) const MAX_METADATA_TAGS: i64 = 8192;
 pub(super) const METADATA_RETENTION_SECONDS: i64 = 90 * 24 * 60 * 60;
+const IMAGE_PENDING: i64 = 0;
+const IMAGE_SCANNED: i64 = 1;
+const IMAGE_EVICTED: i64 = 2;
+const IMAGE_LEGACY_UNCACHED: i64 = 3;
 
 pub(super) struct Store {
     db: Mutex<Connection>,
@@ -49,6 +53,7 @@ impl Store {
                 scanned_at INTEGER,
                 policy TEXT,
                 vulnerable INTEGER,
+                scan_state INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (repository, digest)
             );
             CREATE TABLE IF NOT EXISTS objects (
@@ -68,6 +73,28 @@ impl Store {
             );
         ",
         )?;
+        let has_scan_state = {
+            let mut statement = db.prepare("PRAGMA table_info(images)")?;
+            let mut rows = statement.query([])?;
+            let mut found = false;
+            while let Some(row) = rows.next()? {
+                if row.get_ref(1)?.as_str()? == "scan_state" {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if !has_scan_state {
+            db.execute(
+                "ALTER TABLE images ADD COLUMN scan_state INTEGER NOT NULL DEFAULT 3",
+                [],
+            )?;
+            db.execute(
+                "UPDATE images SET scan_state=?1 WHERE cache_key IS NOT NULL",
+                [IMAGE_SCANNED],
+            )?;
+        }
         let objects = dir.join("objects");
         fs::create_dir_all(&objects)?;
         let mut referenced =
@@ -99,6 +126,29 @@ impl Store {
 
     pub fn root(&self) -> &Path {
         &self.dir
+    }
+    pub fn has_image(&self, repo: &str, digest: &str) -> anyhow::Result<bool> {
+        Ok(self.db()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM images WHERE repository=?1 AND digest=?2)",
+            params![repo, digest],
+            |row| row.get(0),
+        )?)
+    }
+    pub fn discard_pending(&self, repo: &str, digest: &str) -> anyhow::Result<()> {
+        let mut db = self.db()?;
+        let tx = db.transaction()?;
+        tx.execute(
+            "DELETE FROM tags WHERE repository=?1 AND digest=?2 AND EXISTS (
+                SELECT 1 FROM images WHERE repository=?1 AND digest=?2 AND cache_key IS NULL AND scan_state=?3
+            )",
+            params![repo, digest, IMAGE_PENDING],
+        )?;
+        tx.execute(
+            "DELETE FROM images WHERE repository=?1 AND digest=?2 AND cache_key IS NULL AND scan_state=?3",
+            params![repo, digest, IMAGE_PENDING],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn observe(
@@ -133,19 +183,40 @@ impl Store {
         let ts = match known {
             Some(first_seen) => first_seen,
             None => {
-                let pending: i64 = tx.query_row(
+                let mut pending: i64 = tx.query_row(
                     "SELECT COUNT(*) FROM images WHERE cache_key IS NULL",
                     [],
                     |row| row.get::<_, i64>(0),
                 )?;
-                anyhow::ensure!(
-                    pending < MAX_METADATA_IMAGES,
-                    "mirror image capacity reached"
-                );
+                while pending >= MAX_METADATA_IMAGES {
+                    let oldest: Option<i64> = tx
+                        .query_row(
+                            "SELECT rowid FROM images
+                             WHERE cache_key IS NULL AND scan_state IN (?1,?2)
+                             ORDER BY first_seen,repository,digest LIMIT 1",
+                            [IMAGE_EVICTED, IMAGE_LEGACY_UNCACHED],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    let Some(oldest) = oldest else {
+                        anyhow::bail!("mirror image capacity reached");
+                    };
+                    tx.execute(
+                        "DELETE FROM tags WHERE EXISTS (
+                            SELECT 1 FROM images
+                            WHERE images.rowid=?1
+                              AND images.repository=tags.repository
+                              AND images.digest=tags.digest
+                        )",
+                        [oldest],
+                    )?;
+                    tx.execute("DELETE FROM images WHERE rowid=?1", [oldest])?;
+                    pending -= 1;
+                }
                 let first_seen = now.timestamp();
                 tx.execute(
-                    "INSERT INTO images (repository,digest,first_seen) VALUES (?1,?2,?3)",
-                    params![repo, digest, first_seen],
+                    "INSERT INTO images (repository,digest,first_seen,scan_state) VALUES (?1,?2,?3,?4)",
+                    params![repo, digest, first_seen, IMAGE_PENDING],
                 )?;
                 first_seen
             }
@@ -156,15 +227,21 @@ impl Store {
                 params![repo, tag],
                 |row| row.get::<_, bool>(0),
             )?;
-            if !counted {
+            if counted {
+                tx.execute(
+                    "UPDATE tags SET digest=?3 WHERE repository=?1 AND tag=?2",
+                    params![repo, tag, digest],
+                )?;
+            } else {
                 let tags: i64 =
                     tx.query_row("SELECT COUNT(*) FROM tags", [], |row| row.get::<_, i64>(0))?;
-                anyhow::ensure!(tags < MAX_METADATA_TAGS, "mirror tag capacity reached");
+                if tags < MAX_METADATA_TAGS {
+                    tx.execute(
+                        "INSERT INTO tags VALUES (?1,?2,?3)",
+                        params![repo, tag, digest],
+                    )?;
+                }
             }
-            tx.execute(
-                "INSERT INTO tags VALUES (?1,?2,?3) ON CONFLICT(repository,tag) DO UPDATE SET digest=excluded.digest",
-                params![repo, tag, digest],
-            )?;
         }
         tx.commit()?;
         DateTime::from_timestamp(ts, 0).context("invalid first seen time")
@@ -283,8 +360,8 @@ impl Store {
         fs::rename(staging.path(), &target)?;
         let recorded = (|| -> anyhow::Result<()> {
             tx.execute(
-                "UPDATE images SET cache_key=?3,size=?4,scanned_at=?5,policy=?6,vulnerable=?7 WHERE repository=?1 AND digest=?2",
-                params![repo,hash,key,size,now.timestamp(),policy,verdict == Verdict::Vulnerable],
+                "UPDATE images SET cache_key=?3,size=?4,scanned_at=?5,policy=?6,vulnerable=?7,scan_state=?8 WHERE repository=?1 AND digest=?2",
+                params![repo,hash,key,size,now.timestamp(),policy,verdict == Verdict::Vulnerable,IMAGE_SCANNED],
             )?;
             if verdict == Verdict::Clean {
                 let mut insert = tx.prepare("INSERT INTO objects VALUES (?1,?2,?3,?4,?5)")?;
@@ -369,7 +446,10 @@ impl Store {
 
 fn forget(tx: &rusqlite::Transaction<'_>, key: &str) -> rusqlite::Result<()> {
     tx.execute("DELETE FROM objects WHERE cache_key=?1", [key])?;
-    tx.execute("UPDATE images SET cache_key=NULL,size=0,scanned_at=NULL,policy=NULL,vulnerable=NULL WHERE cache_key=?1", [key])?;
+    tx.execute(
+        "UPDATE images SET cache_key=NULL,size=0,policy=NULL,vulnerable=NULL,scan_state=?2 WHERE cache_key=?1",
+        params![key, IMAGE_EVICTED],
+    )?;
     Ok(())
 }
 
@@ -382,4 +462,143 @@ pub(super) struct ScannedImage<'a> {
     pub size: u64,
     pub verdict: Verdict,
     pub objects: &'a [Object],
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evicted_first_seen_survives_failure_and_prunes_capacity() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(dir.path())?;
+        let now = Utc::now();
+        let evicted = digest(b"evicted");
+        store.observe("r", &evicted, Some("evicted"), now)?;
+        let staging = tempfile::tempdir_in(store.root().join("objects"))?;
+        store.commit(ScannedImage {
+            repo: "r",
+            hash: &evicted,
+            policy: "test",
+            now,
+            staging,
+            size: MAX_CACHE_BYTES as u64,
+            verdict: Verdict::Clean,
+            objects: &[],
+        })?;
+
+        let retained = digest(b"retained");
+        store.observe("r", &retained, None, now)?;
+        let later = now + chrono::TimeDelta::seconds(1);
+        let staging = tempfile::tempdir_in(store.root().join("objects"))?;
+        store.commit(ScannedImage {
+            repo: "r",
+            hash: &retained,
+            policy: "test",
+            now: later,
+            staging,
+            size: 1,
+            verdict: Verdict::Clean,
+            objects: &[],
+        })?;
+        store.discard_pending("r", &evicted)?;
+        assert!(store.has_image("r", &evicted)?);
+        let observed_evicted = store.observe("r", &evicted, Some("evicted"), later)?;
+        assert_eq!(observed_evicted.timestamp(), now.timestamp());
+
+        for index in 0..(MAX_METADATA_IMAGES - 1) {
+            store.observe(
+                "r",
+                &digest(format!("pending:{index}").as_bytes()),
+                None,
+                later,
+            )?;
+        }
+        let observed = store.observe("r", &digest(b"incoming"), None, later)?;
+        assert_eq!(observed.timestamp(), later.timestamp());
+        assert!(!store.has_image("r", &evicted)?);
+        let db = Connection::open(store.root().join("state.db"))?;
+        let evicted_tags: i64 = db.query_row(
+            "SELECT COUNT(*) FROM tags WHERE repository=?1 AND tag=?2",
+            ["r", "evicted"],
+            |row| row.get(0),
+        )?;
+        assert_eq!(evicted_tags, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_uncached_metadata_is_pruned_after_migration() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let first_seen = Utc::now() - chrono::TimeDelta::seconds(2);
+        let legacy = digest(b"legacy");
+        let db = Connection::open(dir.path().join("state.db"))?;
+        db.execute_batch(
+            "
+            CREATE TABLE images (
+                repository TEXT NOT NULL,
+                digest TEXT NOT NULL,
+                first_seen INTEGER NOT NULL,
+                cache_key TEXT UNIQUE,
+                size INTEGER NOT NULL DEFAULT 0,
+                scanned_at INTEGER,
+                policy TEXT,
+                vulnerable INTEGER,
+                PRIMARY KEY (repository, digest)
+            );
+            ",
+        )?;
+        db.execute(
+            "INSERT INTO images (repository,digest,first_seen) VALUES (?1,?2,?3)",
+            params!["r", legacy, first_seen.timestamp()],
+        )?;
+        drop(db);
+
+        let store = Store::open(dir.path())?;
+        let later = first_seen + chrono::TimeDelta::seconds(1);
+        store.observe("r", &legacy, Some("legacy"), first_seen)?;
+        for index in 0..(MAX_METADATA_IMAGES - 1) {
+            store.observe(
+                "r",
+                &digest(format!("pending:{index}").as_bytes()),
+                None,
+                later,
+            )?;
+        }
+        let incoming = digest(b"incoming");
+        store.observe("r", &incoming, None, later)?;
+        assert!(!store.has_image("r", &legacy)?);
+        assert!(store.has_image("r", &incoming)?);
+        let db = Connection::open(store.root().join("state.db"))?;
+        let tag_count: i64 = db.query_row(
+            "SELECT COUNT(*) FROM tags WHERE repository=?1 AND tag=?2",
+            ["r", "legacy"],
+            |row| row.get(0),
+        )?;
+        assert_eq!(tag_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn pending_scan_failure_after_restart_clears_metadata() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let pending = digest(b"pending");
+        let now = Utc::now();
+
+        {
+            let store = Store::open(dir.path())?;
+            store.observe("r", &pending, Some("pending"), now)?;
+        }
+
+        let store = Store::open(dir.path())?;
+        store.discard_pending("r", &pending)?;
+        assert!(!store.has_image("r", &pending)?);
+        let db = Connection::open(store.root().join("state.db"))?;
+        let tag_count: i64 = db.query_row(
+            "SELECT COUNT(*) FROM tags WHERE repository=?1 AND tag=?2",
+            ["r", "pending"],
+            |row| row.get(0),
+        )?;
+        assert_eq!(tag_count, 0);
+        Ok(())
+    }
 }

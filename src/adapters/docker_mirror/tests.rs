@@ -200,6 +200,22 @@ fn age(path: &Path, hash: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn age_pending(path: &Path, repo: &str, hash: &str) -> anyhow::Result<()> {
+    let db = rusqlite::Connection::open(path.join("state.db"))?;
+    let first_seen = (Utc::now() - TimeDelta::days(8)).timestamp();
+    let updated = db.execute(
+        "UPDATE images SET first_seen=?1 WHERE repository=?2 AND digest=?3",
+        rusqlite::params![first_seen, repo, hash],
+    )?;
+    if updated == 0 {
+        db.execute(
+            "INSERT INTO images (repository,digest,first_seen) VALUES (?1,?2,?3)",
+            rusqlite::params![repo, hash, first_seen],
+        )?;
+    }
+    Ok(())
+}
+
 async fn finish_background(mirror: &Mirror) {
     tokio::task::yield_now().await;
     let _guard = mirror.worker.lock().await;
@@ -409,14 +425,18 @@ async fn index_releases_only_after_every_platform_is_checked() -> anyhow::Result
         StatusCode::FORBIDDEN
     );
     finish_background(&mirror).await;
-    age(dir.path(), &index)?;
+    age_pending(dir.path(), REPO, &index)?;
     assert_eq!(
         request(&app, Method::GET, &uri("manifests", "main"), &[])
             .await?
             .status(),
         StatusCode::SERVICE_UNAVAILABLE
     );
+    age_pending(dir.path(), REPO, &index)?;
     outcome.store(1, Ordering::SeqCst);
+    let held = request(&app, Method::GET, &uri("manifests", "main"), &[]).await?;
+    assert_eq!(held.status(), StatusCode::FORBIDDEN);
+    finish_background(&mirror).await;
     let denied = request(&app, Method::GET, &uri("manifests", "main"), &[]).await?;
     assert_eq!(denied.status(), StatusCode::FORBIDDEN);
     assert!(
@@ -447,12 +467,10 @@ async fn index_releases_only_after_every_platform_is_checked() -> anyhow::Result
     let db = rusqlite::Connection::open(dir.path().join("state.db"))?;
     db.execute("UPDATE images SET scanned_at=0", [])?;
     outcome.store(2, Ordering::SeqCst);
-    assert_eq!(
-        request(&app, Method::GET, &uri("manifests", "main"), &[])
-            .await?
-            .status(),
-        StatusCode::OK
-    );
+    let released = request(&app, Method::GET, &uri("manifests", "main"), &[]).await?;
+    let status = released.status();
+    let body = to_bytes(released.into_body(), 1024).await?;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     assert_eq!(passing_platforms.load(Ordering::SeqCst), 2);
     for hash in [&one.hash, &two.hash, &attestation] {
         assert_eq!(
@@ -491,7 +509,7 @@ async fn corrupt_blob_never_reaches_scanner() -> anyhow::Result<()> {
         StatusCode::FORBIDDEN
     );
     finish_background(&mirror).await;
-    age(dir.path(), &image.hash)?;
+    age_pending(dir.path(), REPO, &image.hash)?;
     assert_eq!(
         request(&app, Method::GET, &uri("manifests", "main"), &[])
             .await?
@@ -545,10 +563,19 @@ async fn docker_engine_cannot_pull_until_release() -> anyhow::Result<()> {
     registry.tag("main", &hash)?;
     let (upstream, upstream_task) = registry.serve().await?;
     let dir = tempfile::tempdir()?;
-    let mirror = mirror(dir.path(), upstream, Arc::new(|_| Ok(Verdict::Clean)))?;
+    let scans = Arc::new(AtomicUsize::new(0));
+    let scan: TestScan = Arc::new({
+        let scans = Arc::clone(&scans);
+        move |_| {
+            scans.fetch_add(1, Ordering::SeqCst);
+            Ok(Verdict::Clean)
+        }
+    });
+    let mirror = mirror(dir.path(), upstream, scan)?;
     let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
     let reference = format!("localhost:{}/{REPO}:main", listener.local_addr()?.port());
-    let app = router(Arc::clone(&mirror));
+    let probe = router(Arc::clone(&mirror));
+    let app = probe.clone();
     let mirror_task = tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
@@ -557,14 +584,14 @@ async fn docker_engine_cannot_pull_until_release() -> anyhow::Result<()> {
         .output()
         .await?;
     let error = String::from_utf8_lossy(&held.stderr);
-    // Docker's resolver probes the tag with HEAD, which carries no body, so
-    // the quarantine reason is asserted in-process against GET. The
-    // engine-visible contract is that the pull is denied with 403.
     assert!(
-        !held.status.success() && error.contains("403 Forbidden"),
+        !held.status.success() && error.contains("quarantine window"),
         "{error}"
     );
     finish_background(&mirror).await;
+    assert_eq!(scans.load(Ordering::SeqCst), 1);
+    let denied = request(&probe, Method::HEAD, &uri("manifests", "main"), &[]).await?;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
     age(dir.path(), &hash)?;
     let released = tokio::process::Command::new("docker")
         .args(["pull", &reference])
@@ -668,21 +695,20 @@ async fn oversized_index_batch_is_rejected_without_scanning() -> anyhow::Result<
     };
     let mirror = mirror(dir.path(), upstream, scan)?;
     let app = router(Arc::clone(&mirror));
-    // Young: observed, quarantined, and the background scan already fails.
-    assert_eq!(
-        request(&app, Method::GET, &uri("manifests", "main"), &[])
-            .await?
-            .status(),
-        StatusCode::FORBIDDEN
-    );
+    let response = request(&app, Method::GET, &uri("manifests", "main"), &[]).await?;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
     finish_background(&mirror).await;
-    age(dir.path(), &hash)?;
+    let db = rusqlite::Connection::open(dir.path().join("state.db"))?;
     assert_eq!(
-        request(&app, Method::GET, &uri("manifests", "main"), &[])
-            .await?
-            .status(),
-        StatusCode::BAD_GATEWAY
+        db.query_row(
+            "SELECT COUNT(*) FROM images WHERE cache_key IS NULL",
+            [],
+            |row| row.get::<_, i64>(0)
+        )?,
+        0
     );
+    let retry = request(&app, Method::GET, &uri("manifests", "main"), &[]).await?;
+    assert_eq!(retry.status(), StatusCode::FORBIDDEN);
     finish_background(&mirror).await;
     assert_eq!(scans.load(Ordering::SeqCst), 0);
     task.abort();
@@ -727,7 +753,7 @@ async fn external_cache_requires_both_databases_fresh() -> anyhow::Result<()> {
 }
 
 #[test]
-fn metadata_bursts_hit_quotas_instead_of_growing_state() -> anyhow::Result<()> {
+fn metadata_bursts_keep_image_and_tag_state_bounded() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let store = Store::open(dir.path())?;
     let now = Utc::now();
@@ -740,13 +766,29 @@ fn metadata_bursts_hit_quotas_instead_of_growing_state() -> anyhow::Result<()> {
         )?;
     }
     assert!(store.observe("r", &digest(b"overflow"), None, now).is_err());
+
     let tags = tempfile::tempdir()?;
     let store = Store::open(tags.path())?;
     let shared = digest(b"one-image");
     for index in 0..store::MAX_METADATA_TAGS {
         store.observe("r", &shared, Some(&format!("tag:{index}")), now)?;
     }
-    assert!(store.observe("r", &shared, Some("overflow"), now).is_err());
+    store.observe("r", &shared, Some("overflow"), now)?;
+    let db = rusqlite::Connection::open(tags.path().join("state.db"))?;
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM tags", [], |row| row.get::<_, i64>(0))?,
+        store::MAX_METADATA_TAGS
+    );
+    assert!(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM tags WHERE tag='tag:0')",
+        [],
+        |row| row.get::<_, bool>(0)
+    )?);
+    assert!(!db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM tags WHERE tag='overflow')",
+        [],
+        |row| row.get::<_, bool>(0)
+    )?);
     Ok(())
 }
 
@@ -792,5 +834,176 @@ fn observation_prunes_orphan_tags_and_aged_metadata() -> anyhow::Result<()> {
         |row| row.get::<_, i64>(0),
     )?;
     assert_eq!(first_seen, now.timestamp());
+    Ok(())
+}
+#[tokio::test]
+async fn busy_scanner_does_not_admit_new_image_metadata() -> anyhow::Result<()> {
+    let registry = Registry::default();
+    let first = registry.image("first")?;
+    let second = registry.image("second")?;
+    registry.tag("first", &first.hash)?;
+    registry.tag("second", &second.hash)?;
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let started_tx = Arc::new(std::sync::Mutex::new(Some(started_tx)));
+    let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+    let scan: TestScan = Arc::new({
+        let started_tx = Arc::clone(&started_tx);
+        let release_rx = Arc::clone(&release_rx);
+        move |_| {
+            let sender = started_tx
+                .lock()
+                .map_err(|_| anyhow::anyhow!("scan start lock poisoned"))?
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("scan started more than once"))?;
+            sender.send(())?;
+            release_rx
+                .lock()
+                .map_err(|_| anyhow::anyhow!("scan release lock poisoned"))?
+                .recv_timeout(Duration::from_secs(5))?;
+            Ok(Verdict::Clean)
+        }
+    });
+    let (upstream, task) = registry.serve().await?;
+    let dir = tempfile::tempdir()?;
+    let mirror = mirror(dir.path(), upstream, scan)?;
+    let app = router(Arc::clone(&mirror));
+    let first_app = app.clone();
+    let first_path = uri("manifests", "first");
+    let first_request =
+        tokio::spawn(async move { request(&first_app, Method::GET, &first_path, &[]).await });
+    tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(5))).await??;
+
+    let second = request(&app, Method::GET, &uri("manifests", "second"), &[]).await?;
+    let db = rusqlite::Connection::open(dir.path().join("state.db"))?;
+    let pending: i64 = db.query_row(
+        "SELECT COUNT(*) FROM images WHERE cache_key IS NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    drop(db);
+    release_tx.send(())?;
+    let first = first_request.await??;
+    finish_background(&mirror).await;
+    task.abort();
+
+    assert_eq!(second.status(), StatusCode::FORBIDDEN);
+    assert_eq!(pending, 1);
+    assert_eq!(first.status(), StatusCode::FORBIDDEN);
+    Ok(())
+}
+#[tokio::test]
+async fn failed_scan_removes_pending_image_and_tag() -> anyhow::Result<()> {
+    let registry = Registry::default();
+    let image = registry.image("failed")?;
+    registry.tag("failed", &image.hash)?;
+    let (upstream, task) = registry.serve().await?;
+    let dir = tempfile::tempdir()?;
+    let scan: TestScan = Arc::new(|_| Err(anyhow::anyhow!("scan failed")));
+    let mirror = mirror(dir.path(), upstream, scan)?;
+    let app = router(Arc::clone(&mirror));
+    let response = request(&app, Method::GET, &uri("manifests", "failed"), &[]).await?;
+    finish_background(&mirror).await;
+    let db = rusqlite::Connection::open(dir.path().join("state.db"))?;
+    let pending: i64 = db.query_row(
+        "SELECT COUNT(*) FROM images WHERE cache_key IS NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    let tags: i64 = db.query_row("SELECT COUNT(*) FROM tags", [], |row| row.get(0))?;
+    task.abort();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(pending, 0);
+    assert_eq!(tags, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn busy_scan_preserves_existing_tag_alias() -> anyhow::Result<()> {
+    let registry = Registry::default();
+    let released = registry.image("released")?;
+    let replacement = registry.image("replacement")?;
+    let busy = registry.image("busy")?;
+    registry.tag("main", &released.hash)?;
+    registry.tag("busy", &busy.hash)?;
+    let blocked_layer = busy.layer_hash.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let started_tx = Arc::new(std::sync::Mutex::new(Some(started_tx)));
+    let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+    let scan: TestScan = Arc::new({
+        let started_tx = Arc::clone(&started_tx);
+        let release_rx = Arc::clone(&release_rx);
+        move |layout| {
+            if object_path(layout, &blocked_layer).exists() {
+                let sender = started_tx
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("scan start lock poisoned"))?
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("scan started more than once"))?;
+                sender.send(())?;
+                release_rx
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("scan release lock poisoned"))?
+                    .recv_timeout(Duration::from_secs(5))?;
+            }
+            Ok(Verdict::Clean)
+        }
+    });
+    let (upstream, task) = registry.clone().serve().await?;
+    let dir = tempfile::tempdir()?;
+    let mirror = mirror(dir.path(), upstream, scan)?;
+    let app = router(Arc::clone(&mirror));
+
+    assert_eq!(
+        request(&app, Method::GET, &uri("manifests", "main"), &[])
+            .await?
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    finish_background(&mirror).await;
+    age(dir.path(), &released.hash)?;
+    assert_eq!(
+        request(&app, Method::GET, &uri("manifests", "main"), &[])
+            .await?
+            .status(),
+        StatusCode::OK
+    );
+
+    registry.tag("main", &replacement.hash)?;
+    let busy_app = app.clone();
+    let busy_path = uri("manifests", "busy");
+    let busy_request =
+        tokio::spawn(async move { request(&busy_app, Method::GET, &busy_path, &[]).await });
+    tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(5))).await??;
+    assert_eq!(busy_request.await??.status(), StatusCode::FORBIDDEN);
+
+    assert_eq!(
+        request(&app, Method::GET, &uri("manifests", "main"), &[])
+            .await?
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        request(&app, Method::GET, &uri("manifests", "busy"), &[])
+            .await?
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let tags = request(&app, Method::GET, "/v2/library/demo/tags/list", &[]).await?;
+    assert_eq!(tags.status(), StatusCode::OK);
+    let tags =
+        serde_json::from_slice::<serde_json::Value>(&to_bytes(tags.into_body(), 1024).await?)?;
+    assert!(
+        tags["tags"]
+            .as_array()
+            .is_some_and(|tags| tags.iter().any(|tag| tag == "main")),
+        "{tags}"
+    );
+
+    release_tx.send(())?;
+    finish_background(&mirror).await;
+    task.abort();
     Ok(())
 }
