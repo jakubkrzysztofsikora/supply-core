@@ -11,17 +11,22 @@ use anyhow::Result;
 use axum::{
     extract::{Path as AxumPath, State},
     http::{header, HeaderMap, Method, StatusCode},
+    middleware,
     response::{IntoResponse, Redirect, Response},
     routing::{get, post, put},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
 use tower_http::cors::{Any, CorsLayer};
+
+mod detonations;
 
 const PUBLIC_STATUS_PAGE: &str = include_str!("../../../web/index.html");
 
@@ -32,6 +37,8 @@ pub struct ServerConfig {
     pub status_file: Option<PathBuf>,
     pub auth_token: Option<String>,
     pub tailnet_domain: Option<String>,
+    pub detonation_public_store: Option<PathBuf>,
+    pub detonation_ingest_token_file: Option<PathBuf>,
 }
 
 fn configured_token(raw: Option<String>) -> Option<String> {
@@ -54,6 +61,10 @@ impl Default for ServerConfig {
             status_file: std::env::var("SUPPLY_STATUS_FILE").ok().map(PathBuf::from),
             auth_token: configured_token(std::env::var("SUPPLY_AUTH_TOKEN").ok()),
             tailnet_domain: configured_domain(),
+            detonation_public_store: std::env::var_os("SUPPLY_DETONATION_PUBLIC_STORE")
+                .map(PathBuf::from),
+            detonation_ingest_token_file: std::env::var_os("SUPPLY_DETONATION_INGEST_TOKEN_FILE")
+                .map(PathBuf::from),
         }
     }
 }
@@ -237,8 +248,11 @@ fn server_routes(config: ServerConfig, mirror: Option<Router>) -> Router {
         .route("/api/v1/scan/actions", post(scan_github_actions))
         .route("/api/v1/scan/github-actions", post(scan_github_actions))
         .merge(public)
+        .merge(detonations::routes())
         .with_state(state);
-    server.merge(mirror.unwrap_or_default())
+    Router::new()
+        .fallback_service(server.merge(mirror.unwrap_or_default()))
+        .layer(middleware::from_fn(detonations::route_gate))
 }
 
 async fn status_page() -> impl IntoResponse {
@@ -869,17 +883,37 @@ async fn download_artifact(
 
     if let Some(dir) = &state.artifacts_dir {
         let file_path = dir.join(&artifact);
-        if file_path.is_file() {
-            if let Ok(bytes) = std::fs::read(&file_path) {
-                let headers = [
-                    (header::CONTENT_TYPE, "application/octet-stream"),
-                    (
-                        header::CONTENT_DISPOSITION,
-                        &format!("attachment; filename=\"{artifact}\""),
-                    ),
-                ];
-                return (StatusCode::OK, headers, bytes).into_response();
+        match std::fs::symlink_metadata(&file_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return StatusCode::NOT_FOUND.into_response();
             }
+            Ok(_) => {
+                match std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(&file_path)
+                {
+                    Ok(mut file) => {
+                        let mut bytes = Vec::new();
+                        if file.read_to_end(&mut bytes).is_ok() {
+                            let headers = [
+                                (header::CONTENT_TYPE, "application/octet-stream"),
+                                (
+                                    header::CONTENT_DISPOSITION,
+                                    &format!("attachment; filename=\"{artifact}\""),
+                                ),
+                            ];
+                            return (StatusCode::OK, headers, bytes).into_response();
+                        }
+                    }
+                    Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+                        return StatusCode::NOT_FOUND.into_response();
+                    }
+                    Err(_) => {}
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {}
         }
     }
 

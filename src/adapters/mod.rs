@@ -2,6 +2,7 @@ pub mod azure_devops;
 pub mod command_scanner;
 pub mod config;
 pub mod crypto;
+pub mod detonation;
 pub mod docker_mirror;
 pub mod github;
 pub mod http;

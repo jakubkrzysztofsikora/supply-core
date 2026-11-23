@@ -55,6 +55,16 @@ enum Command {
         #[arg(long, env = "SUPPLY_DOCKER_MIRROR_POLICY")]
         policy: Option<PathBuf>,
     },
+    PublishDetonation {
+        #[arg(long, required = true)]
+        pending: bool,
+        #[arg(long)]
+        public_url: String,
+        #[arg(long)]
+        ingest_token_file: PathBuf,
+        #[arg(long)]
+        evidence_dir: PathBuf,
+    },
     ScanActions {
         #[arg(default_value = ".")]
         root: PathBuf,
@@ -315,6 +325,7 @@ async fn main() -> Result<()> {
                 status_file,
                 auth_token,
                 tailnet_domain: supply_core::adapters::http::configured_domain(),
+                ..supply_core::adapters::http::ServerConfig::default()
             };
             eprintln!(
                 "Starting supply-core server '{}' listening on {}",
@@ -326,6 +337,21 @@ async fn main() -> Result<()> {
                 app_with_policy(config, load_policy(policy.as_deref())?)?,
             )
             .await?;
+        }
+        Command::PublishDetonation {
+            pending,
+            public_url,
+            ingest_token_file,
+            evidence_dir,
+        } => {
+            let published = supply_core::adapters::detonation::publisher::publish_pending(
+                &public_url,
+                &ingest_token_file,
+                &evidence_dir,
+                pending,
+            )
+            .await?;
+            println!("Accepted {published} detonation bundle(s)");
         }
         Command::ScanActions {
             root,

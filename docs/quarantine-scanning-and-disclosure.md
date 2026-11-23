@@ -317,6 +317,10 @@ Guardrails before any automated submission:
     Older snapshots remain valid; missing fields default to empty lists and
     zero omitted rows.
 
+## Public detonation replay
+
+The opt-in `/api/v1/detonations` API serves signed, revalidated, redacted replay bundles. It does not expose private raw evidence. It remains separate from the name/version-only `/api/v1/status` snapshot. Automatic redaction may miss unknown secrets. Route details, configuration, and the explicit publisher command appear in the [README detonation API guide](../README.md#detonation-evidence-replay).
+
 ## Original plan
 
 1. `Policy.quarantine_scanner` + `ContentFinding` domain type + evaluator test

@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 pub mod ai_scanner;
+pub mod detonation;
 pub mod image_scanner;
 pub mod ledger;
 pub mod packages;

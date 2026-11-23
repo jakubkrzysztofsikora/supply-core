@@ -355,7 +355,7 @@ server over the compose network. Captures land in `radar/data/`. Without the
   {
     "generated_at": "2026-11-15T08:32:00Z",
     "service": "supply-core",
-    "version": "0.4.8",
+    "version": "0.5.0",
     "health": {"status": "ok"},
     "quarantine": {
       "enabled": true,
@@ -406,6 +406,33 @@ server over the compose network. Captures land in `radar/data/`. Without the
   The publisher rejects `content-scan.json` files larger than 1,000,000 bytes, more than 1,000 scanned rows, or more than 100,000 candidates, errors, or findings per row. Names and versions cap at 256 UTF-8 bytes. Each `rules` or `sources` list caps at 16 identifiers; each identifier caps at 120 bytes. Error text caps at 2,048 bytes for validation, then is discarded. Scan timestamps cap at 64 bytes. Scores cap at 32 bytes, 29 digits, and 28 fractional digits. Unknown row fields are dropped by the publisher and rejected by the upload API. The API also rejects invalid decisions, coverage, paths, scores, and oversized lists. Existing incomplete records cap at 1,000; `scan_incomplete_truncated` reports omissions.
 
   Existing `quarantine` rows retain these fields: `packages[]` has `name`, `version`, non-negative `age_days`, and `status` (`Block` or `Fallback`); `confirmed[]` has `name`, `version`, `advisory`, and `severity`; `suspected[]` has `name`, `version`, integer `score` from 0 through 10, and `rules`; `scan_incomplete[]` has `name`, `version`, and verdict `scan_incomplete`. `scan_incomplete_truncated` counts omitted incomplete rows. Upload limits are 5,000 packages; 1,000 confirmed, suspected, or incomplete rows; and 16 rules per suspected row, with each rule capped at 120 bytes. Confirmed advisory and severity strings cap at 256 and 32 bytes.
+
+### Detonation evidence replay
+
+Replay API publishes only signed, revalidated public projections. It never serves private raw evidence. Automatic redaction can miss unknown secrets. Existing `/api/v1/status` remains unchanged.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/v1/detonations?limit=50&cursor=<opaque>` | List sealed runs, newest first. |
+| GET | `/api/v1/detonations/{run_id}` | Read run metadata, counts, provenance, and coverage. |
+| GET | `/api/v1/detonations/{run_id}/events?after_seq=0&limit=50` | Read ordered public events and loss markers. |
+| GET | `/api/v1/detonations/{run_id}/logs?stream=stdout&after=0&limit=65536` | Read redacted output bytes and markers. `limit` counts bytes; it defaults to 65536 and caps at 1048576. Use `stderr` for stderr. |
+| PUT | `/api/v1/detonations/{run_id}` | Upload one signed public bundle. |
+
+Pages default to 50 records and cap at 100. Run IDs use 32 lowercase hexadecimal characters. Responses use `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`. Uploads return `201` when sealed, `202` when pending version review, `200` for an identical sealed retry, and `409` for conflicting bytes.
+
+Set `SUPPLY_DETONATION_ROUTES_ENABLED=1` to enable routes. This switch applies per request. Set `SUPPLY_DETONATION_PUBLIC_STORE` to a private mode-0700 directory. Set `SUPPLY_DETONATION_INGEST_TOKEN_FILE` to a file containing the publisher bearer token. Set `SUPPLY_DETONATION_INGEST_KEYS_FILE` to a private JSON file with `{"keys":[{"key_id":"publisher-1","key_hex":"<64-128 lowercase hex characters>"}]}` entries. Server keys must contain 32–64 decoded bytes.
+
+Store publisher HMAC credentials as `publisher-hmac-key.json` inside the private evidence directory, using `{"key_id":"publisher-1","key_hex":"<64-128 lowercase hex characters>"}`. Publish sealed projections explicitly:
+
+```bash
+supply publish-detonation --pending \
+  --public-url https://supply-core.example.com \
+  --ingest-token-file ~/.config/supply-core/detonation-token \
+  --evidence-dir /var/lib/supply-core/evidence
+```
+
+The publisher follows no redirects and requires HTTPS outside loopback. It streams acknowledgements with a 4 KiB limit. HTTP `202` keeps bundles for retry. A sealed acknowledgement must match the run ID and bundle digest. A `409` response or mismatched sealed digest records an endpoint-scoped conflict marker, retains pending bytes, and prevents repeat uploads until the bundle changes. Matching receipts prevent repeat uploads to that endpoint while allowing publication elsewhere. After correcting server state, remove the matching `.conflict` marker from `.detonation-pending` to retry; removing a stale `.bundle` regenerates it from sealed evidence.
 
 **Deploy to Kubernetes:**
 ```bash
@@ -474,6 +501,10 @@ with Trivy, Bubblewrap, and unprivileged user namespaces available. The Compose
 configuration permits Bubblewrap to create its isolated scanner namespaces.
 If running the image directly, use `--init` and the Compose security options
 or a seccomp profile that permits the required namespace and mount operations.
+
+The official Kubernetes deployment uses a retained 40Gi hostPath volume pinned
+to `k3s-node-1`. Move its data before replacing that node; an empty volume
+restarts first-seen quarantine windows.
 
 Public Docker Hub pulls are supported, with Docker schema 2 and OCI images and
 indexes. The mirror supports pull by tag and digest, manifest and blob HEAD,

@@ -22,20 +22,28 @@ spec:
         operator: Equal
         value: worker
         effect: NoExecute
+      initContainers:
+      - name: docker-mirror-volume-owner
+        image: ghcr.io/jakubkrzysztofsikora/supply-core:v0.5.0@sha256:2a2f1cdf005eb2dc1f6684e2b074b857bcc99510b69a04fa3a6c7d8d04f11987
+        imagePullPolicy: IfNotPresent
+        command: ["chown", "supply:supply", "/app/docker-mirror"]
+        securityContext:
+          runAsUser: 0
+          allowPrivilegeEscalation: false
+        volumeMounts:
+        - name: docker-mirror
+          mountPath: /app/docker-mirror
       containers:
       - name: app
-        image: ghcr.io/jakubkrzysztofsikora/supply-core:v0.4.8
+        image: ghcr.io/jakubkrzysztofsikora/supply-core:v0.5.0@sha256:2a2f1cdf005eb2dc1f6684e2b074b857bcc99510b69a04fa3a6c7d8d04f11987
         imagePullPolicy: Always
         ports:
         - containerPort: 4873
           name: http
         env:
-        # The official server publishes package quarantine status only. The
-        # pull-through mirror is opt-in here: it needs its own volume, a
-        # Trivy-sized memory limit, and Docker Hub credentials for useful
-        # rate limits. Compose and self-hosted installs keep the default.
+        # Public Hub pulls use anonymous Docker Hub rate limits.
         - name: SUPPLY_DOCKER_MIRROR_ENABLED
-          value: "false"
+          value: "true"
         - name: SUPPLY_SERVICE_NAME
           value: "supply-core-official"
         - name: SUPPLY_ARTIFACTS_DIR
@@ -52,14 +60,17 @@ spec:
         - name: HOST
           value: "127.0.0.1"
         volumeMounts:
+        - name: docker-mirror
+          mountPath: /app/docker-mirror
         - name: artifacts
           mountPath: /app/artifacts
         resources:
           requests:
-            cpu: 25m
-            memory: 64Mi
+            cpu: 250m
+            memory: 512Mi
           limits:
-            memory: 256Mi
+            cpu: "2"
+            memory: 1Gi
         readinessProbe:
           httpGet:
             path: /health
@@ -115,6 +126,9 @@ spec:
       - name: artifacts
         persistentVolumeClaim:
           claimName: supply-core-artifacts
+      - name: docker-mirror
+        persistentVolumeClaim:
+          claimName: supply-core-docker-mirror
       - name: config
         configMap:
           name: ts-funnel-config

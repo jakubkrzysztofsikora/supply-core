@@ -5,6 +5,8 @@ namespace: supply-core
 
 resources:
   - namespace.yaml
+  - docker-mirror-pv.yaml
+  - docker-mirror-pvc.yaml
   - pvc.yaml
   - ts-funnel.yaml
   - deployment.yaml

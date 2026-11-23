@@ -13,6 +13,7 @@ use std::{
     sync::Mutex,
     time::Duration,
 };
+pub mod detonation;
 pub mod ledger;
 
 /// The store directory must be writable only by trusted local processes.
