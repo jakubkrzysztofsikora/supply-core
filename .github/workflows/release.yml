@@ -103,7 +103,7 @@ jobs:
   publish-docker:
     name: Build & Push Container Image
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork != true
-    runs-on: [self-hosted, supply-core-linux]
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332

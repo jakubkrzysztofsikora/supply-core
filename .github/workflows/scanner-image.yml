@@ -14,7 +14,7 @@ jobs:
   publish-scanner:
     name: Build & Push Scanner Image
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork != true
-    runs-on: [self-hosted, supply-core-linux]
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - name: Checkout repository
