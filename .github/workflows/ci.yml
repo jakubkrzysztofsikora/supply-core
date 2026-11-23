@@ -24,13 +24,12 @@ jobs:
       - run: python3 -m unittest discover -s experiments -p 'test_*.py'
       - run: cargo clippy --locked --all-targets -- -D warnings
   docker-engine:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork != true
+    # Billing lock blocks hosted runners; flip repo variable DOCKER_ENGINE_ENABLED
+    # to 'true' once billing is restored — job is blocking again after that.
+    if: (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork != true) && vars.DOCKER_ENGINE_ENABLED == 'true'
     runs-on: ubuntu-latest
-    continue-on-error: true
     timeout-minutes: 30
     steps:
-      - name: Billing gate notice
-        run: echo "::warning::docker-engine uses hosted runners; failure is expected until GitHub billing is restored. Flip continue-on-error off once billing works."
       - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
         with:
