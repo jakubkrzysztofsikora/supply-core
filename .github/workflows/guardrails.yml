@@ -12,25 +12,12 @@ jobs:
   hosted-suite-armed:
     # Dead-man's switch: while HOSTED_SUITE_ENABLED is false, the full test
     # suite, docker-engine test and the 85% coverage floor are NOT enforced.
+    # (Runner health needs admin scope, so it is watched by the Mac supervisor
+    # instead — see sc-ephemeral-supervisor.sh.)
     runs-on: ubuntu-latest
     steps:
       - run: |
           if [ "${{ vars.HOSTED_SUITE_ENABLED }}" != "true" ]; then
             echo "::error::HOSTED_SUITE_ENABLED is not 'true': full suite, docker-engine test and 85% coverage floor are unenforced. Restore GitHub billing, then set the repo variable."
-            exit 1
-          fi
-
-  ephemeral-runner-online:
-    # Single point of failure: test/coverage/release publishing queue forever
-    # when no [self-hosted, supply-core-linux] runner is alive.
-    runs-on: ubuntu-latest
-    steps:
-      - env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          online=$(gh api 'repos/${{ github.repository }}/actions/runners' \
-            --paginate --jq '[.runners[] | select(.status == "online" and any(.labels[]; .name == "supply-core-linux"))] | length')
-          if [ "$online" -eq 0 ]; then
-            echo "::error::No online runner with label supply-core-linux — ephemeral lanes would queue indefinitely. Check the sc-ephemeral-supervisor on mac-studio."
             exit 1
           fi
