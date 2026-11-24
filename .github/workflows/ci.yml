@@ -20,9 +20,9 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - run: cargo fmt --all --check
-      # Sandbox-dependent tests (bubblewrap user namespaces are EPERM inside any
-      # container on this host) run in the hosted-suite job when billing returns.
-      - run: cargo test --locked -- --skip guarddog_report_is_complete --skip invalid_json_report_is_partial --skip clean_command_reports_no_findings --skip package_scan_records_external_scanner_finding --skip docker_save_signature --skip cosign --skip registry_manifest --skip oci_signature --skip whiteout --skip symlink_and_hardlink --skip insecure_npm_tarball
+      # Sandbox-dependent tests carry #[ignore = "requires bubblewrap sandbox…"]
+      # so the plain run excludes them here; hosted-suite re-enables them.
+      - run: cargo test --locked
       - run: python3 -m unittest discover -s experiments -p 'test_*.py'
       - run: cargo clippy --locked --all-targets -- -D warnings
   hosted-suite:
@@ -37,8 +37,7 @@ jobs:
         with:
           toolchain: stable
           components: llvm-tools-preview
-      - run: cargo test --locked
-      - run: cargo test --locked docker_engine_cannot_pull_until_release -- --ignored
+      - run: cargo test --locked -- --include-ignored
       - run: cargo install cargo-llvm-cov --version 0.9.1 --locked
       - run: cargo llvm-cov --locked --fail-under-lines 85 --summary-only
   coverage:
@@ -55,7 +54,7 @@ jobs:
       # Sandbox-dependent engine code is unexercised without bubblewrap, so this
       # lane's floor tracks the no-sandbox baseline (measured 81.96% vs 82.52%
       # on macOS); the 85% repo floor applies on the hosted-suite job.
-      - run: cargo llvm-cov --locked --fail-under-lines 81 --summary-only -- --skip guarddog_report_is_complete --skip invalid_json_report_is_partial --skip clean_command_reports_no_findings --skip package_scan_records_external_scanner_finding --skip docker_save_signature --skip cosign --skip registry_manifest --skip oci_signature --skip whiteout --skip symlink_and_hardlink --skip insecure_npm_tarball
+      - run: cargo llvm-cov --locked --fail-under-lines 81 --summary-only
   registry-e2e:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: [self-hosted, supply-core-linux]
