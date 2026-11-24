@@ -1904,6 +1904,7 @@ mod cli_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "requires bubblewrap sandbox; unavailable in the supply-core-runner container"]
     fn package_scan_records_external_scanner_finding() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
 

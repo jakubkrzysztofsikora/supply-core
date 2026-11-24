@@ -537,6 +537,7 @@ fn engine_report<'a>(report: &'a Value, source: &str) -> Result<&'a Value> {
 
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "requires bubblewrap sandbox; unavailable in the supply-core-runner container"]
 fn scan_image_accepts_docker_save_signature_equivalence_with_successful_engines() -> Result<()> {
     let layer = tar_bytes(&[("usr/share/fixture.txt", b"signature fixture")])?;
     let fixture = docker_save_fixture(&[("layer/layer.tar", &layer, &layer)], false)?;
@@ -630,6 +631,7 @@ fn scan_image_does_not_verify_signature_covering_one_of_several_images() -> Resu
 
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "requires bubblewrap sandbox; unavailable in the supply-core-runner container"]
 fn scan_image_keeps_compressed_docker_save_signature_equivalence_incomplete() -> Result<()> {
     let layer = tar_bytes(&[("usr/share/fixture.txt", b"compressed signature fixture")])?;
     let fixture = docker_save_fixture(&[("layer/layer.tar", &layer, &layer)], false)?;
@@ -748,6 +750,7 @@ fn scan_image_keeps_cosign_verification_failure_incomplete() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "requires bubblewrap sandbox; unavailable in the supply-core-runner container"]
 fn scan_image_rejects_registry_manifest_digest_mismatch() -> Result<()> {
     let layer = tar_bytes(&[("usr/share/fixture.txt", b"digest mismatch")])?;
     let fixture = docker_save_fixture(&[("layer/layer.tar", &layer, &layer)], false)?;
@@ -772,6 +775,7 @@ fn scan_image_rejects_registry_manifest_digest_mismatch() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "requires bubblewrap sandbox; unavailable in the supply-core-runner container"]
 fn scan_image_rejects_docker_save_signature_with_config_mismatch() -> Result<()> {
     let layer = tar_bytes(&[("usr/share/fixture.txt", b"config mismatch")])?;
     let fixture = docker_save_fixture(&[("layer/layer.tar", &layer, &layer)], false)?;
@@ -796,6 +800,7 @@ fn scan_image_rejects_docker_save_signature_with_config_mismatch() -> Result<()>
 
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "requires bubblewrap sandbox; unavailable in the supply-core-runner container"]
 fn scan_image_rejects_docker_save_signature_with_layer_order_mismatch() -> Result<()> {
     let first = tar_bytes(&[("usr/share/first.txt", b"first layer")])?;
     let second = tar_bytes(&[("usr/share/second.txt", b"second layer")])?;
@@ -827,6 +832,7 @@ fn scan_image_rejects_docker_save_signature_with_layer_order_mismatch() -> Resul
 
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "requires bubblewrap sandbox; unavailable in the supply-core-runner container"]
 fn scan_image_rejects_malformed_registry_manifest_output() -> Result<()> {
     let layer = tar_bytes(&[("usr/share/fixture.txt", b"malformed manifest")])?;
     let fixture = docker_save_fixture(&[("layer/layer.tar", &layer, &layer)], false)?;
@@ -874,6 +880,7 @@ fn scan_image_rejects_malformed_cosign_output() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "requires bubblewrap sandbox; unavailable in the supply-core-runner container"]
 fn scan_image_verifies_oci_signature_against_compressed_layer_evidence() -> Result<()> {
     let layer = tar_bytes(&[("usr/share/fixture.txt", b"OCI signature fixture")])?;
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
@@ -912,6 +919,7 @@ fn scan_image_verifies_oci_signature_against_compressed_layer_evidence() -> Resu
 
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "requires bubblewrap sandbox; unavailable in the supply-core-runner container"]
 fn scan_image_scans_oci_whiteouted_lower_layer_file() -> Result<()> {
     let lower = tar_bytes(&[("usr/share/obsolete.txt", b"deleted but present")])?;
     let upper = tar_bytes(&[
@@ -950,6 +958,7 @@ fn scan_image_scans_oci_whiteouted_lower_layer_file() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "requires bubblewrap sandbox; unavailable in the supply-core-runner container"]
 fn scan_image_accepts_safe_symlink_and_hardlink_members() -> Result<()> {
     let layer = tar_layer_with_links()?;
     let fixture = docker_save_fixture(&[("layer/layer.tar", &layer, &layer)], false)?;

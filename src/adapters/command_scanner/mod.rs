@@ -3303,6 +3303,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "requires bubblewrap sandbox; unavailable in the supply-core-runner container"]
     fn guarddog_report_is_complete_only_with_attested_revision() {
         let (_directory, path) = script(
             r#"cat <<'EOF'
@@ -3333,6 +3334,7 @@ EOF"#,
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "requires bubblewrap sandbox; unavailable in the supply-core-runner container"]
     fn invalid_json_report_is_partial() {
         let (_directory, path) = script("echo not-json");
         let scanner = CommandScanner::new(dispatcher(), "guarddog");
@@ -3343,6 +3345,7 @@ EOF"#,
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "requires bubblewrap sandbox; unavailable in the supply-core-runner container"]
     fn clean_command_reports_no_findings_without_attesting_engine_revision() {
         let (_directory, path) = script(
             r#"cat <<'EOF'
