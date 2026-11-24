@@ -37,7 +37,7 @@ Steps (each is an assertion in `tests/e2e_npm.rs`):
 5. **Denylist → Block** — denied package with frozen copy available →
    `Decision::Block` (denylist must never serve).
 
-## 0-day simulation (`zero_day_update_quarantined_tamper_blocked`)
+## 0-day simulation (`e2e_zero_day_update_quarantined_tamper_blocked`)
 
 Models the CVE-less attack window from the feasibility research: a
 malicious version lands, no advisory exists yet, so the vulnerability

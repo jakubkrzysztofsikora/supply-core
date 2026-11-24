@@ -73,7 +73,7 @@ fn fixture(registry: &HttpNpmRegistry) -> Result<PackageVersion> {
 /// verified freeze → quarantine fallback → denylist block.
 #[test]
 #[ignore = "hits registry.npmjs.org"]
-fn left_pad_end_to_end() -> Result<()> {
+fn e2e_left_pad_end_to_end() -> Result<()> {
     let name = "left-pad";
     let version = PackageVersionId::parse(&Ecosystem::Npm, "1.3.0")?;
     let registry = HttpNpmRegistry::new()?;
@@ -167,7 +167,7 @@ fn left_pad_end_to_end() -> Result<()> {
 /// must hard-block.
 #[test]
 #[ignore = "hits registry.npmjs.org"]
-fn zero_day_update_quarantined_tamper_blocked() -> Result<()> {
+fn e2e_zero_day_update_quarantined_tamper_blocked() -> Result<()> {
     let registry = HttpNpmRegistry::new()?;
     let known_good = fixture(&registry)?;
 
@@ -299,7 +299,7 @@ fn zero_day_update_quarantined_tamper_blocked() -> Result<()> {
 /// rejected against the frozen ledger.
 #[test]
 #[ignore = "hits registry.npmjs.org"]
-fn same_version_republish_detected() -> Result<()> {
+fn e2e_same_version_republish_detected() -> Result<()> {
     let registry = HttpNpmRegistry::new()?;
     let pv = fixture(&registry)?;
 

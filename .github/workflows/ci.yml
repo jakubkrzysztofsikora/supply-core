@@ -37,9 +37,11 @@ jobs:
         with:
           toolchain: stable
           components: llvm-tools-preview
-      - run: cargo test --locked -- --include-ignored
+      - run: cargo test --locked -- --include-ignored --skip e2e_
       - run: cargo install cargo-llvm-cov --version 0.9.1 --locked
-      - run: cargo llvm-cov --locked --fail-under-lines 85 --summary-only
+      # --include-ignored keeps the 85% floor calibrated on the full suite
+      # (sandbox tests included); e2e_ npm tests stay schedule-only.
+      - run: cargo llvm-cov --locked --fail-under-lines 85 --summary-only -- --include-ignored --skip e2e_
   coverage:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork != true
     runs-on: [self-hosted, supply-core-linux]
