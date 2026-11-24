@@ -36,6 +36,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
         with:
           toolchain: stable
+          components: llvm-tools-preview
       - run: cargo test --locked
       - run: cargo test --locked docker_engine_cannot_pull_until_release -- --ignored
       - run: cargo install cargo-llvm-cov --version 0.9.1 --locked
