@@ -29,7 +29,10 @@ spec:
         # Secret projections are root-owned symlinks (unreadable by the app's
         # regular-file reader); copy them into a private emptyDir as real
         # owner-readable files.
-        command: ["sh", "-ec", "mkdir -p /app/artifacts/detonations /run/detonation-secrets && cp -L /app/secrets-src/detonation-ingest-token /app/secrets-src/detonation-ingest-keys.json /run/detonation-secrets/ && chown supply:supply /app/docker-mirror /app/artifacts/detonations /run/detonation-secrets /run/detonation-secrets/detonation-ingest-token /run/detonation-secrets/detonation-ingest-keys.json && chmod 700 /app/docker-mirror /app/artifacts/detonations /run/detonation-secrets && chmod 600 /run/detonation-secrets/detonation-ingest-token /run/detonation-secrets/detonation-ingest-keys.json"]
+        # /app/artifacts/detonations is pre-created world-writable on the NFS
+        # server: root-squash makes chown from the pod fail and uid 1000 must
+        # be able to write it.
+        command: ["sh", "-ec", "mkdir -p /run/detonation-secrets && cp -L /app/secrets-src/detonation-ingest-token /app/secrets-src/detonation-ingest-keys.json /run/detonation-secrets/ && chown supply:supply /app/docker-mirror /run/detonation-secrets /run/detonation-secrets/detonation-ingest-token /run/detonation-secrets/detonation-ingest-keys.json && chmod 700 /app/docker-mirror /run/detonation-secrets && chmod 600 /run/detonation-secrets/detonation-ingest-token /run/detonation-secrets/detonation-ingest-keys.json"]
         securityContext:
           runAsUser: 0
           allowPrivilegeEscalation: false
