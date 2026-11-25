@@ -1220,6 +1220,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn occupancy_refresh_survives_caller_cancellation_with_single_flight() {
+        let store = tempfile::tempdir().unwrap_or_else(|_| panic!("tempdir"));
+        let root = store.path().to_owned();
+        let walk_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let release =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let count_for_walker = walk_count.clone();
+        let release_for_walker = release.clone();
+        *detonations::OCCUPANCY_WALKER_OVERRIDE
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Some((
+            root.clone(),
+            std::sync::Arc::new(move |_path| {
+                count_for_walker.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (flag, condvar) = &*release_for_walker;
+                let mut released = flag.lock().unwrap_or_else(|error| error.into_inner());
+                while !*released {
+                    released = condvar
+                        .wait(released)
+                        .unwrap_or_else(|error| error.into_inner());
+                }
+                Ok(detonations::StoreOccupancy {
+                    used_bytes: 7,
+                    limit_bytes: 100,
+                    pending_bytes: 0,
+                    pending_runs: 0,
+                })
+            }),
+        ));
+
+        let first = tokio::spawn(detonations::cached_occupancy(root.clone()));
+        let mut waited = 0_u32;
+        while walk_count.load(std::sync::atomic::Ordering::SeqCst) == 0 && waited < 2_000 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            waited += 5;
+        }
+        assert_eq!(
+            walk_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "walker should have started exactly once"
+        );
+
+        first.abort();
+        let _ = first.await;
+
+        let second = tokio::spawn(detonations::cached_occupancy(root.clone()));
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            assert_eq!(
+                walk_count.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "caller cancellation must not start a second walk"
+            );
+        }
+
+        let (flag, condvar) = &*release;
+        *flag.lock().unwrap_or_else(|error| error.into_inner()) = true;
+        condvar.notify_all();
+        let occupancy = second
+            .await
+            .unwrap_or_else(|_| panic!("join"))
+            .unwrap_or_else(|_| panic!("occupancy"));
+        assert_eq!(occupancy.used_bytes, 7);
+        assert_eq!(walk_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        *detonations::OCCUPANCY_WALKER_OVERRIDE
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+    }
+
+    #[tokio::test]
     async fn test_public_status_page_and_diagnostics() {
         let app = app();
 

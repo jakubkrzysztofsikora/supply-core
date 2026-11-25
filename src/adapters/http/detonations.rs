@@ -1215,23 +1215,103 @@ pub(crate) fn occupancy_status(used_bytes: u64, limit_bytes: u64) -> &'static st
 }
 
 const OCCUPANCY_TTL: Duration = Duration::from_secs(5);
-static OCCUPANCY_CACHE: OnceLock<tokio::sync::Mutex<HashMap<PathBuf, (Instant, StoreOccupancy)>>> =
+
+struct OccupancyEntry {
+    value: Option<(Instant, StoreOccupancy)>,
+    inflight: Option<tokio::sync::watch::Receiver<Option<Result<StoreOccupancy, String>>>>,
+}
+
+static OCCUPANCY_CACHE: OnceLock<tokio::sync::Mutex<HashMap<PathBuf, OccupancyEntry>>> =
     OnceLock::new();
 
-pub(crate) async fn cached_occupancy(root: PathBuf) -> std::io::Result<StoreOccupancy> {
-    let cache = OCCUPANCY_CACHE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()));
-    let mut cached = cache.lock().await;
-    if let Some((refreshed_at, occupancy)) = cached.get(&root) {
-        if refreshed_at.elapsed() < OCCUPANCY_TTL {
-            return Ok(occupancy.clone());
+#[cfg(test)]
+type OccupancyWalker = Arc<dyn Fn(&Path) -> std::io::Result<StoreOccupancy> + Send + Sync>;
+
+#[cfg(test)]
+pub(crate) static OCCUPANCY_WALKER_OVERRIDE: std::sync::RwLock<Option<(PathBuf, OccupancyWalker)>> =
+    std::sync::RwLock::new(None);
+
+fn walk_store(root: &Path) -> std::io::Result<StoreOccupancy> {
+    #[cfg(test)]
+    {
+        let guard = OCCUPANCY_WALKER_OVERRIDE
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some((path, walker)) = guard.as_ref() {
+            if path == root {
+                return walker(root);
+            }
         }
     }
-    let walk_root = root.clone();
-    let occupancy = tokio::task::spawn_blocking(move || store_occupancy(&walk_root))
-        .await
-        .map_err(|error| std::io::Error::other(error.to_string()))??;
-    cached.insert(root, (Instant::now(), occupancy.clone()));
-    Ok(occupancy)
+    store_occupancy(root)
+}
+
+pub(crate) async fn cached_occupancy(root: PathBuf) -> std::io::Result<StoreOccupancy> {
+    let cache = OCCUPANCY_CACHE.get_or_init(Default::default);
+    loop {
+        let mut cached = cache.lock().await;
+        if let Some(entry) = cached.get_mut(&root) {
+            if let Some((refreshed_at, occupancy)) = &entry.value {
+                if refreshed_at.elapsed() < OCCUPANCY_TTL {
+                    return Ok(occupancy.clone());
+                }
+            }
+            if let Some(receiver) = entry.inflight.as_ref() {
+                let mut receiver = receiver.clone();
+                if receiver.borrow().is_none() {
+                    drop(cached);
+                    if receiver.changed().await.is_err() {
+                        let mut cached = cache.lock().await;
+                        if let Some(entry) = cached.get_mut(&root) {
+                            if entry
+                                .inflight
+                                .as_ref()
+                                .is_some_and(|current| current.same_channel(&receiver))
+                            {
+                                entry.inflight = None;
+                            }
+                        }
+                        return Err(std::io::Error::other("occupancy walker terminated"));
+                    }
+                }
+                return match receiver.borrow_and_update().clone() {
+                    Some(Ok(occupancy)) => Ok(occupancy),
+                    Some(Err(error)) => Err(std::io::Error::other(error)),
+                    None => continue,
+                };
+            }
+            let (sender, receiver) = tokio::sync::watch::channel(None);
+            entry.inflight = Some(receiver);
+            let walk_root = root.clone();
+            tokio::spawn(async move {
+                let block_root = walk_root.clone();
+                let result = tokio::task::spawn_blocking(move || walk_store(&block_root))
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|inner| inner.map_err(|error| error.to_string()));
+                let cache = OCCUPANCY_CACHE.get_or_init(Default::default);
+                let mut cached = cache.lock().await;
+                if let Some(entry) = cached.get_mut(&walk_root) {
+                    entry.inflight = None;
+                    if let Ok(occupancy) = &result {
+                        entry.value = Some((Instant::now(), occupancy.clone()));
+                    }
+                }
+                drop(cached);
+                sender.send_replace(Some(result));
+            });
+            drop(cached);
+            continue;
+        }
+        cached.insert(
+            root.clone(),
+            OccupancyEntry {
+                value: None,
+                inflight: None,
+            },
+        );
+        drop(cached);
+    }
 }
 
 fn stream_bytes(
