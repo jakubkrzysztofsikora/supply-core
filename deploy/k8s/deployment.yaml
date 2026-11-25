@@ -29,10 +29,9 @@ spec:
         # Secret projections are root-owned symlinks (unreadable by the app's
         # regular-file reader); copy them into a private emptyDir as real
         # owner-readable files.
-        # /app/artifacts/detonations is pre-created world-writable on the NFS
-        # server: root-squash makes chown from the pod fail and uid 1000 must
-        # be able to write it.
-        command: ["sh", "-ec", "mkdir -p /run/detonation-secrets && cp -L /app/secrets-src/detonation-ingest-token /app/secrets-src/detonation-ingest-keys.json /run/detonation-secrets/ && chown supply:supply /app/docker-mirror /run/detonation-secrets /run/detonation-secrets/detonation-ingest-token /run/detonation-secrets/detonation-ingest-keys.json && chmod 700 /app/docker-mirror /run/detonation-secrets && chmod 600 /run/detonation-secrets/detonation-ingest-token /run/detonation-secrets/detonation-ingest-keys.json"]
+        # /app/artifacts/detonations gets mode 0700 owned by 501 below, matching
+        # the store's private-directory requirement.
+        command: ["sh", "-ec", "mkdir -p /app/artifacts/detonations /run/detonation-secrets && cp -L /app/secrets-src/detonation-ingest-token /app/secrets-src/detonation-ingest-keys.json /run/detonation-secrets/ && chown 501:501 /app/docker-mirror /app/artifacts/detonations /run/detonation-secrets /run/detonation-secrets/detonation-ingest-token /run/detonation-secrets/detonation-ingest-keys.json && chmod 700 /app/docker-mirror /app/artifacts/detonations /run/detonation-secrets && chmod 600 /run/detonation-secrets/detonation-ingest-token /run/detonation-secrets/detonation-ingest-keys.json"]
         securityContext:
           runAsUser: 0
           allowPrivilegeEscalation: false
@@ -83,8 +82,11 @@ spec:
           value: "127.0.0.1"
         securityContext:
           runAsNonRoot: true
-          runAsUser: 1000
-          runAsGroup: 1000
+          # uid/gid 501 = the NFS export owner on the Studio: the detonation
+          # store must be mode 0700, and root-squash maps pod root to 501, so
+          # ownership has to be 501 end to end.
+          runAsUser: 501
+          runAsGroup: 501
           seccompProfile:
             type: RuntimeDefault
         volumeMounts:
