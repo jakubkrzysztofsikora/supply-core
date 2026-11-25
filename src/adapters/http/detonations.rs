@@ -45,7 +45,7 @@ const TOKEN_FILE_LIMIT_BYTES: u64 = 8 * 1024;
 const INGEST_TIMEOUT: Duration = Duration::from_secs(60);
 const STALE_STAGE_AGE: Duration = Duration::from_secs(60 * 60);
 static INGEST_SLOTS: Semaphore = Semaphore::const_new(4);
-static PUBLIC_READ_SLOTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(1)));
+static PUBLIC_READ_SLOTS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(8)));
 static PUBLISH_LOCK: Mutex<()> = Mutex::new(());
 static STALE_CLEANUP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -170,7 +170,7 @@ async fn list_runs(
     };
     let runs = match read_blocking(move || {
         let root = configured_store(&state, false)?;
-        read_all_bundles(&root).map_err(|_| {
+        read_all_manifests(&root).map_err(|_| {
             api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "detonation store unavailable",
@@ -184,15 +184,15 @@ async fn list_runs(
     };
     let mut summaries = runs
         .iter()
-        .map(|bundle| RunSummary {
-            run_id: bundle.manifest.run_id,
-            ecosystem: bundle.manifest.ecosystem.clone(),
-            package_name: bundle.manifest.package_name.clone(),
-            package_version: bundle.manifest.package_version.clone(),
-            state: state_name(bundle.manifest.state),
-            ended_at_unix_ms: bundle.manifest.ended_at_unix_ms,
-            event_count: bundle.manifest.event_count,
-            redaction_count: bundle.manifest.redaction_count,
+        .map(|manifest| RunSummary {
+            run_id: manifest.run_id,
+            ecosystem: manifest.ecosystem.clone(),
+            package_name: manifest.package_name.clone(),
+            package_version: manifest.package_version.clone(),
+            state: state_name(manifest.state),
+            ended_at_unix_ms: manifest.ended_at_unix_ms,
+            event_count: manifest.event_count,
+            redaction_count: manifest.redaction_count,
         })
         .collect::<Vec<_>>();
     summaries.sort_by(|left, right| {
@@ -631,7 +631,7 @@ async fn receive_bundle(
     Ok((staged, bytes))
 }
 
-fn validate_bundle(
+fn verify_bundle(
     bytes: &[u8],
     id: RunId,
     keys: &HashMap<String, Vec<u8>>,
@@ -649,6 +649,19 @@ fn validate_bundle(
         return Err(StatusCode::UNAUTHORIZED);
     }
     validate_manifest(&parsed.manifest, &parsed.events, id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    Ok(parsed)
+}
+
+/// Ingest-side check: re-runs the redactor over the submitted content. The
+/// read path deliberately skips this (content is HMAC-covered and redaction
+/// was enforced here at publish time); re-running it per anonymous read is a
+/// CPU-amplification DoS.
+fn validate_bundle(
+    bytes: &[u8],
+    id: RunId,
+    keys: &HashMap<String, Vec<u8>>,
+) -> Result<ParsedBundle, StatusCode> {
+    let parsed = verify_bundle(bytes, id, keys)?;
     validate_redaction(&parsed.events).map_err(|_| StatusCode::BAD_REQUEST)?;
     Ok(parsed)
 }
@@ -830,7 +843,9 @@ fn validate_redaction(events: &[PublicEvent]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn read_all_bundles(root: &Path) -> Result<Vec<ParsedBundle>, ()> {
+fn read_all_manifests(root: &Path) -> Result<Vec<BundleManifest>, ()> {
+    // Manifests only: verified bundles' events are dropped here so a listing
+    // never materializes the whole store in memory (the store cap is 256 MiB).
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -853,7 +868,7 @@ fn read_all_bundles(root: &Path) -> Result<Vec<ParsedBundle>, ()> {
         }
         let current_keys = keys.as_ref().ok_or(())?;
         if let Some(bundle) = read_bundle(root, id, current_keys)? {
-            output.push(bundle);
+            output.push(bundle.manifest);
         }
     }
     Ok(output)
@@ -892,7 +907,7 @@ fn read_bundle(
     {
         return Err(());
     }
-    match validate_bundle(&bytes, id, keys) {
+    match verify_bundle(&bytes, id, keys) {
         Ok(bundle)
             if bundle.manifest.projection_version == PROJECTION_VERSION
                 && redaction_policy_matches(bundle.manifest.redaction_policy_version)

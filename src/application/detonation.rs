@@ -4,6 +4,61 @@ use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use std::{collections::HashMap, fmt, str::FromStr};
 
 pub const REDACTION_POLICY_VERSION: u32 = 1;
+pub(crate) const TERMINAL_ESCAPE_PATTERN: &str =
+    r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))";
+pub(crate) const REDACTION_RULE_DEFINITIONS: [(&str, &str, &str); 9] = [
+    (
+        r"(?i)[A-Za-z][A-Za-z0-9+.-]*://(?P<secret>[^/\s?#@]+@)",
+        "",
+        "url_userinfo",
+    ),
+    (
+        r"(?i)\bauthorization\s*:\s*(?:bearer|basic)\s+(?P<secret>[A-Za-z0-9._~+/=-]+)",
+        "[REDACTED]",
+        "authorization_token",
+    ),
+    (
+        r"(?i)\bauthorization\s*=\s*(?:bearer\s+|basic\s+)?(?P<secret>[^,\s;]+)",
+        "[REDACTED]",
+        "authorization_token",
+    ),
+    (
+        concat!(
+            r"(?i)(?:\b|_)(?:api[_-]?(?:key|token)|access[_-]?(?:token|key)|",
+            r"refresh[_-]?token|auth[_-]?token|token|secret[_-]?key|secret|",
+            r"password|passwd|credential|client[_-]?secret|private[_-]?key|",
+            r"aws[_-]?secret[_-]?access[_-]?key|secret[_-]?access[_-]?key)\b",
+            r#"\s*[:=]\s*["']?(?P<secret>[^"'\s,;]+)"#
+        ),
+        "[REDACTED]",
+        "credential_value",
+    ),
+    (
+        r"\b(?P<secret>AKIA[0-9A-Z]{16})\b",
+        "[REDACTED]",
+        "aws_access_key",
+    ),
+    (
+        r"\b(?P<secret>gh[pousr]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,})\b",
+        "[REDACTED]",
+        "github_token",
+    ),
+    (
+        r"\b(?P<secret>eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})\b",
+        "[REDACTED]",
+        "jwt",
+    ),
+    (
+        r"(?s)(?P<secret>-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----.*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)",
+        "[REDACTED]",
+        "private_key",
+    ),
+    (
+        r"(?:/Users/|/home/)(?P<secret>[^/\s]+)",
+        "[REDACTED]",
+        "home_directory",
+    ),
+];
 pub const MAX_FIELD_BYTES: usize = 8 * 1024;
 pub const MAX_STDOUT_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_STDERR_BYTES: usize = 1536 * 1024;
@@ -438,60 +493,7 @@ pub struct RedactionStream {
 
 impl Redactor {
     pub fn new() -> Result<Self> {
-        let definitions = [
-            (
-                r"(?i)[A-Za-z][A-Za-z0-9+.-]*://(?P<secret>[^/\s?#@]+@)",
-                "",
-                "url_userinfo",
-            ),
-            (
-                r"(?i)\bauthorization\s*:\s*(?:bearer|basic)\s+(?P<secret>[A-Za-z0-9._~+/=-]+)",
-                "[REDACTED]",
-                "authorization_token",
-            ),
-            (
-                r"(?i)\bauthorization\s*=\s*(?:bearer\s+|basic\s+)?(?P<secret>[^,\s;]+)",
-                "[REDACTED]",
-                "authorization_token",
-            ),
-            (
-                concat!(
-                    r"(?i)(?:\b|_)(?:api[_-]?(?:key|token)|access[_-]?(?:token|key)|",
-                    r"refresh[_-]?token|auth[_-]?token|token|secret[_-]?key|secret|",
-                    r"password|passwd|credential|client[_-]?secret|private[_-]?key|",
-                    r"aws[_-]?secret[_-]?access[_-]?key|secret[_-]?access[_-]?key)\b",
-                    r#"\s*[:=]\s*["']?(?P<secret>[^"'\s,;]+)"#
-                ),
-                "[REDACTED]",
-                "credential_value",
-            ),
-            (
-                r"\b(?P<secret>AKIA[0-9A-Z]{16})\b",
-                "[REDACTED]",
-                "aws_access_key",
-            ),
-            (
-                r"\b(?P<secret>gh[pousr]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,})\b",
-                "[REDACTED]",
-                "github_token",
-            ),
-            (
-                r"\b(?P<secret>eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})\b",
-                "[REDACTED]",
-                "jwt",
-            ),
-            (
-                r"(?s)(?P<secret>-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----.*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)",
-                "[REDACTED]",
-                "private_key",
-            ),
-            (
-                r"(?:/Users/|/home/)(?P<secret>[^/\s]+)",
-                "[REDACTED]",
-                "home_directory",
-            ),
-        ];
-        let rules = definitions
+        let rules = REDACTION_RULE_DEFINITIONS
             .into_iter()
             .map(|(pattern, replacement, marker)| {
                 Ok(RedactionRule {
@@ -503,7 +505,7 @@ impl Redactor {
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             rules,
-            terminal_escape: Regex::new(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")?,
+            terminal_escape: Regex::new(TERMINAL_ESCAPE_PATTERN)?,
         })
     }
 

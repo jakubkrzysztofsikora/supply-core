@@ -275,7 +275,10 @@ fn check_auth(state: &ServerConfig, headers: &HeaderMap) -> Result<(), (StatusCo
     let token_match = match auth_header {
         Some(val) if val.starts_with("Bearer ") => {
             let token = val.trim_start_matches("Bearer ").trim();
-            token == expected_token
+            crate::adapters::detonation::constant_time_eq(
+                token.as_bytes(),
+                expected_token.as_bytes(),
+            )
         }
         _ => false,
     };

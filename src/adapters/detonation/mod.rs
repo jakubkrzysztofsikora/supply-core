@@ -1,5 +1,6 @@
 use crate::application::detonation::{
     Coverage, EventKind, Phase, PublicEvent, RunId, RunState, Sensor, REDACTION_POLICY_VERSION,
+    REDACTION_RULE_DEFINITIONS, TERMINAL_ESCAPE_PATTERN,
 };
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -69,9 +70,19 @@ pub(crate) struct ParsedBundle {
 }
 
 pub fn redactor_build_sha256() -> String {
-    hex::encode(Sha256::digest(include_bytes!(
-        "../../application/detonation.rs"
-    )))
+    let mut input = Vec::with_capacity(2048);
+    input.extend_from_slice(&REDACTION_POLICY_VERSION.to_le_bytes());
+    input.extend_from_slice(TERMINAL_ESCAPE_PATTERN.as_bytes());
+    input.push(0);
+    for (pattern, replacement, marker) in REDACTION_RULE_DEFINITIONS {
+        input.extend_from_slice(pattern.as_bytes());
+        input.push(0);
+        input.extend_from_slice(replacement.as_bytes());
+        input.push(0);
+        input.extend_from_slice(marker.as_bytes());
+        input.push(0);
+    }
+    hex::encode(Sha256::digest(&input))
 }
 
 pub fn encode_public_bundle(

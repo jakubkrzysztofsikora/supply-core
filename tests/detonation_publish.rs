@@ -531,13 +531,15 @@ async fn sealed_digest_conflict_is_not_reuploaded() {
         start_contract_fixture_with_digest(StatusCode::CREATED, Some("00".repeat(32))).await;
     let target = format!("http://{address}");
 
+    // First cycle: conflict persists the marker and skips the entry.
     assert!(publish_pending(&target, &token, &evidence_dir, true)
         .await
-        .is_err());
+        .is_ok());
     assert!(pending.is_file());
+    // Later cycles skip the same-digest marker without uploading or failing.
     assert!(publish_pending(&target, &token, &evidence_dir, true)
         .await
-        .is_err());
+        .is_ok());
 
     assert_eq!(observed_requests(&fixture), 1);
     assert!(pending.is_file());
@@ -589,17 +591,84 @@ async fn real_run_id_conflict_is_not_uploaded_again() {
     let target = format!("http://{address}");
     assert!(publish_pending(&target, &token, &evidence_dir, true)
         .await
-        .is_err());
+        .is_ok());
     assert_eq!(request_count.load(Ordering::SeqCst), 2);
     assert!(pending.is_file());
 
-    let error = publish_pending(&target, &token, &evidence_dir, true)
+    // Marker skip: the conflicted bundle is never re-uploaded, batch stays green.
+    assert!(publish_pending(&target, &token, &evidence_dir, true)
         .await
-        .err()
-        .unwrap_or_else(|| panic!("conflicted run remains terminal"));
+        .is_ok());
     assert_eq!(request_count.load(Ordering::SeqCst), 2);
-    assert!(format!("{error:#}").contains("conflict"));
     assert!(pending.is_file());
+    server.abort();
+}
+
+#[tokio::test]
+async fn healthy_run_publishes_alongside_conflicted_run() {
+    let directory = tempfile::tempdir().unwrap_or_else(|_| panic!("tempdir"));
+    let conflicted_id = evidence(directory.path());
+    let healthy_id = evidence(directory.path());
+    let (keys, token) = write_key_files(directory.path());
+    let _env = EnvGuard::enabled(&keys);
+    let evidence_dir = directory.path().join("evidence");
+    let pending_dir = evidence_dir.join(".detonation-pending");
+    let conflicted_pending = pending_dir.join(format!("{conflicted_id}.bundle"));
+    let healthy_pending = pending_dir.join(format!("{healthy_id}.bundle"));
+
+    // Stage both pending bundles via an unreachable target.
+    let unused = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap_or_else(|_| panic!("reserve unused publisher port"));
+    let unused_address = unused
+        .local_addr()
+        .unwrap_or_else(|_| panic!("unused publisher address"));
+    drop(unused);
+    assert!(publish_pending(
+        &format!("http://{unused_address}"),
+        &token,
+        &evidence_dir,
+        true,
+    )
+    .await
+    .is_err());
+    let original =
+        fs::read(&conflicted_pending).unwrap_or_else(|_| panic!("read conflicted pending bundle"));
+
+    let (address, request_count, server) = start_counted_server(directory.path()).await;
+    reqwest::Client::new()
+        .put(format!(
+            "http://{address}/api/v1/detonations/{conflicted_id}"
+        ))
+        .header(reqwest::header::AUTHORIZATION, "Bearer test-token")
+        .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
+        .body(changed_bundle(&original))
+        .send()
+        .await
+        .unwrap_or_else(|_| panic!("seed conflicting server content"));
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
+    let target = format!("http://{address}");
+
+    // Cycle 1: conflicted run 409s into a marker; healthy run publishes.
+    assert_eq!(
+        publish_pending(&target, &token, &evidence_dir, true)
+            .await
+            .unwrap_or_else(|_| panic!("healthy run publishes past conflict")),
+        1
+    );
+    assert_eq!(request_count.load(Ordering::SeqCst), 3);
+    assert!(conflicted_pending.is_file());
+    assert!(!healthy_pending.exists());
+
+    // Cycle 2: marker skips the conflicted run; healthy run needs no upload.
+    assert_eq!(
+        publish_pending(&target, &token, &evidence_dir, true)
+            .await
+            .unwrap_or_else(|_| panic!("marker skip keeps the cycle green")),
+        0
+    );
+    assert_eq!(request_count.load(Ordering::SeqCst), 3);
+    assert!(conflicted_pending.is_file());
     server.abort();
 }
 

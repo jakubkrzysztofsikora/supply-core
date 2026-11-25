@@ -145,10 +145,9 @@ pub async fn publish_pending(
             continue;
         }
         if let Some(marker) = read_conflict_marker(&pending_dir, endpoint_identity, id)? {
-            ensure!(
-                marker.bundle_sha256 != bundle_sha256,
-                "pending bundle conflicts with durable server conflict marker"
-            );
+            if marker.bundle_sha256 == bundle_sha256 {
+                continue;
+            }
             fs::remove_file(conflict_marker_path(&pending_dir, endpoint_identity, id))
                 .context("clear stale detonation conflict marker")?;
             sync_directory(&pending_dir)?;
@@ -163,7 +162,10 @@ pub async fn publish_pending(
             }
             UploadOutcome::Conflict(bundle_sha256) => {
                 persist_conflict_marker(&pending_dir, endpoint_identity, id, &bundle_sha256)?;
-                bail!("detonation run {id} conflicts with existing server content");
+                eprintln!(
+                    "detonation run {id} conflicts with existing server content; skipping it and continuing"
+                );
+                continue;
             }
         }
     }
