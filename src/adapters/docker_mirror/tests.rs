@@ -1,5 +1,7 @@
 use super::*;
-use axum::{body::to_bytes, extract::Path as AxumPath, routing::get};
+use axum::{
+    body::to_bytes, extract::connect_info::MockConnectInfo, extract::Path as AxumPath, routing::get,
+};
 use std::{
     collections::HashMap,
     sync::atomic::{AtomicUsize, Ordering},
@@ -913,5 +915,88 @@ async fn failed_scan_removes_pending_image_and_tag() -> anyhow::Result<()> {
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert_eq!(pending, 0);
     assert_eq!(tags, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn first_scan_admission_limits_per_ip() -> anyhow::Result<()> {
+    let (upstream, task) = Registry::default().serve().await?;
+    let dir = tempfile::tempdir()?;
+    let mirror = mirror(dir.path(), upstream, Arc::new(|_| Ok(Verdict::Clean)))?;
+    let attacker: IpAddr = "203.0.113.10".parse()?;
+    let other: IpAddr = "198.51.100.20".parse()?;
+    for _ in 0..FIRST_SCANS_PER_IP {
+        assert!(mirror.admit_first_scan(Some(attacker)));
+    }
+    assert!(!mirror.admit_first_scan(Some(attacker)));
+    assert!(mirror.admit_first_scan(Some(other)));
+    assert!(mirror.admit_first_scan(None));
+    task.abort();
+    Ok(())
+}
+
+#[test]
+fn client_peer_trusts_forwarded_only_from_loopback() {
+    let loopback = SocketAddr::from(([127, 0, 0, 1], 40000));
+    assert_eq!(
+        Mirror::client_peer(
+            Some(SocketAddr::from(([100, 64, 15, 9], 40000))),
+            Some(&header::HeaderValue::from_static("9.9.9.9, 100.64.15.1")),
+        ),
+        Some(IpAddr::from([100, 64, 15, 9])),
+        "direct peers must not trust spoofable forwarded headers"
+    );
+    assert_eq!(
+        Mirror::client_peer(
+            Some(loopback),
+            Some(&header::HeaderValue::from_static("9.9.9.9, 100.64.15.1")),
+        ),
+        Some(IpAddr::from([100, 64, 15, 1])),
+        "proxied loopback requests take the funnel-observed client IP"
+    );
+    assert_eq!(
+        Mirror::client_peer(
+            Some(loopback),
+            Some(&header::HeaderValue::from_static("not-an-ip")),
+        ),
+        None
+    );
+    assert_eq!(Mirror::client_peer(Some(loopback), None), None);
+    assert_eq!(Mirror::client_peer(None, None), None);
+}
+
+#[tokio::test]
+async fn proxied_first_scan_admission_is_per_client_ip() -> anyhow::Result<()> {
+    let registry = Registry::default();
+    for tag in ["one", "two", "three", "four", "five"] {
+        let image = registry.image(tag)?;
+        registry.tag(tag, &image.hash)?;
+    }
+    let (upstream, task) = registry.serve().await?;
+    let dir = tempfile::tempdir()?;
+    let mirror = mirror(dir.path(), upstream, Arc::new(|_| Ok(Verdict::Clean)))?;
+    let app = router(Arc::clone(&mirror))
+        .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))));
+    let client_a = [("x-forwarded-for", "100.64.10.1")];
+    let client_b = [("x-forwarded-for", "100.64.10.2")];
+    for tag in ["one", "two", "three", "four"] {
+        let response = request(&app, Method::GET, &uri("manifests", tag), &client_a).await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "tag {tag} admitted but still quarantined"
+        );
+        finish_background(&mirror).await;
+    }
+    let denied = request(&app, Method::GET, &uri("manifests", "five"), &client_a).await?;
+    assert_eq!(denied.status(), StatusCode::TOO_MANY_REQUESTS);
+    let released = request(&app, Method::GET, &uri("manifests", "five"), &client_b).await?;
+    assert_eq!(
+        released.status(),
+        StatusCode::FORBIDDEN,
+        "a different proxied client keeps its own budget"
+    );
+    finish_background(&mirror).await;
+    task.abort();
     Ok(())
 }

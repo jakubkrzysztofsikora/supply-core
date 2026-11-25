@@ -838,6 +838,7 @@ async fn health_check(State(state): State<Arc<ServerConfig>>) -> Json<Value> {
     }))
 }
 
+#[allow(clippy::result_large_err)]
 async fn detailed_health(State(state): State<Arc<ServerConfig>>) -> Json<Value> {
     let mut document = json!({
         "status": "ok",
@@ -855,6 +856,46 @@ async fn detailed_health(State(state): State<Arc<ServerConfig>>) -> Json<Value> 
     });
     if let Some(domain) = &state.tailnet_domain {
         document["tailnet"] = json!(domain);
+    }
+    let occupancy = match state.detonation_public_store.as_deref() {
+        Some(root) => {
+            let root = root.to_owned();
+            Some(
+                detonations::read_blocking(move || {
+                    detonations::store_occupancy(&root).map_err(|_| {
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(json!({"error": "detonation store unavailable"})),
+                        )
+                            .into_response()
+                    })
+                })
+                .await,
+            )
+        }
+        None => None,
+    };
+    match occupancy {
+        Some(Ok(occupancy)) => {
+            let status = detonations::occupancy_status(occupancy.used_bytes, occupancy.limit_bytes);
+            if status == "full" {
+                document["status"] = json!("degraded");
+            }
+            document["detonation_store"] = json!({
+                "configured": true,
+                "status": status,
+                "used_bytes": occupancy.used_bytes,
+                "limit_bytes": occupancy.limit_bytes,
+                "pending_bytes": occupancy.pending_bytes,
+                "pending_runs": occupancy.pending_runs,
+            });
+        }
+        Some(Err(_)) => {
+            document["detonation_store"] = json!({ "configured": true, "status": "unavailable" });
+        }
+        None => {
+            document["detonation_store"] = json!({ "configured": false });
+        }
     }
     Json(document)
 }
@@ -1111,6 +1152,49 @@ mod tests {
         let document: serde_json::Value =
             serde_json::from_slice(&body).unwrap_or_else(|_| panic!("json"));
         assert_eq!(document["tailnet"], "example.ts.net");
+    }
+
+    #[tokio::test]
+    async fn detailed_health_reports_detonation_store_occupancy() {
+        let store = tempfile::tempdir().unwrap_or_else(|_| panic!("tempdir"));
+        let pending = store.path().join("pending");
+        std::fs::create_dir(&pending).unwrap_or_else(|_| panic!("pending dir"));
+        std::fs::write(pending.join("held.bundle"), b"held").unwrap_or_else(|_| panic!("write"));
+        std::fs::write(store.path().join("root.bundle"), b"root")
+            .unwrap_or_else(|_| panic!("write"));
+        let app = app_with_config(ServerConfig {
+            detonation_public_store: Some(store.path().to_owned()),
+            ..ServerConfig::default()
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .body(axum::body::Body::empty())
+                    .unwrap_or_else(|_| panic!("valid request")),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("request succeeds"));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap_or_else(|_| panic!("body"));
+        let document: serde_json::Value =
+            serde_json::from_slice(&body).unwrap_or_else(|_| panic!("json"));
+        assert_eq!(document["detonation_store"]["configured"], true);
+        assert_eq!(document["detonation_store"]["status"], "ok");
+        assert_eq!(document["detonation_store"]["used_bytes"], 8);
+        assert_eq!(document["detonation_store"]["limit_bytes"], 268_435_456);
+        assert_eq!(document["detonation_store"]["pending_bytes"], 4);
+        assert_eq!(document["detonation_store"]["pending_runs"], 1);
+        assert_eq!(document["status"], "ok");
+
+        let limit = 256 * 1024 * 1024;
+        assert_eq!(detonations::occupancy_status(limit, limit), "full");
+        assert_eq!(
+            detonations::occupancy_status(220 * 1024 * 1024, limit),
+            "degraded"
+        );
+        assert_eq!(detonations::occupancy_status(1024, limit), "ok");
     }
 
     #[tokio::test]

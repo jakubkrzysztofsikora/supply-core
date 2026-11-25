@@ -74,7 +74,7 @@ pub(crate) async fn route_gate(request: Request, next: Next) -> Response {
 }
 
 #[allow(clippy::result_large_err)]
-async fn read_blocking<T, F>(operation: F) -> Result<T, Response>
+pub(crate) async fn read_blocking<T, F>(operation: F) -> Result<T, Response>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T, Response> + Send + 'static,
@@ -1161,6 +1161,56 @@ fn store_size(root: &Path) -> std::io::Result<u64> {
         }
     }
     Ok(total)
+}
+
+pub(crate) struct StoreOccupancy {
+    pub used_bytes: u64,
+    pub limit_bytes: u64,
+    pub pending_bytes: u64,
+    pub pending_runs: u64,
+}
+
+pub(crate) fn store_occupancy(root: &Path) -> std::io::Result<StoreOccupancy> {
+    let mut pending_bytes = 0_u64;
+    let mut pending_runs = 0_u64;
+    match fs::read_dir(root.join("pending")) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                let metadata = fs::symlink_metadata(entry.path())?;
+                if metadata.file_type().is_file() {
+                    pending_bytes = pending_bytes.checked_add(metadata.len()).ok_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, "pending overflow")
+                    })?;
+                    if entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.ends_with(".bundle"))
+                    {
+                        pending_runs += 1;
+                    }
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    Ok(StoreOccupancy {
+        used_bytes: store_size(root)?,
+        limit_bytes: PUBLIC_STORE_LIMIT_BYTES,
+        pending_bytes,
+        pending_runs,
+    })
+}
+
+pub(crate) fn occupancy_status(used_bytes: u64, limit_bytes: u64) -> &'static str {
+    if used_bytes >= limit_bytes {
+        "full"
+    } else if used_bytes.saturating_mul(100) >= limit_bytes.saturating_mul(80) {
+        "degraded"
+    } else {
+        "ok"
+    }
 }
 
 fn stream_bytes(

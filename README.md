@@ -501,7 +501,13 @@ The mirror keeps up to 8192 tag aliases. At capacity, it skips new aliases witho
 
 The mirror accepts up to 8 GiB of content per image graph. The cache stores up
 to 20 GiB of image content and evicts the oldest scans as needed. Reserve
-additional space for databases, scan scratch, and incoming content. For a native installation run the server as an unprivileged Linux user
+additional space for databases, scan scratch, and incoming content.
+Starting a first scan of a never-cached image is rate limited to 4 images per
+client per hour. Direct connections use the socket peer address; requests
+proxied from a loopback peer (for example the Tailscale Funnel sidecar) use
+the last `X-Forwarded-For` entry, which that proxy sets. Requests without a
+usable client identity are exempt, so local probes keep working.
+For a native installation run the server as an unprivileged Linux user
 with Trivy, Bubblewrap, and unprivileged user namespaces available. The Compose
 configuration permits Bubblewrap to create its isolated scanner namespaces.
 If running the image directly, use `--init` and the Compose security options

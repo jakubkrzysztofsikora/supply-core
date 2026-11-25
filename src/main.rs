@@ -334,7 +334,8 @@ async fn main() -> Result<()> {
             let listener = tokio::net::TcpListener::bind(addr).await?;
             axum::serve(
                 listener,
-                app_with_policy(config, load_policy(policy.as_deref())?)?,
+                app_with_policy(config, load_policy(policy.as_deref())?)?
+                    .into_make_service_with_connect_info::<std::net::SocketAddr>(),
             )
             .await?;
         }

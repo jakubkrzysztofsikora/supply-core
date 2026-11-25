@@ -8,7 +8,7 @@ use crate::{
 };
 use axum::{
     body::Body,
-    extract::{OriginalUri, State},
+    extract::{ConnectInfo, OriginalUri, State},
     http::{header, HeaderMap, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::any,
@@ -20,9 +20,11 @@ use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::{HashMap, VecDeque},
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
+    sync::{Arc, Mutex as StdMutex},
+    time::{Duration, Instant},
 };
 use store::{Release, ScannedImage, Store};
 use tokio::{
@@ -41,6 +43,9 @@ const MANIFEST_TYPES: [&str; 4] = [
     "application/vnd.docker.distribution.manifest.v2+json",
 ];
 const API_VERSION: &str = "docker-distribution-api-version";
+const FIRST_SCANS_PER_IP: usize = 4;
+const FIRST_SCAN_WINDOW: Duration = Duration::from_secs(3600);
+const MAX_TRACKED_IPS: usize = 4096;
 
 pub struct Config {
     directory: PathBuf,
@@ -72,6 +77,7 @@ struct Mirror {
     upstream: Upstream,
     store: OnceCell<Store>,
     worker: Arc<Mutex<()>>,
+    first_scan_admission: StdMutex<HashMap<IpAddr, VecDeque<Instant>>>,
     policy_hash: String,
     #[cfg(test)]
     test_scan: Option<TestScan>,
@@ -94,10 +100,57 @@ impl Mirror {
             upstream,
             store: OnceCell::new(),
             worker: Arc::new(Mutex::new(())),
+            first_scan_admission: StdMutex::new(HashMap::new()),
             policy_hash,
             #[cfg(test)]
             test_scan: None,
         })
+    }
+
+    fn admit_first_scan(&self, peer: Option<IpAddr>) -> bool {
+        let Some(peer) = peer else {
+            return true;
+        };
+        let now = Instant::now();
+        let mut admission = self
+            .first_scan_admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if admission.len() >= MAX_TRACKED_IPS && !admission.contains_key(&peer) {
+            admission.retain(|_, window| {
+                window
+                    .back()
+                    .is_some_and(|seen| now.duration_since(*seen) < FIRST_SCAN_WINDOW)
+            });
+            if admission.len() >= MAX_TRACKED_IPS {
+                return false;
+            }
+        }
+        let window = admission.entry(peer).or_default();
+        window.retain(|seen| now.duration_since(*seen) < FIRST_SCAN_WINDOW);
+        if window.len() >= FIRST_SCANS_PER_IP {
+            return false;
+        }
+        window.push_back(now);
+        true
+    }
+
+    fn client_peer(
+        connect: Option<SocketAddr>,
+        forwarded: Option<&header::HeaderValue>,
+    ) -> Option<IpAddr> {
+        let connect = connect?;
+        if !connect.ip().is_loopback() {
+            return Some(connect.ip());
+        }
+        forwarded?
+            .to_str()
+            .ok()?
+            .rsplit(',')
+            .next()?
+            .trim()
+            .parse()
+            .ok()
     }
 
     async fn store(&self) -> Result<&Store> {
@@ -142,7 +195,12 @@ impl Mirror {
             .map_err(MirrorError::internal)
     }
 
-    async fn manifest(self: Arc<Self>, repo: String, reference: &str) -> Result<Release> {
+    async fn manifest(
+        self: Arc<Self>,
+        repo: String,
+        reference: &str,
+        peer: Option<IpAddr>,
+    ) -> Result<Release> {
         let store = self.store().await?;
         let tag = (!valid_digest(reference)).then_some(reference);
         if tag.is_none() {
@@ -167,7 +225,12 @@ impl Mirror {
             .map_err(MirrorError::internal)?
         {
             match Arc::clone(&self.worker).try_lock_owned() {
-                Ok(guard) => Some(guard),
+                Ok(guard) => {
+                    if !self.admit_first_scan(peer) {
+                        return Err(MirrorError::ScanRateLimited);
+                    }
+                    Some(guard)
+                }
                 Err(_) => {
                     if let Some(tag) = tag {
                         store
@@ -427,10 +490,15 @@ fn router(mirror: Arc<Mirror>) -> Router {
 async fn registry(
     State(mirror): State<Arc<Mirror>>,
     OriginalUri(uri): OriginalUri,
+    peer: Option<ConnectInfo<SocketAddr>>,
     method: Method,
     headers: HeaderMap,
 ) -> Response {
-    let mut response = match dispatch(mirror, &uri, &method, &headers).await {
+    let peer = Mirror::client_peer(
+        peer.map(|connect| connect.0),
+        headers.get("x-forwarded-for"),
+    );
+    let mut response = match dispatch(mirror, &uri, &method, &headers, peer).await {
         Ok(response) => response,
         Err(error) => {
             error.log();
@@ -452,6 +520,7 @@ async fn dispatch(
     uri: &Uri,
     method: &Method,
     headers: &HeaderMap,
+    peer: Option<IpAddr>,
 ) -> Result<Response> {
     if method != Method::GET && method != Method::HEAD {
         return Err(MirrorError::Unsupported);
@@ -483,7 +552,7 @@ async fn dispatch(
             if !valid_digest(reference) && !valid_tag(reference) {
                 return Err(MirrorError::ManifestUnknown);
             }
-            let release = mirror.manifest(repo, reference).await?;
+            let release = mirror.manifest(repo, reference, peer).await?;
             if !accepts(headers, &release.object.media_type) {
                 return Err(MirrorError::ManifestUnknown);
             }
@@ -738,6 +807,7 @@ enum MirrorError {
     ScanIncomplete,
     Busy,
     RateLimited,
+    ScanRateLimited,
     Internal(anyhow::Error),
     Invalid(anyhow::Error),
     Upstream(anyhow::Error),
@@ -833,6 +903,11 @@ impl MirrorError {
                 StatusCode::TOO_MANY_REQUESTS,
                 "TOOMANYREQUESTS",
                 "Docker Hub rate limit reached",
+            ),
+            Self::ScanRateLimited => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "TOOMANYREQUESTS",
+                "first-scan rate limit reached for this client",
             ),
             Self::Internal(_) => (
                 StatusCode::SERVICE_UNAVAILABLE,
