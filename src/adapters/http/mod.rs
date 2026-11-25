@@ -1221,11 +1221,20 @@ mod tests {
 
     #[tokio::test]
     async fn occupancy_refresh_survives_caller_cancellation_with_single_flight() {
+        struct ReleaseOnDrop(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                let (flag, condvar) = &*self.0;
+                *flag.lock().unwrap_or_else(|error| error.into_inner()) = true;
+                condvar.notify_all();
+            }
+        }
         let store = tempfile::tempdir().unwrap_or_else(|_| panic!("tempdir"));
         let root = store.path().to_owned();
         let walk_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let release =
             std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let _release_guard = ReleaseOnDrop(release.clone());
         let count_for_walker = walk_count.clone();
         let release_for_walker = release.clone();
         *detonations::OCCUPANCY_WALKER_OVERRIDE
