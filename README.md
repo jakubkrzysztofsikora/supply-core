@@ -355,7 +355,7 @@ server over the compose network. Captures land in `radar/data/`. Without the
   {
     "generated_at": "2026-11-15T08:32:00Z",
     "service": "supply-core",
-    "version": "0.5.0",
+    "version": "0.5.1",
     "health": {"status": "ok"},
     "quarantine": {
       "enabled": true,
