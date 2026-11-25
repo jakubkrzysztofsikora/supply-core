@@ -24,7 +24,7 @@ spec:
         effect: NoExecute
       initContainers:
       - name: docker-mirror-volume-owner
-        image: ghcr.io/jakubkrzysztofsikora/supply-core:v0.5.0@sha256:2a2f1cdf005eb2dc1f6684e2b074b857bcc99510b69a04fa3a6c7d8d04f11987
+        image: ghcr.io/jakubkrzysztofsikora/supply-core:v0.5.1@sha256:14d4b23b43b1546665c4a948fc66d6671d711739f1862b8ae452fb3cc4d2c9d5
         imagePullPolicy: IfNotPresent
         # Secret projections are root-owned symlinks (unreadable by the app's
         # regular-file reader); copy them into a private emptyDir as real
@@ -45,8 +45,9 @@ spec:
           mountPath: /run/detonation-secrets
       containers:
       - name: app
-        image: ghcr.io/jakubkrzysztofsikora/supply-core:v0.5.0@sha256:2a2f1cdf005eb2dc1f6684e2b074b857bcc99510b69a04fa3a6c7d8d04f11987
-        imagePullPolicy: Always
+        image: ghcr.io/jakubkrzysztofsikora/supply-core:v0.5.1@sha256:14d4b23b43b1546665c4a948fc66d6671d711739f1862b8ae452fb3cc4d2c9d5
+        # Nodes have no ghcr egress; image is imported into containerd per release.
+        imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 4873
           name: http
