@@ -29,9 +29,11 @@ spec:
         # Secret projections are root-owned symlinks (unreadable by the app's
         # regular-file reader); copy them into a private emptyDir as real
         # owner-readable files.
-        # /app/artifacts/detonations gets mode 0700 owned by 501 below, matching
-        # the store's private-directory requirement.
-        command: ["sh", "-ec", "mkdir -p /app/artifacts/detonations /run/detonation-secrets && cp -L /app/secrets-src/detonation-ingest-token /app/secrets-src/detonation-ingest-keys.json /run/detonation-secrets/ && chown 501:501 /app/docker-mirror /app/artifacts/detonations /run/detonation-secrets /run/detonation-secrets/detonation-ingest-token /run/detonation-secrets/detonation-ingest-keys.json && chmod 700 /app/docker-mirror /app/artifacts/detonations /run/detonation-secrets && chmod 600 /run/detonation-secrets/detonation-ingest-token /run/detonation-secrets/detonation-ingest-keys.json"]
+        # /app/artifacts/detonations is pre-created on the Studio NFS server as
+        # 0700 owned by uid 501. Pod root is NFS-squashed and cannot chown or
+        # chmod that directory, so the init container must not touch it; the
+        # app (uid 501) opens it directly.
+        command: ["sh", "-ec", "mkdir -p /run/detonation-secrets && cp -L /app/secrets-src/detonation-ingest-token /app/secrets-src/detonation-ingest-keys.json /run/detonation-secrets/ && chown 501:501 /app/docker-mirror /run/detonation-secrets /run/detonation-secrets/detonation-ingest-token /run/detonation-secrets/detonation-ingest-keys.json && chmod 700 /app/docker-mirror /run/detonation-secrets && chmod 600 /run/detonation-secrets/detonation-ingest-token /run/detonation-secrets/detonation-ingest-keys.json"]
         securityContext:
           runAsUser: 0
           allowPrivilegeEscalation: false
