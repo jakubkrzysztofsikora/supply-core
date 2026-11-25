@@ -371,6 +371,27 @@
           </table>
         </div>
       </section>
+      <section class="section card" aria-labelledby="detonations-heading">
+        <div class="section-head">
+          <div>
+            <h2 id="detonations-heading">Detonation evidence replay</h2>
+            <p>Signed, redacted sandbox-replay projections of quarantined packages. Read-only JSON endpoints; when the detonation store is empty or disabled, requests return 404.</p>
+          </div>
+        </div>
+        <div class="table-wrap" role="region" aria-label="Detonation replay endpoints" tabindex="0">
+          <table>
+            <thead>
+              <tr><th>Data</th><th>Endpoint</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Sealed runs (newest first)</td><td><a href="/api/v1/detonations?limit=50">/api/v1/detonations?limit=50</a></td></tr>
+              <tr><td>One run's metadata and coverage</td><td><a href="/api/v1/detonations">/api/v1/detonations/{run_id}</a></td></tr>
+              <tr><td>Ordered public events</td><td><a href="/api/v1/detonations">/api/v1/detonations/{run_id}/events</a></td></tr>
+              <tr><td>Redacted stdout/stderr bytes</td><td><a href="/api/v1/detonations">/api/v1/detonations/{run_id}/logs</a></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
       <footer>Supply Core <span id="footer-version"></span> · Public diagnostics only · Latest snapshot: <time id="updated-at">—</time> · <span class="freshness-flag freshness-missing" id="freshness-label">Checking</span></footer>
     </main>
   </div>

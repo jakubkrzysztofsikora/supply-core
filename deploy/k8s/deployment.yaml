@@ -26,13 +26,23 @@ spec:
       - name: docker-mirror-volume-owner
         image: ghcr.io/jakubkrzysztofsikora/supply-core:v0.5.0@sha256:2a2f1cdf005eb2dc1f6684e2b074b857bcc99510b69a04fa3a6c7d8d04f11987
         imagePullPolicy: IfNotPresent
-        command: ["chown", "supply:supply", "/app/docker-mirror"]
+        # Secret projections are root-owned symlinks (unreadable by the app's
+        # regular-file reader); copy them into a private emptyDir as real
+        # owner-readable files.
+        command: ["sh", "-ec", "mkdir -p /app/artifacts/detonations /run/detonation-secrets && cp -L /app/secrets-src/detonation-ingest-token /app/secrets-src/detonation-ingest-keys.json /run/detonation-secrets/ && chown supply:supply /app/docker-mirror /app/artifacts/detonations /run/detonation-secrets && chmod 700 /app/docker-mirror /app/artifacts/detonations /run/detonation-secrets && chmod 600 /run/detonation-secrets/detonation-ingest-token /run/detonation-secrets/detonation-ingest-keys.json"]
         securityContext:
           runAsUser: 0
           allowPrivilegeEscalation: false
         volumeMounts:
         - name: docker-mirror
           mountPath: /app/docker-mirror
+        - name: artifacts
+          mountPath: /app/artifacts
+        - name: detonation-ingest
+          mountPath: /app/secrets-src
+          readOnly: true
+        - name: detonation-runtime
+          mountPath: /run/detonation-secrets
       containers:
       - name: app
         image: ghcr.io/jakubkrzysztofsikora/supply-core:v0.5.0@sha256:2a2f1cdf005eb2dc1f6684e2b074b857bcc99510b69a04fa3a6c7d8d04f11987
@@ -44,6 +54,14 @@ spec:
         # Public Hub pulls use anonymous Docker Hub rate limits.
         - name: SUPPLY_DOCKER_MIRROR_ENABLED
           value: "true"
+        - name: SUPPLY_DETONATION_ROUTES_ENABLED
+          value: "1"
+        - name: SUPPLY_DETONATION_PUBLIC_STORE
+          value: "/app/artifacts/detonations"
+        - name: SUPPLY_DETONATION_INGEST_TOKEN_FILE
+          value: "/run/detonation-secrets/detonation-ingest-token"
+        - name: SUPPLY_DETONATION_INGEST_KEYS_FILE
+          value: "/run/detonation-secrets/detonation-ingest-keys.json"
         - name: SUPPLY_SERVICE_NAME
           value: "supply-core-official"
         - name: SUPPLY_ARTIFACTS_DIR
@@ -59,11 +77,20 @@ spec:
           value: "4873"
         - name: HOST
           value: "127.0.0.1"
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 1000
+          seccompProfile:
+            type: RuntimeDefault
         volumeMounts:
         - name: docker-mirror
           mountPath: /app/docker-mirror
         - name: artifacts
           mountPath: /app/artifacts
+        - name: detonation-runtime
+          mountPath: /run/detonation-secrets
+          readOnly: true
         resources:
           requests:
             cpu: 250m
@@ -129,6 +156,13 @@ spec:
       - name: docker-mirror
         persistentVolumeClaim:
           claimName: supply-core-docker-mirror
+      - name: detonation-ingest
+        secret:
+          secretName: supply-core-detonation-ingest
+          defaultMode: 0400
+      - name: detonation-runtime
+        emptyDir:
+          medium: Memory
       - name: config
         configMap:
           name: ts-funnel-config

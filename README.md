@@ -423,10 +423,12 @@ Pages default to 50 records and cap at 100. Run IDs use 32 lowercase hexadecimal
 
 Set `SUPPLY_DETONATION_ROUTES_ENABLED=1` to enable routes. This switch applies per request. Set `SUPPLY_DETONATION_PUBLIC_STORE` to a private mode-0700 directory. Set `SUPPLY_DETONATION_INGEST_TOKEN_FILE` to a file containing the publisher bearer token. Set `SUPPLY_DETONATION_INGEST_KEYS_FILE` to a private JSON file with `{"keys":[{"key_id":"publisher-1","key_hex":"<64-128 lowercase hex characters>"}]}` entries. Server keys must contain 32–64 decoded bytes.
 
-Store publisher HMAC credentials as `publisher-hmac-key.json` inside the private evidence directory, using `{"key_id":"publisher-1","key_hex":"<64-128 lowercase hex characters>"}`. Publish sealed projections explicitly:
+Producing sealed runs: the sandbox harness that executes detonations writes runs with the `EvidenceStore` API (`supply_core::adapters::storage::detonation::EvidenceStore::new` → `begin_run_with_metadata` → event recording → `seal`). `EvidenceStore` is a library contract only; this repository ships no producer CLI. The harness must run in a bubblewrap sandbox with the private evidence directory in mode 0700, and it must embed the same `REDACTION_POLICY_VERSION` the server enforces — a policy mismatch files the projection in the server's pending review area instead of the public store.
+
+Store publisher HMAC credentials as `publisher-hmac-key.json` inside the private evidence directory, using `{"key_id":"publisher-1","key_hex":"<64-128 lowercase hex characters>"}`. Publish sealed projections explicitly (binary `supply-core`; the container image also exposes it as `supply`):
 
 ```bash
-supply publish-detonation --pending \
+supply-core publish-detonation --pending \
   --public-url https://supply-core.example.com \
   --ingest-token-file ~/.config/supply-core/detonation-token \
   --evidence-dir /var/lib/supply-core/evidence
@@ -440,6 +442,9 @@ The publisher follows no redirects and requires HTTPS outside loopback. It strea
 kubectl create namespace supply-core
 kubectl -n supply-core create secret generic ts-sidecar-auth --from-literal=TS_AUTHKEY=<tailscale-auth-key>
 kubectl -n supply-core create secret generic supply-core-auth --from-literal=SUPPLY_AUTH_TOKEN=<long-random-token>
+kubectl -n supply-core create secret generic supply-core-detonation-ingest \
+  --from-literal=detonation-ingest-token=<long-random-ingest-token> \
+  --from-file=detonation-ingest-keys.json=<server-keys.json>
 # The manifests match the official homelab: storageClassName nfs-studio and a
 # nodeSelector/toleration for k3s-node-1. Adjust both, plus sizing, for your cluster.
 kubectl apply -k deploy/k8s

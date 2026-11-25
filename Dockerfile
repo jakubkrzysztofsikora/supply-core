@@ -24,7 +24,7 @@ RUN cargo build --release --locked
 FROM alpine:3.20 AS runner
 
 RUN apk add --no-cache ca-certificates curl tzdata && \
-    addgroup -S supply && adduser -S supply -G supply
+    addgroup -S -g 1000 supply && adduser -S -u 1000 -G supply supply
 
 WORKDIR /app
 
