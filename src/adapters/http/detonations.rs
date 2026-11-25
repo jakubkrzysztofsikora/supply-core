@@ -34,7 +34,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, LazyLock, Mutex, OnceLock},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::{io::AsyncWriteExt, sync::Semaphore};
 use tower_http::cors::{Any, CorsLayer};
@@ -1163,6 +1163,7 @@ fn store_size(root: &Path) -> std::io::Result<u64> {
     Ok(total)
 }
 
+#[derive(Clone)]
 pub(crate) struct StoreOccupancy {
     pub used_bytes: u64,
     pub limit_bytes: u64,
@@ -1211,6 +1212,26 @@ pub(crate) fn occupancy_status(used_bytes: u64, limit_bytes: u64) -> &'static st
     } else {
         "ok"
     }
+}
+
+const OCCUPANCY_TTL: Duration = Duration::from_secs(5);
+static OCCUPANCY_CACHE: OnceLock<tokio::sync::Mutex<HashMap<PathBuf, (Instant, StoreOccupancy)>>> =
+    OnceLock::new();
+
+pub(crate) async fn cached_occupancy(root: PathBuf) -> std::io::Result<StoreOccupancy> {
+    let cache = OCCUPANCY_CACHE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()));
+    let mut cached = cache.lock().await;
+    if let Some((refreshed_at, occupancy)) = cached.get(&root) {
+        if refreshed_at.elapsed() < OCCUPANCY_TTL {
+            return Ok(occupancy.clone());
+        }
+    }
+    let walk_root = root.clone();
+    let occupancy = tokio::task::spawn_blocking(move || store_occupancy(&walk_root))
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))??;
+    cached.insert(root, (Instant::now(), occupancy.clone()));
+    Ok(occupancy)
 }
 
 fn stream_bytes(

@@ -858,21 +858,16 @@ async fn detailed_health(State(state): State<Arc<ServerConfig>>) -> Json<Value> 
         document["tailnet"] = json!(domain);
     }
     let occupancy = match state.detonation_public_store.as_deref() {
-        Some(root) => {
-            let root = root.to_owned();
-            Some(
-                detonations::read_blocking(move || {
-                    detonations::store_occupancy(&root).map_err(|_| {
-                        (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            Json(json!({"error": "detonation store unavailable"})),
-                        )
-                            .into_response()
-                    })
-                })
-                .await,
-            )
-        }
+        Some(root) => Some(
+            detonations::cached_occupancy(root.to_owned())
+                .await
+                .map_err(|_| {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({"error": "detonation store unavailable"})),
+                    )
+                }),
+        ),
         None => None,
     };
     match occupancy {
@@ -1195,6 +1190,33 @@ mod tests {
             "degraded"
         );
         assert_eq!(detonations::occupancy_status(1024, limit), "ok");
+    }
+
+    #[tokio::test]
+    async fn concurrent_occupancy_calls_share_one_walk() {
+        let store = tempfile::tempdir().unwrap_or_else(|_| panic!("tempdir"));
+        let pending = store.path().join("pending");
+        std::fs::create_dir(&pending).unwrap_or_else(|_| panic!("pending dir"));
+        std::fs::write(pending.join("held.bundle"), b"held").unwrap_or_else(|_| panic!("write"));
+        let root = store.path().to_owned();
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let root = root.clone();
+            handles.push(tokio::spawn(async move {
+                detonations::cached_occupancy(root)
+                    .await
+                    .unwrap_or_else(|_| panic!("occupancy"))
+            }));
+        }
+        let mut results = Vec::new();
+        for handle in handles {
+            results.push(handle.await.unwrap_or_else(|_| panic!("join")));
+        }
+        assert_eq!(results[0].pending_bytes, 4);
+        assert_eq!(results[0].pending_runs, 1);
+        assert!(results
+            .windows(2)
+            .all(|pair| pair[0].used_bytes == pair[1].used_bytes));
     }
 
     #[tokio::test]
