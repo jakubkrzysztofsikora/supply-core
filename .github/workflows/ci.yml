@@ -15,6 +15,7 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
+      - run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
         with:
           toolchain: stable
@@ -48,6 +49,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
+      - run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
         with:
           toolchain: stable
@@ -63,6 +65,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
+      - run: echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
         with:
           toolchain: stable

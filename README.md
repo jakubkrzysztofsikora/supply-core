@@ -754,6 +754,9 @@ cargo test -- --ignored
 
 CI checks formatting, tests, Clippy, and maintains an 85% library line-coverage floor via `cargo-llvm-cov`.
 
+The self-hosted Linux runner installs Rust into a job-local `RUSTUP_HOME` under
+`RUNNER_TEMP`, so toolchain updates work in disposable containers.
+
 ---
 
 ## Deep Dive & Specifications
