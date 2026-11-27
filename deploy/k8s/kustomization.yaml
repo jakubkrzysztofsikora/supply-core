@@ -9,4 +9,5 @@ resources:
   - docker-mirror-pvc.yaml
   - pvc.yaml
   - ts-funnel.yaml
+  - cato-root-ca.yaml
   - deployment.yaml

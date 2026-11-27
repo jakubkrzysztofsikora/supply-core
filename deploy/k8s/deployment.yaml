@@ -130,6 +130,8 @@ spec:
       - name: ts-funnel
         image: tailscale/tailscale@sha256:8c42c4574ab066384fcb72f69e086a2ff1dd3652eb6f56856cee34bcf0d2f680
         env:
+        - name: SSL_CERT_DIR
+          value: "/etc/ssl/certs:/run/cato-ca"
         - name: TS_AUTHKEY
           valueFrom:
             secretKeyRef:
@@ -146,6 +148,9 @@ spec:
         - name: TS_KUBE_SECRET
           value: ""
         volumeMounts:
+        - name: cato-ca
+          mountPath: /run/cato-ca
+          readOnly: true
         - name: config
           mountPath: /config
           readOnly: true
@@ -171,6 +176,9 @@ spec:
       - name: detonation-runtime
         emptyDir:
           medium: Memory
+      - name: cato-ca
+        configMap:
+          name: supply-core-cato-ca-03cb0160
       - name: config
         configMap:
           name: ts-funnel-config
